@@ -36,8 +36,20 @@ impl Embedder {
             .commit_from_file(model_path)
             .context("Failed to load ONNX model into session")?;
             
-        let tokenizer = Tokenizer::from_file(tokenizer_path)
+        let mut tokenizer = Tokenizer::from_file(tokenizer_path)
             .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {}", e))?;
+        
+        // Enforce truncation to 512 tokens for stable inference
+        let _ = tokenizer.with_truncation(Some(tokenizers::TruncationParams {
+            max_length: 512,
+            ..Default::default()
+        }));
+
+        // Enforce padding to 512 tokens for fixed-size tensor shapes
+        let _ = tokenizer.with_padding(Some(tokenizers::PaddingParams {
+            strategy: tokenizers::PaddingStrategy::Fixed(512),
+            ..Default::default()
+        }));
         
         Ok(Self { 
             session: Mutex::new(session), 
@@ -55,10 +67,10 @@ impl Embedder {
         let mask: Vec<i64> = encoding.get_attention_mask().iter().map(|&m| m as i64).collect();
         let type_ids: Vec<i64> = encoding.get_type_ids().iter().map(|&t| t as i64).collect();
 
-        let seq_len = ids.len();
-        let input_ids = Array2::from_shape_vec((1, seq_len), ids)?;
-        let attention_mask = Array2::from_shape_vec((1, seq_len), mask)?;
-        let token_type_ids = Array2::from_shape_vec((1, seq_len), type_ids)?;
+        // Shape: [batch_size, seq_len] -> [1, 512]
+        let input_ids = Array2::from_shape_vec((1, 512), ids)?;
+        let attention_mask = Array2::from_shape_vec((1, 512), mask)?;
+        let token_type_ids = Array2::from_shape_vec((1, 512), type_ids)?;
 
         let mut session = self.session.lock()
             .map_err(|_| anyhow::anyhow!("Embedder mutex poisoned"))?;

@@ -30,7 +30,7 @@ pub struct Store {
 
 impl Store {
     /// Open (or create) the core application table and return a ready `Store`.
-    async fn open_tables(connection: Connection) -> Result<Self> {
+    async fn open_tables(connection: Connection, dimension: usize) -> Result<Self> {
         let code_vectors = open_or_create_table(
             &connection,
             "code_vectors",
@@ -41,7 +41,7 @@ impl Store {
                     "vector",
                     DataType::FixedSizeList(
                         Arc::new(Field::new("item", DataType::Float32, true)),
-                        1024,
+                        dimension as i32,
                     ),
                     false,
                 ),
@@ -119,13 +119,13 @@ impl Store {
     }
 }
 
-pub async fn connect_store(uri: &str) -> Result<Store> {
+pub async fn connect_store(uri: &str, dimension: usize) -> Result<Store> {
     let connection = connect(uri)
         .execute()
         .await
         .with_context(|| format!("connecting to LanceDB at {uri}"))?;
 
-    Store::open_tables(connection).await
+    Store::open_tables(connection, dimension).await
 }
 
 async fn open_or_create_table(

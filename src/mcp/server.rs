@@ -200,9 +200,3 @@ fn json_value<T: serde::Serialize>(v: &T) -> serde_json::Value {
     serde_json::to_value(v).unwrap_or_else(|e| json!({"error": e.to_string()}))
 }
 
-fn serialize_response<T: serde::Serialize>(v: &T) -> Vec<u8> {
-    serde_json::to_vec(v).unwrap_or_else(|e| {
-        format!(r#"{{"jsonrpc":"2.0","error":{{"code":-32603,"message":"Serialization failed: {e}"}}}}"#)
-            .into_bytes()
-    })
-}

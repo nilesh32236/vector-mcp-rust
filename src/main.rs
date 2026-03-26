@@ -6,7 +6,7 @@ mod mcp;
 
 use std::sync::Arc;
 use anyhow::{Result, Context};
-use tracing::{info, error};
+use tracing::info;
 
 use crate::llm::embedding::Embedder;
 use crate::llm::summarizer::Summarizer;
@@ -35,7 +35,7 @@ async fn main() -> Result<()> {
 
     // 3. Connect to LanceDB and open/create tables.
     let db_uri = cfg.db_path.display().to_string();
-    let store = db::connect_store(&db_uri).await?;
+    let store = db::connect_store(&db_uri, cfg.dimension).await?;
     info!("LanceDB connected — tables initialised");
 
     // 4. Initialise AI components.

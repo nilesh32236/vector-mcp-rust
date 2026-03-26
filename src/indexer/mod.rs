@@ -71,14 +71,14 @@ pub async fn index_file(
         });
     }
 
-    let batch = records_to_batch(records)?;
+    let batch = records_to_batch(records, config.dimension)?;
     store.delete_by_path(path).await?;
     store.code_vectors.add(batch).execute().await?;
 
     Ok(())
 }
 
-fn records_to_batch(records: Vec<Record>) -> Result<RecordBatch> {
+fn records_to_batch(records: Vec<Record>, dimension: usize) -> Result<RecordBatch> {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
         Field::new("content", DataType::Utf8, false),
@@ -86,7 +86,7 @@ fn records_to_batch(records: Vec<Record>) -> Result<RecordBatch> {
             "vector",
             DataType::FixedSizeList(
                 Arc::new(Field::new("item", DataType::Float32, true)),
-                1024,
+                dimension as i32,
             ),
             false,
         ),
@@ -103,7 +103,7 @@ fn records_to_batch(records: Vec<Record>) -> Result<RecordBatch> {
     }
     
     let vector_values = Float32Array::from(flattened_vectors);
-    let vectors = FixedSizeListArray::try_new_from_values(vector_values, 1024)?;
+    let vectors = FixedSizeListArray::try_new_from_values(vector_values, dimension as i32)?;
 
     RecordBatch::try_new(
         schema,

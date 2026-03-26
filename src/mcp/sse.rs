@@ -3,13 +3,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
-use axum::response::sse;
 use axum::{
     extract::{Query, State},
     http::StatusCode,
     response::{sse::Event, Sse},
     routing::{get, post},
-    Json, Router,
+    Router,
 };
 use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
@@ -28,13 +27,15 @@ type SessionSender = mpsc::UnboundedSender<Event>;
 pub struct SseManager {
     sessions: Mutex<HashMap<String, SessionSender>>,
     server: Arc<Server>,
+    port: u16,
 }
 
 impl SseManager {
-    pub fn new(server: Arc<Server>) -> Self {
+    pub fn new(server: Arc<Server>, port: u16) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
             server,
+            port,
         }
     }
 }
@@ -64,7 +65,8 @@ async fn sse_handler(
 
     // Send the endpoint event as per MCP spec.
     // The client will use this URL to POST messages.
-    let endpoint_url = format!("/message?session_id={}", session_id);
+    // Use an absolute URL as some clients are sensitive to relative paths.
+    let endpoint_url = format!("http://localhost:{}/message?session_id={}", manager.port, session_id);
     let _ = tx.send(Event::default().event("endpoint").data(endpoint_url));
 
     let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx)
@@ -114,11 +116,13 @@ async fn message_handler(
 // ---------------------------------------------------------------------------
 
 pub async fn start_sse_server(server: Arc<Server>, port: u16) -> anyhow::Result<()> {
-    let manager = Arc::new(SseManager::new(server));
+    let manager = Arc::new(SseManager::new(server, port));
 
+    // Handle both /sse and /message with a unified approach to avoid 405 Method Not Allowed.
+    // Some clients might POST to /sse or GET /message depending on implementation details.
     let app = Router::new()
-        .route("/sse", get(sse_handler))
-        .route("/message", post(message_handler))
+        .route("/sse", get(sse_handler).post(message_handler_permissive))
+        .route("/message", post(message_handler).get(not_found_handler))
         .layer(CorsLayer::permissive())
         .with_state(manager);
 
@@ -129,4 +133,24 @@ pub async fn start_sse_server(server: Arc<Server>, port: u16) -> anyhow::Result<
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+/// A version of message_handler that can handle session_id from query or body if needed.
+async fn message_handler_permissive(
+    state: State<Arc<SseManager>>,
+    query: Query<HashMap<String, String>>,
+    body: String,
+) -> StatusCode {
+    let session_id = query.get("session_id").cloned();
+    match session_id {
+        Some(sid) => message_handler(state, Query(MessageQuery { session_id: sid }), body).await,
+        None => {
+            warn!("POST to SSE without session_id");
+            StatusCode::METHOD_NOT_ALLOWED
+        }
+    }
+}
+
+async fn not_found_handler() -> StatusCode {
+    StatusCode::NOT_FOUND
 }

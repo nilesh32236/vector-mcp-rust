@@ -137,7 +137,7 @@ impl Config {
             model_name,
             reranker_model_name,
             hf_token: env::var("HF_TOKEN").unwrap_or_default(),
-            dimension: 1024,
+            dimension: 384,
             disable_watcher,
             embedder_pool_size,
             api_port,
