@@ -35,9 +35,20 @@ The server will perform an initial scan of the current directory (respecting `.g
 ## Configuration
 
 Environment variables can be set in a `.env` file:
-- `DATA_DIR`: Where LanceDB and models are stored (default: `~/.local/share/vector-mcp-rust`).
-- `MODEL_NAME`: Hugging Face repo for embeddings (default: `BAAI/bge-small-en-v1.5`).
 - `ENABLE_LIVE_INDEXING`: Toggle background watcher (default: `true`).
+
+## SSE Support (Remote/URL Access)
+
+In addition to standard Stdio, `vector-mcp-rust` supports access via HTTP/SSE, matching the Go implementation's behavior.
+
+- **SSE Endpoint**: `http://localhost:47821/sse`
+- **Port Configuration**: Controlled via `API_PORT` (default: 47821).
+
+To test via `curl`:
+```bash
+# Start connection (emulates what an MCP client does)
+curl -N http://localhost:47821/sse
+```
 
 ## Tools Provided
 

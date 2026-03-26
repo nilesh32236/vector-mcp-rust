@@ -76,7 +76,11 @@ impl Server {
 
             debug!(raw = trimmed, "incoming request");
 
-            let response_bytes = self.handle_line(trimmed).await;
+            let response = self.process_message(trimmed).await;
+            let response_bytes = serde_json::to_vec(&response).unwrap_or_else(|e| {
+                format!(r#"{{"jsonrpc":"2.0","error":{{"code":-32603,"message":"Serialization failed: {e}"}}}}"#)
+                    .into_bytes()
+            });
 
             stdout
                 .write_all(&response_bytes)
@@ -92,8 +96,8 @@ impl Server {
         Ok(())
     }
 
-    /// Parse one JSON-RPC line and produce the response bytes.
-    async fn handle_line(&self, line: &str) -> Vec<u8> {
+    /// Parse one JSON-RPC line and produce the response object.
+    pub async fn process_message(&self, line: &str) -> serde_json::Value {
         // 1. Parse JSON
         let request: JsonRpcRequest = match serde_json::from_str(line) {
             Ok(r) => r,
@@ -104,7 +108,7 @@ impl Server {
                     INVALID_PARAMS,
                     format!("Invalid JSON: {e}"),
                 );
-                return serialize_response(&resp);
+                return serde_json::to_value(&resp).unwrap();
             }
         };
 
@@ -113,18 +117,18 @@ impl Server {
         match request.method.as_str() {
             "initialize" => {
                 let result = self.handle_initialize();
-                serialize_response(&JsonRpcResponse::new(id, json_value(&result)))
+                serde_json::to_value(&JsonRpcResponse::new(id, json_value(&result))).unwrap()
             }
             "initialized" => {
-                serialize_response(&JsonRpcResponse::new(id, json!({})))
+                serde_json::to_value(&JsonRpcResponse::new(id, json!({}))).unwrap()
             }
             "tools/list" => {
                 let tools = tools::tool_definitions();
-                serialize_response(&JsonRpcResponse::new(id, json!({ "tools": tools })))
+                serde_json::to_value(&JsonRpcResponse::new(id, json!({ "tools": tools }))).unwrap()
             }
             "tools/call" => self.handle_tools_call(id, &request.params).await,
             "notifications/cancelled" | "notifications/progress" => {
-                serialize_response(&JsonRpcResponse::new(id, json!({})))
+                serde_json::to_value(&JsonRpcResponse::new(id, json!({}))).unwrap()
             }
             _ => {
                 let resp = JsonRpcErrorResponse::new(
@@ -132,7 +136,7 @@ impl Server {
                     METHOD_NOT_FOUND,
                     format!("Method not found: {}", request.method),
                 );
-                serialize_response(&resp)
+                serde_json::to_value(&resp).unwrap()
             }
         }
     }
@@ -158,7 +162,7 @@ impl Server {
         &self,
         id: Option<serde_json::Value>,
         raw_params: &serde_json::Value,
-    ) -> Vec<u8> {
+    ) -> serde_json::Value {
         let params: CallToolParams = match serde_json::from_value(raw_params.clone()) {
             Ok(p) => p,
             Err(e) => {
@@ -167,7 +171,7 @@ impl Server {
                     INVALID_PARAMS,
                     format!("Invalid tools/call params: {e}"),
                 );
-                return serialize_response(&resp);
+                return serde_json::to_value(&resp).unwrap();
             }
         };
 
@@ -180,11 +184,11 @@ impl Server {
                     INTERNAL_ERROR,
                     format!("Tool execution error: {e}"),
                 );
-                return serialize_response(&resp);
+                return serde_json::to_value(&resp).unwrap();
             }
         };
 
-        serialize_response(&JsonRpcResponse::new(id, json_value(&result)))
+        serde_json::to_value(&JsonRpcResponse::new(id, json_value(&result))).unwrap()
     }
 }
 

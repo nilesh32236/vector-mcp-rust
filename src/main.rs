@@ -6,7 +6,7 @@ mod mcp;
 
 use std::sync::Arc;
 use anyhow::{Result, Context};
-use tracing::info;
+use tracing::{info, error};
 
 use crate::llm::embedding::Embedder;
 use crate::llm::summarizer::Summarizer;
@@ -62,14 +62,35 @@ async fn main() -> Result<()> {
         Arc::clone(&summarizer),
     ).await.context("Starting background watcher")?;
 
-    // 6. Start MCP server on stdio.
-    let server = mcp::server::Server::new(
+    // 6. Start MCP server.
+    let server = Arc::new(mcp::server::Server::new(
         Arc::clone(&store),
         Arc::clone(&config),
         Arc::clone(&embedder),
         Arc::clone(&summarizer),
-    );
+    ));
+
+    let port_str = config.api_port.clone();
+    let sse_server = if let Ok(port) = port_str.parse::<u16>() {
+        let server_for_sse = Arc::clone(&server);
+        Some(tokio::spawn(async move {
+            if let Err(e) = mcp::sse::start_sse_server(server_for_sse, port).await {
+                tracing::error!(err = %e, "SSE server failed");
+            }
+        }))
+    } else {
+        None
+    };
 
     info!("vector-mcp-rust ready ✓");
-    server.run().await
+
+    // Standard MCP transport via stdio.
+    server.run().await?;
+
+    // Graceful shutdown of SSE server if it was running.
+    if let Some(task) = sse_server {
+        task.abort();
+    }
+
+    Ok(())
 }
