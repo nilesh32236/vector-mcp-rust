@@ -10,10 +10,10 @@ use tracing::info;
 
 use crate::llm::embedding::Embedder;
 use crate::llm::summarizer::Summarizer;
+use crate::config::Config;
+use crate::db::Store;
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // 1. Structured logging (JSON to stderr, respects RUST_LOG env filter).
+fn setup_logging() {
     tracing_subscriber::fmt()
         .json()
         .with_env_filter(
@@ -21,33 +21,25 @@ async fn main() -> Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
+}
 
-    // 2. Load configuration from env / .env file.
-    let cfg = config::Config::load()?;
-    info!(
-        project_root = %cfg.project_root,
-        db_path = %cfg.db_path.display(),
-        model = %cfg.model_name,
-        local_llm = cfg.feature_toggles.enable_local_llm,
-        live_indexing = cfg.feature_toggles.enable_live_indexing,
-        "configuration loaded"
-    );
-
-    // 3. Connect to LanceDB and open/create tables.
+async fn init_components(cfg: &Config) -> Result<(Arc<Store>, Arc<Embedder>, Arc<Summarizer>)> {
     let db_uri = cfg.db_path.display().to_string();
     let store = db::connect_store(&db_uri, cfg.dimension).await?;
     info!("LanceDB connected — tables initialised");
 
-    // 4. Initialise AI components.
-    // Use the model path from config.
-    let embedder = Arc::new(Embedder::new(&cfg)?);
-    let summarizer = Arc::new(Summarizer::new(&cfg)?);
+    let embedder = Arc::new(Embedder::new(cfg)?);
+    let summarizer = Arc::new(Summarizer::new(cfg)?);
 
-    let store = Arc::new(store);
-    let config = Arc::new(cfg);
+    Ok((Arc::new(store), embedder, summarizer))
+}
 
-    // 5. Initial Scan & Background Watcher (if enabled).
-    // Perform an initial project-wide scan in the background.
+async fn start_background_tasks(
+    config: Arc<Config>,
+    store: Arc<Store>,
+    embedder: Arc<Embedder>,
+    summarizer: Arc<Summarizer>,
+) -> Result<()> {
     let config_clone = Arc::clone(&config);
     let store_clone = Arc::clone(&store);
     let embedder_clone = Arc::clone(&embedder);
@@ -68,6 +60,33 @@ async fn main() -> Result<()> {
         Arc::clone(&embedder),
         Arc::clone(&summarizer),
     ).await.context("Starting background watcher")?;
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // 1. Structured logging (JSON to stderr, respects RUST_LOG env filter).
+    setup_logging();
+
+    // 2. Load configuration from env / .env file.
+    let cfg = config::Config::load()?;
+    info!(
+        project_root = %cfg.project_root,
+        db_path = %cfg.db_path.display(),
+        model = %cfg.model_name,
+        local_llm = cfg.feature_toggles.enable_local_llm,
+        live_indexing = cfg.feature_toggles.enable_live_indexing,
+        "configuration loaded"
+    );
+
+    // 3. Connect to LanceDB and open/create tables.
+    // 4. Initialise AI components.
+    let (store, embedder, summarizer) = init_components(&cfg).await?;
+    let config = Arc::new(cfg);
+
+    // 5. Initial Scan & Background Watcher (if enabled).
+    start_background_tasks(Arc::clone(&config), Arc::clone(&store), Arc::clone(&embedder), Arc::clone(&summarizer)).await?;
 
     // 6. Start MCP server.
     let server = Arc::new(mcp::server::Server::new(

@@ -195,19 +195,8 @@ pub fn parse_pdf(bytes: &[u8], file_path: &str) -> Result<Vec<Chunk>> {
 // Tree-sitter chunking
 // ---------------------------------------------------------------------------
 
-fn tree_sitter_chunk(content: &str, _file_path: &str, spec: &LangSpec) -> Result<Vec<Chunk>> {
-    let mut parser = Parser::new();
-    parser
-        .set_language(&spec.language)
-        .context("setting Tree-sitter language")?;
-
-    let tree = parser
-        .parse(content, None)
-        .context("Tree-sitter parse returned None")?;
-
+fn extract_raw_chunks(source: &[u8], spec: &LangSpec, tree: &tree_sitter::Tree) -> Vec<Chunk> {
     let root = tree.root_node();
-    let source = content.as_bytes();
-
     let mut raw_chunks: Vec<Chunk> = Vec::new();
     let mut seen: HashSet<(usize, usize)> = HashSet::new();
 
@@ -276,10 +265,11 @@ fn tree_sitter_chunk(content: &str, _file_path: &str, spec: &LangSpec) -> Result
             });
         }
     }
+    raw_chunks
+}
 
-    // Deduplicate: remove smaller chunks fully contained in a larger chunk of
-    // the same type (mirrors Go's redundancy filter).
-    let filtered: Vec<Chunk> = raw_chunks
+fn deduplicate_chunks(raw_chunks: Vec<Chunk>) -> Vec<Chunk> {
+    raw_chunks
         .iter()
         .enumerate()
         .filter(|&(i, c1)| {
@@ -292,7 +282,25 @@ fn tree_sitter_chunk(content: &str, _file_path: &str, spec: &LangSpec) -> Result
             })
         })
         .map(|(_, c)| c.clone())
-        .collect();
+        .collect()
+}
+
+fn tree_sitter_chunk(content: &str, _file_path: &str, spec: &LangSpec) -> Result<Vec<Chunk>> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&spec.language)
+        .context("setting Tree-sitter language")?;
+
+    let tree = parser
+        .parse(content, None)
+        .context("Tree-sitter parse returned None")?;
+
+    let source = content.as_bytes();
+    let raw_chunks = extract_raw_chunks(source, spec, &tree);
+
+    // Deduplicate: remove smaller chunks fully contained in a larger chunk of
+    // the same type (mirrors Go's redundancy filter).
+    let filtered = deduplicate_chunks(raw_chunks);
 
     Ok(filtered)
 }
@@ -368,101 +376,103 @@ fn calculate_score(node: tree_sitter::Node, calls: &[String]) -> f32 {
 // Relationship parsing (mirrors Go's `parseRelationships`)
 // ---------------------------------------------------------------------------
 
+fn parse_js_relationships(text: &str, relations: &mut Vec<String>) {
+    // import/from/require paths
+    let path_re = regex::Regex::new(r#"(?:import|from|require)\s*\(?\s*['"]([^'"]+)['"]"#);
+    if let Ok(re) = path_re {
+        for cap in re.captures_iter(text) {
+            if let Some(m) = cap.get(1) {
+                relations.push(m.as_str().to_owned());
+            }
+        }
+    }
+    // named imports
+    let named_re = regex::Regex::new(r"import\s*\{([^}]+)\}");
+    if let Ok(re) = named_re {
+        for cap in re.captures_iter(text) {
+            if let Some(m) = cap.get(1) {
+                for name in m.as_str().split(',') {
+                    let cleaned = name.split(" as ").next().unwrap_or("").trim();
+                    if !cleaned.is_empty() {
+                        relations.push(cleaned.to_owned());
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn parse_go_relationships(text: &str, relations: &mut Vec<String>) {
+    // single import
+    let single_re = regex::Regex::new(r#"import\s+(?:[a-zA-Z0-9_.]+\s+)?["']([^"']+)["']"#);
+    if let Ok(re) = single_re {
+        for cap in re.captures_iter(text) {
+            if let Some(m) = cap.get(1) {
+                relations.push(m.as_str().to_owned());
+            }
+        }
+    }
+    // block import
+    let block_re = regex::Regex::new(r"import\s+\(([\s\S]*?)\)");
+    if let Ok(re) = block_re {
+        let inner_re = regex::Regex::new(r#"["']([^"']+)["']"#);
+        for cap in re.captures_iter(text) {
+            if let Some(block) = cap.get(1) {
+                if let Ok(ref ire) = inner_re {
+                    for ic in ire.captures_iter(block.as_str()) {
+                        if let Some(m) = ic.get(1) {
+                            relations.push(m.as_str().to_owned());
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn parse_php_relationships(text: &str, relations: &mut Vec<String>) {
+    let req_re = regex::Regex::new(r#"(?:require|require_once|include|include_once)\s*\(?\s*['"]([^'"]+)['"]"#);
+    if let Ok(re) = req_re {
+        for cap in re.captures_iter(text) {
+            if let Some(m) = cap.get(1) {
+                relations.push(m.as_str().to_owned());
+            }
+        }
+    }
+    let use_re = regex::Regex::new(r"use\s+([^;]+);");
+    if let Ok(re) = use_re {
+        for cap in re.captures_iter(text) {
+            if let Some(m) = cap.get(1) {
+                for part in m.as_str().split(',') {
+                    let cleaned = part.split(" as ").next().unwrap_or("").trim();
+                    if !cleaned.is_empty() {
+                        relations.push(cleaned.to_owned());
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn parse_rust_relationships(text: &str, relations: &mut Vec<String>) {
+    let use_re = regex::Regex::new(r"use\s+([^;]+);");
+    if let Ok(re) = use_re {
+        for cap in re.captures_iter(text) {
+            if let Some(m) = cap.get(1) {
+                relations.push(m.as_str().trim().to_owned());
+            }
+        }
+    }
+}
+
 fn parse_relationships(text: &str, ext: &str) -> Vec<String> {
     let mut relations: Vec<String> = Vec::new();
 
     match ext {
-        ".ts" | ".tsx" | ".js" | ".jsx" => {
-            // import/from/require paths
-            let path_re = regex::Regex::new(
-                r#"(?:import|from|require)\s*\(?\s*['"]([^'"]+)['"]"#,
-            );
-            if let Ok(re) = path_re {
-                for cap in re.captures_iter(text) {
-                    if let Some(m) = cap.get(1) {
-                        relations.push(m.as_str().to_owned());
-                    }
-                }
-            }
-            // named imports
-            let named_re = regex::Regex::new(r"import\s*\{([^}]+)\}");
-            if let Ok(re) = named_re {
-                for cap in re.captures_iter(text) {
-                    if let Some(m) = cap.get(1) {
-                        for name in m.as_str().split(',') {
-                            let cleaned = name.split(" as ").next().unwrap_or("").trim();
-                            if !cleaned.is_empty() {
-                                relations.push(cleaned.to_owned());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        ".go" => {
-            // single import
-            let single_re = regex::Regex::new(
-                r#"import\s+(?:[a-zA-Z0-9_.]+\s+)?["']([^"']+)["']"#,
-            );
-            if let Ok(re) = single_re {
-                for cap in re.captures_iter(text) {
-                    if let Some(m) = cap.get(1) {
-                        relations.push(m.as_str().to_owned());
-                    }
-                }
-            }
-            // block import
-            let block_re = regex::Regex::new(r"import\s+\(([\s\S]*?)\)");
-            if let Ok(re) = block_re {
-                let inner_re = regex::Regex::new(r#"["']([^"']+)["']"#);
-                for cap in re.captures_iter(text) {
-                    if let Some(block) = cap.get(1) {
-                        if let Ok(ref ire) = inner_re {
-                            for ic in ire.captures_iter(block.as_str()) {
-                                if let Some(m) = ic.get(1) {
-                                    relations.push(m.as_str().to_owned());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        ".php" => {
-            let req_re = regex::Regex::new(
-                r#"(?:require|require_once|include|include_once)\s*\(?\s*['"]([^'"]+)['"]"#,
-            );
-            if let Ok(re) = req_re {
-                for cap in re.captures_iter(text) {
-                    if let Some(m) = cap.get(1) {
-                        relations.push(m.as_str().to_owned());
-                    }
-                }
-            }
-            let use_re = regex::Regex::new(r"use\s+([^;]+);");
-            if let Ok(re) = use_re {
-                for cap in re.captures_iter(text) {
-                    if let Some(m) = cap.get(1) {
-                        for part in m.as_str().split(',') {
-                            let cleaned = part.split(" as ").next().unwrap_or("").trim();
-                            if !cleaned.is_empty() {
-                                relations.push(cleaned.to_owned());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        ".rs" => {
-            let use_re = regex::Regex::new(r"use\s+([^;]+);");
-            if let Ok(re) = use_re {
-                for cap in re.captures_iter(text) {
-                    if let Some(m) = cap.get(1) {
-                        relations.push(m.as_str().trim().to_owned());
-                    }
-                }
-            }
-        }
+        ".ts" | ".tsx" | ".js" | ".jsx" => parse_js_relationships(text, &mut relations),
+        ".go" => parse_go_relationships(text, &mut relations),
+        ".php" => parse_php_relationships(text, &mut relations),
+        ".rs" => parse_rust_relationships(text, &mut relations),
         _ => {}
     }
 
