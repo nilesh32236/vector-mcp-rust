@@ -21,9 +21,25 @@ impl Summarizer {
 
         // 1. Download/Cache model from Hugging Face
         let api = Api::new().context("Failed to create HF API client")?;
-        let repo = api.model("Qwen/Qwen2.5-0.5B-Instruct-GGUF".to_string());
-        let model_path = repo.get("qwen2.5-0.5b-instruct-q4_k_m.gguf")
-            .context("Failed to download model from Hugging Face")?;
+        
+        // Check for local model in models_dir first as requested by the user
+        let local_model = config.models_dir.join("qwen2.5-0.5b-instruct-q4_k_m.gguf");
+        let model_path = if local_model.exists() {
+            tracing::info!("Found local model at {:?}", local_model);
+            local_model
+        } else {
+            tracing::info!("Local model not found in models_dir, downloading from Hugging Face...");
+            let repo = api.model("Qwen/Qwen2.5-0.5B-Instruct-GGUF".to_string());
+            let downloaded_path = repo.get("qwen2.5-0.5b-instruct-q4_k_m.gguf")
+                .context("Failed to download model from Hugging Face")?;
+            
+            // Store it in models_dir for future use
+            std::fs::copy(&downloaded_path, &local_model)
+                .context("Failed to copy downloaded model to models_dir")?;
+            
+            tracing::info!("Downloaded and stored model at {:?}", local_model);
+            local_model
+        };
 
         // 2. Load the GGUF model
         let mut file = std::fs::File::open(&model_path).context("Failed to open model file")?;
@@ -33,20 +49,24 @@ impl Summarizer {
             .context("Failed to load quantized model weights")?;
 
         // 3. Load Tokenizer
-        let cwd = std::env::current_dir().unwrap_or_default();
-        tracing::info!("Current working directory: {:?}", cwd);
-        
-        let local_tokenizer = cwd.join("tokenizer.json");
+        let local_tokenizer = config.models_dir.join("qwen-tokenizer.json");
         tracing::info!("Checking for local tokenizer at: {:?}", local_tokenizer);
 
         let tokenizer_path = if local_tokenizer.exists() {
             tracing::info!("Found local tokenizer at {:?}", local_tokenizer);
             local_tokenizer
         } else {
-            tracing::info!("Local tokenizer not found, downloading from Hugging Face...");
+            tracing::info!("Local tokenizer not found in models_dir, downloading from Hugging Face...");
             let token_repo = api.model("Qwen/Qwen2.5-0.5B-Instruct".to_string());
-            token_repo.get("tokenizer.json")
-                .context("Failed to download tokenizer from Hugging Face")?
+            let downloaded_path = token_repo.get("tokenizer.json")
+                .context("Failed to download tokenizer from Hugging Face")?;
+            
+            // Store it in models_dir for future use with a distinct name to avoid conflicts
+            std::fs::copy(&downloaded_path, &local_tokenizer)
+                .context("Failed to copy downloaded tokenizer to models_dir")?;
+            
+            tracing::info!("Downloaded and stored tokenizer at {:?}", local_tokenizer);
+            local_tokenizer
         };
 
         let tokenizer = Tokenizer::from_file(&tokenizer_path)

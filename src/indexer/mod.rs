@@ -54,7 +54,13 @@ pub async fn index_file(
         // Optional: Generate AI summary if local LLM is enabled.
         // We only do this for function/class chunks to save time, or if requested.
         let ai_summary: String = if config.feature_toggles.enable_local_llm && chunk.function_score > 0.5 {
-            summarizer.summarize_chunk(&chunk.content, Arc::clone(&config)).await.unwrap_or_else(|_| "Summary failed".to_string())
+            match summarizer.summarize_chunk(&chunk.content, Arc::clone(&config)).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("Summary failed for {}: {}", path, e);
+                    "Summary failed".to_string()
+                }
+            }
         } else {
             "No AI summary generated".to_string()
         };
