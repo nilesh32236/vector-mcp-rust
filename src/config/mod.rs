@@ -1,5 +1,5 @@
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -46,19 +46,7 @@ pub struct Config {
 }
 
 impl Config {
-    /// Load configuration from environment variables (and an optional `.env`
-    /// file).  Mirrors the Go `LoadConfig` function:
-    ///
-    /// 1. Attempt to load `.env` (ignore if absent).
-    /// 2. Resolve paths with the same fallback chain as the Go version.
-    /// 3. Ensure required directories exist.
-    pub fn load() -> Result<Self> {
-        // Best-effort .env loading — missing file is fine.
-        let _ = dotenvy::dotenv();
-
-        let home = dirs_home()?;
-
-        // --- path resolution (same chain as Go) --------------------------
+    fn resolve_paths(home: &Path) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf, String)> {
         let data_dir = env_or_default("DATA_DIR", || {
             home.join(".local")
                 .join("share")
@@ -81,17 +69,35 @@ impl Config {
         });
         let log_path = PathBuf::from(log_path);
 
-        // Ensure directories exist (match Go's `os.MkdirAll`)
-        std::fs::create_dir_all(&db_path)
-            .with_context(|| format!("creating db directory: {}", db_path.display()))?;
-        std::fs::create_dir_all(&models_dir)
-            .with_context(|| format!("creating models directory: {}", models_dir.display()))?;
-
         let project_root = env::var("PROJECT_ROOT").unwrap_or_else(|_| {
             env::current_dir()
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|_| ".".to_string())
         });
+
+        Ok((data_dir, db_path, models_dir, log_path, project_root))
+    }
+
+    /// Load configuration from environment variables (and an optional `.env`
+    /// file).  Mirrors the Go `LoadConfig` function:
+    ///
+    /// 1. Attempt to load `.env` (ignore if absent).
+    /// 2. Resolve paths with the same fallback chain as the Go version.
+    /// 3. Ensure required directories exist.
+    pub fn load() -> Result<Self> {
+        // Best-effort .env loading — missing file is fine.
+        let _ = dotenvy::dotenv();
+
+        let home = dirs_home()?;
+
+        // --- path resolution (same chain as Go) --------------------------
+        let (data_dir, db_path, models_dir, log_path, project_root) = Self::resolve_paths(&home)?;
+
+        // Ensure directories exist (match Go's `os.MkdirAll`)
+        std::fs::create_dir_all(&db_path)
+            .with_context(|| format!("creating db directory: {}", db_path.display()))?;
+        std::fs::create_dir_all(&models_dir)
+            .with_context(|| format!("creating models directory: {}", models_dir.display()))?;
 
         let model_name =
             env::var("MODEL_NAME").unwrap_or_else(|_| "BAAI/bge-small-en-v1.5".to_string());

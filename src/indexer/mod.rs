@@ -37,7 +37,7 @@ pub async fn index_file(
                 format!(".{}", e)
             }
         })
-        .unwrap_or_else(|| "".to_string());
+        .unwrap_or_default();
 
     let chunks = if extension == ".pdf" {
         chunker::parse_pdf(&raw_bytes, path)?

@@ -65,26 +65,22 @@ impl Embedder {
             if let Ok(r_model) = r_repo
                 .get("model.onnx")
                 .or_else(|_| r_repo.get("onnx/model.onnx"))
+                && let Ok(r_sess) = Session::builder()?.commit_from_file(r_model)
+                && let Ok(r_tok_path) = r_repo
+                    .get("tokenizer.json")
+                    .or_else(|_| r_repo.get("onnx/tokenizer.json"))
+                && let Ok(mut r_tok) = Tokenizer::from_file(r_tok_path)
             {
-                if let Ok(r_sess) = Session::builder()?.commit_from_file(r_model) {
-                    if let Ok(r_tok_path) = r_repo
-                        .get("tokenizer.json")
-                        .or_else(|_| r_repo.get("onnx/tokenizer.json"))
-                    {
-                        if let Ok(mut r_tok) = Tokenizer::from_file(r_tok_path) {
-                            let _ = r_tok.with_truncation(Some(tokenizers::TruncationParams {
-                                max_length: 512,
-                                ..Default::default()
-                            }));
-                            let _ = r_tok.with_padding(Some(tokenizers::PaddingParams {
-                                strategy: tokenizers::PaddingStrategy::Fixed(512),
-                                ..Default::default()
-                            }));
-                            rerank_session = Some(Mutex::new(r_sess));
-                            rerank_tokenizer = Some(r_tok);
-                        }
-                    }
-                }
+                let _ = r_tok.with_truncation(Some(tokenizers::TruncationParams {
+                    max_length: 512,
+                    ..Default::default()
+                }));
+                let _ = r_tok.with_padding(Some(tokenizers::PaddingParams {
+                    strategy: tokenizers::PaddingStrategy::Fixed(512),
+                    ..Default::default()
+                }));
+                rerank_session = Some(Mutex::new(r_sess));
+                rerank_tokenizer = Some(r_tok);
             }
         }
 

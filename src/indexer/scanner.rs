@@ -76,15 +76,16 @@ fn is_indexable(path: &Path) -> bool {
     }
 
     // 2. Avoid oversized files (e.g. 1MB limit for safety)
-    if let Ok(metadata) = std::fs::metadata(path) {
-        if metadata.len() > 1_000_000 && ext != "pdf" {
-            warn!(
-                "Skipping oversized file: {} ({} bytes)",
-                path.display(),
-                metadata.len()
-            );
-            return false;
-        }
+    if let Ok(metadata) = std::fs::metadata(path)
+        && metadata.len() > 1_000_000
+        && ext != "pdf"
+    {
+        warn!(
+            "Skipping oversized file: {} ({} bytes)",
+            path.display(),
+            metadata.len()
+        );
+        return false;
     }
 
     true

@@ -105,7 +105,7 @@ async fn message_handler(
         let response_json = serde_json::to_string(&response).unwrap_or_default();
 
         let event = Event::default().event("message").data(response_json);
-        if let Err(_) = tx.send(event) {
+        if tx.send(event).is_err() {
             warn!(session = %session_id, "failed to send response to SSE stream (client disconnected)");
         }
     });

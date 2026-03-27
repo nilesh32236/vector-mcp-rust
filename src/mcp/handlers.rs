@@ -336,17 +336,17 @@ async fn handle_check_dependency_health(
     // 1. Detect project type and load declared dependencies
     if abs_path.join("package.json").exists() {
         project_type = "npm";
-        if let Ok(content) = std::fs::read_to_string(abs_path.join("package.json")) {
-            if let Ok(v) = serde_json::from_str::<Value>(&content) {
-                if let Some(deps) = v["dependencies"].as_object() {
-                    for d in deps.keys() {
-                        declared_deps.insert(d.clone());
-                    }
+        if let Ok(content) = std::fs::read_to_string(abs_path.join("package.json"))
+            && let Ok(v) = serde_json::from_str::<Value>(&content)
+        {
+            if let Some(deps) = v["dependencies"].as_object() {
+                for d in deps.keys() {
+                    declared_deps.insert(d.clone());
                 }
-                if let Some(dev) = v["devDependencies"].as_object() {
-                    for d in dev.keys() {
-                        declared_deps.insert(d.clone());
-                    }
+            }
+            if let Some(dev) = v["devDependencies"].as_object() {
+                for d in dev.keys() {
+                    declared_deps.insert(d.clone());
                 }
             }
         }
@@ -369,10 +369,11 @@ async fn handle_check_dependency_health(
             let re = regex::Regex::new(r"^([a-zA-Z0-9_\-]+)")?;
             for line in content.lines() {
                 let trimmed = line.trim();
-                if !trimmed.is_empty() && !trimmed.starts_with('#') {
-                    if let Some(cap) = re.captures(trimmed) {
-                        declared_deps.insert(cap[1].to_string());
-                    }
+                if !trimmed.is_empty()
+                    && !trimmed.starts_with('#')
+                    && let Some(cap) = re.captures(trimmed)
+                {
+                    declared_deps.insert(cap[1].to_string());
                 }
             }
         }
@@ -418,10 +419,8 @@ async fn handle_check_dependency_health(
                         {
                             used_deps.insert(import_path.to_string());
                         }
-                    } else if project_type == "python" {
-                        if !import_path.starts_with('.') {
-                            used_deps.insert(import_path.to_string());
-                        }
+                    } else if project_type == "python" && !import_path.starts_with('.') {
+                        used_deps.insert(import_path.to_string());
                     }
                 }
             }
@@ -546,7 +545,7 @@ async fn handle_find_dead_code(server: &Server, params: &CallToolParams) -> Resu
 
     let mut dead = Vec::new();
     for (name, path) in exports {
-        let base_name = name.split('.').last().unwrap_or(&name);
+        let base_name = name.split('.').next_back().unwrap_or(&name);
         if !usages.contains(&name) && !usages.contains(base_name) {
             dead.push((name, path));
         }
@@ -570,17 +569,17 @@ fn handle_filesystem_grep(server: &Server, params: &CallToolParams) -> Result<Ca
     use walkdir::WalkDir;
     for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
         let entry: walkdir::DirEntry = entry;
-        if entry.file_type().is_file() {
-            if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                for (i, line) in content.lines().enumerate() {
-                    if line.to_lowercase().contains(&query) {
-                        results.push(format!(
-                            "{}:{}: {}",
-                            entry.path().display(),
-                            i + 1,
-                            line.trim()
-                        ));
-                    }
+        if entry.file_type().is_file()
+            && let Ok(content) = std::fs::read_to_string(entry.path())
+        {
+            for (i, line) in content.lines().enumerate() {
+                if line.to_lowercase().contains(&query) {
+                    results.push(format!(
+                        "{}:{}: {}",
+                        entry.path().display(),
+                        i + 1,
+                        line.trim()
+                    ));
                 }
             }
         }
