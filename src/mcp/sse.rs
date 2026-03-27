@@ -2,15 +2,18 @@
 
 use axum::{
     Router,
-    extract::{Query, State},
+    extract::{Query, State, Host},
     http::StatusCode,
     response::{Sse, sse::Event},
     routing::{get, post},
 };
 use futures::stream::Stream;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
@@ -25,24 +28,52 @@ use super::server::Server;
 type SessionSender = mpsc::UnboundedSender<Event>;
 
 pub struct SseManager {
-    sessions: Mutex<HashMap<String, SessionSender>>,
+    sessions: DashMap<String, SessionSender>,
     server: Arc<Server>,
-    port: u16,
 }
 
 impl SseManager {
-    pub fn new(server: Arc<Server>, port: u16) -> Self {
+    pub fn new(server: Arc<Server>) -> Self {
         Self {
-            sessions: Mutex::new(HashMap::new()),
+            sessions: DashMap::new(),
             server,
-            port,
         }
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// SSE Session Cleanup Wrapper
+// ---------------------------------------------------------------------------
+
+struct SessionCleanupStream<S> {
+    inner: Pin<Box<S>>,
+    session_id: String,
+    manager: Arc<SseManager>,
+}
+
+impl<S> Stream for SessionCleanupStream<S>
+where
+    S: Stream + Unpin,
+{
+    type Item = S::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+impl<S> Drop for SessionCleanupStream<S> {
+    fn drop(&mut self) {
+        info!(session = %self.session_id, "SSE session disconnected, cleaning up");
+        self.manager.sessions.remove(&self.session_id);
     }
 }
 
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
+
 
 #[derive(serde::Deserialize)]
 struct MessageQuery {
@@ -51,30 +82,34 @@ struct MessageQuery {
 
 /// GET /sse — Start the SSE connection.
 async fn sse_handler(
+    Host(host): Host,
     State(manager): State<Arc<SseManager>>,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
     let session_id = Uuid::new_v4().to_string();
     let (tx, rx) = mpsc::unbounded_channel();
 
-    {
-        let mut sessions = manager.sessions.lock().await;
-        sessions.insert(session_id.clone(), tx.clone());
-    }
+    manager.sessions.insert(session_id.clone(), tx.clone());
 
     info!(session = %session_id, "new SSE session");
 
     // Send the endpoint event as per MCP spec.
     // The client will use this URL to POST messages.
     // Use an absolute URL as some clients are sensitive to relative paths.
+    // Dynamically build the absolute URL based on the incoming Host header.
     let endpoint_url = format!(
-        "http://localhost:{}/message?session_id={}",
-        manager.port, session_id
+        "http://{}/message?session_id={}",
+        host, session_id
     );
     let _ = tx.send(Event::default().event("endpoint").data(endpoint_url));
 
     let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx).map(Ok);
+    let session_cleanup = SessionCleanupStream {
+        inner: Box::pin(stream),
+        session_id: session_id.clone(),
+        manager: Arc::clone(&manager),
+    };
 
-    Sse::new(stream)
+    Sse::new(session_cleanup)
 }
 
 /// POST /message — Receive JSON-RPC messages.
@@ -83,10 +118,7 @@ async fn message_handler(
     Query(query): Query<MessageQuery>,
     body: String,
 ) -> StatusCode {
-    let sender = {
-        let sessions = manager.sessions.lock().await;
-        sessions.get(&query.session_id).cloned()
-    };
+    let sender = manager.sessions.get(&query.session_id).map(|s| s.clone());
 
     let tx = match sender {
         Some(t) => t,
@@ -118,14 +150,19 @@ async fn message_handler(
 // ---------------------------------------------------------------------------
 
 pub async fn start_sse_server(server: Arc<Server>, port: u16) -> anyhow::Result<()> {
-    let manager = Arc::new(SseManager::new(server, port));
+    let manager = Arc::new(SseManager::new(server));
 
     // Handle both /sse and /message with a unified approach to avoid 405 Method Not Allowed.
     // Some clients might POST to /sse or GET /message depending on implementation details.
     let app = Router::new()
         .route("/sse", get(sse_handler).post(message_handler_permissive))
         .route("/message", post(message_handler).get(not_found_handler))
-        .layer(CorsLayer::permissive())
+        .layer(
+            CorsLayer::new()
+                .allow_origin(tower_http::cors::Any)
+                .allow_methods(tower_http::cors::Any)
+                .allow_headers(tower_http::cors::Any)
+        )
         .with_state(manager);
 
     let addr = format!("0.0.0.0:{}", port);
