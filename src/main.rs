@@ -4,14 +4,14 @@ mod indexer;
 mod llm;
 mod mcp;
 
+use anyhow::{Context, Result};
 use std::sync::Arc;
-use anyhow::{Result, Context};
 use tracing::info;
 
-use crate::llm::embedding::Embedder;
-use crate::llm::summarizer::Summarizer;
 use crate::config::Config;
 use crate::db::Store;
+use crate::llm::embedding::Embedder;
+use crate::llm::summarizer::Summarizer;
 
 fn setup_logging() {
     tracing_subscriber::fmt()
@@ -44,14 +44,15 @@ async fn start_background_tasks(
     let store_clone = Arc::clone(&store);
     let embedder_clone = Arc::clone(&embedder);
     let summarizer_clone = Arc::clone(&summarizer);
-    
+
     tokio::spawn(async move {
         let _ = crate::indexer::scanner::scan_project(
             config_clone,
             store_clone,
             embedder_clone,
             summarizer_clone,
-        ).await;
+        )
+        .await;
     });
 
     indexer::watcher::start_watcher(
@@ -59,7 +60,9 @@ async fn start_background_tasks(
         Arc::clone(&store),
         Arc::clone(&embedder),
         Arc::clone(&summarizer),
-    ).await.context("Starting background watcher")?;
+    )
+    .await
+    .context("Starting background watcher")?;
 
     Ok(())
 }
@@ -86,7 +89,13 @@ async fn main() -> Result<()> {
     let config = Arc::new(cfg);
 
     // 5. Initial Scan & Background Watcher (if enabled).
-    start_background_tasks(Arc::clone(&config), Arc::clone(&store), Arc::clone(&embedder), Arc::clone(&summarizer)).await?;
+    start_background_tasks(
+        Arc::clone(&config),
+        Arc::clone(&store),
+        Arc::clone(&embedder),
+        Arc::clone(&summarizer),
+    )
+    .await?;
 
     // 6. Start MCP server.
     let server = Arc::new(mcp::server::Server::new(

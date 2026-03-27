@@ -81,7 +81,10 @@ fn resolve_language(ext: &str) -> Option<LangSpec> {
     let (language, queries): (Language, &[&str]) = match ext {
         ".go" => (tree_sitter_go::LANGUAGE.into(), GO_QUERIES),
         ".js" | ".jsx" => (tree_sitter_javascript::LANGUAGE.into(), JS_TS_QUERIES),
-        ".ts" => (tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), JS_TS_QUERIES),
+        ".ts" => (
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            JS_TS_QUERIES,
+        ),
         ".tsx" => (tree_sitter_typescript::LANGUAGE_TSX.into(), JS_TS_QUERIES),
         ".php" => (tree_sitter_php::LANGUAGE_PHP.into(), PHP_QUERIES),
         ".rs" => (tree_sitter_rust::LANGUAGE.into(), RUST_QUERIES),
@@ -206,10 +209,7 @@ fn extract_raw_chunks(source: &[u8], spec: &LangSpec, tree: &tree_sitter::Tree) 
             Err(_) => continue, // skip invalid queries gracefully
         };
 
-        let entity_idx = query
-            .capture_names()
-            .iter()
-            .position(|n| *n == "entity");
+        let entity_idx = query.capture_names().iter().position(|n| *n == "entity");
         let name_idx = query
             .capture_names()
             .iter()
@@ -220,10 +220,16 @@ fn extract_raw_chunks(source: &[u8], spec: &LangSpec, tree: &tree_sitter::Tree) 
 
         while let Some(m) = matches.next() {
             let entity_node: Option<Node> = entity_idx.and_then(|idx| {
-                m.captures.iter().find(|c| c.index as usize == idx).map(|c| c.node)
+                m.captures
+                    .iter()
+                    .find(|c| c.index as usize == idx)
+                    .map(|c| c.node)
             });
             let name_node: Option<Node> = name_idx.and_then(|idx| {
-                m.captures.iter().find(|c| c.index as usize == idx).map(|c| c.node)
+                m.captures
+                    .iter()
+                    .find(|c| c.index as usize == idx)
+                    .map(|c| c.node)
             });
 
             let entity_node: Node = match entity_node {
@@ -244,10 +250,7 @@ fn extract_raw_chunks(source: &[u8], spec: &LangSpec, tree: &tree_sitter::Tree) 
                 .unwrap_or("Unknown")
                 .to_owned();
 
-            let chunk_text = entity_node
-                .utf8_text(source)
-                .unwrap_or("")
-                .to_owned();
+            let chunk_text = entity_node.utf8_text(source).unwrap_or("").to_owned();
 
             let calls = extract_calls(entity_node, source);
             let score = calculate_score(entity_node, &calls);
@@ -332,14 +335,13 @@ fn walk_calls(node: tree_sitter::Node, source: &[u8], out: &mut HashSet<String>)
                     || ct == "member_expression"
                     || ct == "field_expression")
                     && child.child_count() > 0
+                    && let Some(last) = child.child(child.child_count() - 1)
                 {
-                    if let Some(last) = child.child(child.child_count() - 1) {
-                        let lt = last.kind();
-                        if lt == "field_identifier" || lt == "property_identifier" {
-                            if let Ok(text) = last.utf8_text(source) {
-                                out.insert(text.to_owned());
-                            }
-                        }
+                    let lt = last.kind();
+                    if (lt == "field_identifier" || lt == "property_identifier")
+                        && let Ok(text) = last.utf8_text(source)
+                    {
+                        out.insert(text.to_owned());
                     }
                 }
             }
@@ -417,12 +419,12 @@ fn parse_go_relationships(text: &str, relations: &mut Vec<String>) {
     if let Ok(re) = block_re {
         let inner_re = regex::Regex::new(r#"["']([^"']+)["']"#);
         for cap in re.captures_iter(text) {
-            if let Some(block) = cap.get(1) {
-                if let Ok(ref ire) = inner_re {
-                    for ic in ire.captures_iter(block.as_str()) {
-                        if let Some(m) = ic.get(1) {
-                            relations.push(m.as_str().to_owned());
-                        }
+            if let Some(block) = cap.get(1)
+                && let Ok(ref ire) = inner_re
+            {
+                for ic in ire.captures_iter(block.as_str()) {
+                    if let Some(m) = ic.get(1) {
+                        relations.push(m.as_str().to_owned());
                     }
                 }
             }
@@ -431,7 +433,9 @@ fn parse_go_relationships(text: &str, relations: &mut Vec<String>) {
 }
 
 fn parse_php_relationships(text: &str, relations: &mut Vec<String>) {
-    let req_re = regex::Regex::new(r#"(?:require|require_once|include|include_once)\s*\(?\s*['"]([^'"]+)['"]"#);
+    let req_re = regex::Regex::new(
+        r#"(?:require|require_once|include|include_once)\s*\(?\s*['"]([^'"]+)['"]"#,
+    );
     if let Ok(re) = req_re {
         for cap in re.captures_iter(text) {
             if let Some(m) = cap.get(1) {
@@ -527,4 +531,63 @@ fn fast_chunk(text: &str, file_path: &str) -> Vec<Chunk> {
     }
 
     chunks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_js_relationships() {
+        let code = r#"
+            import { foo } from "./foo";
+            import * as bar from "bar";
+            const baz = require('baz');
+        "#;
+        let mut relations = Vec::new();
+        parse_js_relationships(code, &mut relations);
+        assert!(relations.contains(&"./foo".to_string()));
+        assert!(relations.contains(&"foo".to_string()));
+        assert!(relations.contains(&"bar".to_string()));
+        assert!(relations.contains(&"baz".to_string()));
+    }
+
+    #[test]
+    fn test_parse_go_relationships() {
+        let code = r#"
+            import "fmt"
+            import (
+                "os"
+                "path/filepath"
+            )
+        "#;
+        let mut relations = Vec::new();
+        parse_go_relationships(code, &mut relations);
+        assert!(relations.contains(&"fmt".to_string()));
+        assert!(relations.contains(&"os".to_string()));
+        assert!(relations.contains(&"path/filepath".to_string()));
+    }
+
+    #[test]
+    fn test_parse_rust_relationships() {
+        let code = r#"
+            use std::collections::HashMap;
+            use crate::db::Store;
+        "#;
+        let mut relations = Vec::new();
+        parse_rust_relationships(code, &mut relations);
+        assert!(relations.contains(&"std::collections::HashMap".to_string()));
+        assert!(relations.contains(&"crate::db::Store".to_string()));
+    }
+
+    #[test]
+    fn test_parse_relationships_dispatch() {
+        let code = "import 'vue';";
+        let rels = parse_relationships(code, ".js");
+        assert!(rels.contains(&"vue".to_string()));
+
+        let go_code = "import \"net/http\"";
+        let go_rels = parse_relationships(go_code, ".go");
+        assert!(go_rels.contains(&"net/http".to_string()));
+    }
 }
