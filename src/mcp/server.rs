@@ -108,7 +108,7 @@ impl Server {
                     INVALID_PARAMS,
                     format!("Invalid JSON: {e}"),
                 );
-                return serde_json::to_value(&resp).unwrap();
+                return to_json_rpc_value(&resp, None);
             }
         };
 
@@ -117,26 +117,26 @@ impl Server {
         match request.method.as_str() {
             "initialize" => {
                 let result = self.handle_initialize();
-                serde_json::to_value(&JsonRpcResponse::new(id, json_value(&result))).unwrap()
+                to_json_rpc_value(&JsonRpcResponse::new(id.clone(), json_value(&result)), id)
             }
             "initialized" => {
-                serde_json::to_value(&JsonRpcResponse::new(id, json!({}))).unwrap()
+                to_json_rpc_value(&JsonRpcResponse::new(id.clone(), json!({})), id)
             }
             "tools/list" => {
                 let tools = tools::tool_definitions();
-                serde_json::to_value(&JsonRpcResponse::new(id, json!({ "tools": tools }))).unwrap()
+                to_json_rpc_value(&JsonRpcResponse::new(id.clone(), json!({ "tools": tools })), id)
             }
             "tools/call" => self.handle_tools_call(id, &request.params).await,
             "notifications/cancelled" | "notifications/progress" => {
-                serde_json::to_value(&JsonRpcResponse::new(id, json!({}))).unwrap()
+                to_json_rpc_value(&JsonRpcResponse::new(id.clone(), json!({})), id)
             }
             _ => {
                 let resp = JsonRpcErrorResponse::new(
-                    id,
+                    id.clone(),
                     METHOD_NOT_FOUND,
                     format!("Method not found: {}", request.method),
                 );
-                serde_json::to_value(&resp).unwrap()
+                to_json_rpc_value(&resp, id)
             }
         }
     }
@@ -167,11 +167,11 @@ impl Server {
             Ok(p) => p,
             Err(e) => {
                 let resp = JsonRpcErrorResponse::new(
-                    id,
+                    id.clone(),
                     INVALID_PARAMS,
                     format!("Invalid tools/call params: {e}"),
                 );
-                return serde_json::to_value(&resp).unwrap();
+                return to_json_rpc_value(&resp, id);
             }
         };
 
@@ -180,15 +180,15 @@ impl Server {
             Err(e) => {
                 error!(tool = %params.name, err = %e, "handler error");
                 let resp = JsonRpcErrorResponse::new(
-                    id,
+                    id.clone(),
                     INTERNAL_ERROR,
                     format!("Tool execution error: {e}"),
                 );
-                return serde_json::to_value(&resp).unwrap();
+                return to_json_rpc_value(&resp, id);
             }
         };
 
-        serde_json::to_value(&JsonRpcResponse::new(id, json_value(&result))).unwrap()
+        to_json_rpc_value(&JsonRpcResponse::new(id.clone(), json_value(&result)), id)
     }
 }
 
@@ -200,3 +200,19 @@ fn json_value<T: serde::Serialize>(v: &T) -> serde_json::Value {
     serde_json::to_value(v).unwrap_or_else(|e| json!({"error": e.to_string()}))
 }
 
+/// Fallback for JSON-RPC serialization errors.
+fn to_json_rpc_value<T: serde::Serialize>(
+    v: &T,
+    id: Option<serde_json::Value>,
+) -> serde_json::Value {
+    serde_json::to_value(v).unwrap_or_else(|e| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": INTERNAL_ERROR,
+                "message": format!("Serialization failed: {e}")
+            }
+        })
+    })
+}
