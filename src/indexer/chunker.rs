@@ -81,7 +81,10 @@ fn resolve_language(ext: &str) -> Option<LangSpec> {
     let (language, queries): (Language, &[&str]) = match ext {
         ".go" => (tree_sitter_go::LANGUAGE.into(), GO_QUERIES),
         ".js" | ".jsx" => (tree_sitter_javascript::LANGUAGE.into(), JS_TS_QUERIES),
-        ".ts" => (tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(), JS_TS_QUERIES),
+        ".ts" => (
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            JS_TS_QUERIES,
+        ),
         ".tsx" => (tree_sitter_typescript::LANGUAGE_TSX.into(), JS_TS_QUERIES),
         ".php" => (tree_sitter_php::LANGUAGE_PHP.into(), PHP_QUERIES),
         ".rs" => (tree_sitter_rust::LANGUAGE.into(), RUST_QUERIES),
@@ -217,10 +220,7 @@ fn tree_sitter_chunk(content: &str, _file_path: &str, spec: &LangSpec) -> Result
             Err(_) => continue, // skip invalid queries gracefully
         };
 
-        let entity_idx = query
-            .capture_names()
-            .iter()
-            .position(|n| *n == "entity");
+        let entity_idx = query.capture_names().iter().position(|n| *n == "entity");
         let name_idx = query
             .capture_names()
             .iter()
@@ -231,10 +231,16 @@ fn tree_sitter_chunk(content: &str, _file_path: &str, spec: &LangSpec) -> Result
 
         while let Some(m) = matches.next() {
             let entity_node: Option<Node> = entity_idx.and_then(|idx| {
-                m.captures.iter().find(|c| c.index as usize == idx).map(|c| c.node)
+                m.captures
+                    .iter()
+                    .find(|c| c.index as usize == idx)
+                    .map(|c| c.node)
             });
             let name_node: Option<Node> = name_idx.and_then(|idx| {
-                m.captures.iter().find(|c| c.index as usize == idx).map(|c| c.node)
+                m.captures
+                    .iter()
+                    .find(|c| c.index as usize == idx)
+                    .map(|c| c.node)
             });
 
             let entity_node: Node = match entity_node {
@@ -255,10 +261,7 @@ fn tree_sitter_chunk(content: &str, _file_path: &str, spec: &LangSpec) -> Result
                 .unwrap_or("Unknown")
                 .to_owned();
 
-            let chunk_text = entity_node
-                .utf8_text(source)
-                .unwrap_or("")
-                .to_owned();
+            let chunk_text = entity_node.utf8_text(source).unwrap_or("").to_owned();
 
             let calls = extract_calls(entity_node, source);
             let score = calculate_score(entity_node, &calls);
@@ -374,9 +377,7 @@ fn parse_relationships(text: &str, ext: &str) -> Vec<String> {
     match ext {
         ".ts" | ".tsx" | ".js" | ".jsx" => {
             // import/from/require paths
-            let path_re = regex::Regex::new(
-                r#"(?:import|from|require)\s*\(?\s*['"]([^'"]+)['"]"#,
-            );
+            let path_re = regex::Regex::new(r#"(?:import|from|require)\s*\(?\s*['"]([^'"]+)['"]"#);
             if let Ok(re) = path_re {
                 for cap in re.captures_iter(text) {
                     if let Some(m) = cap.get(1) {
@@ -401,9 +402,7 @@ fn parse_relationships(text: &str, ext: &str) -> Vec<String> {
         }
         ".go" => {
             // single import
-            let single_re = regex::Regex::new(
-                r#"import\s+(?:[a-zA-Z0-9_.]+\s+)?["']([^"']+)["']"#,
-            );
+            let single_re = regex::Regex::new(r#"import\s+(?:[a-zA-Z0-9_.]+\s+)?["']([^"']+)["']"#);
             if let Ok(re) = single_re {
                 for cap in re.captures_iter(text) {
                     if let Some(m) = cap.get(1) {

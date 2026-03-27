@@ -68,9 +68,7 @@ impl Config {
         });
         let data_dir = PathBuf::from(data_dir);
 
-        let db_path = env_or_default("DB_PATH", || {
-            data_dir.join("lancedb").display().to_string()
-        });
+        let db_path = env_or_default("DB_PATH", || data_dir.join("lancedb").display().to_string());
         let db_path = PathBuf::from(db_path);
 
         let models_dir = env_or_default("MODELS_DIR", || {
