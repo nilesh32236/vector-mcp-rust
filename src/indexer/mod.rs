@@ -1,14 +1,14 @@
 pub mod chunker;
-pub mod watcher;
 pub mod scanner;
+pub mod watcher;
 
+use anyhow::{Context, Result};
+use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, StringArray};
+use arrow_schema::{DataType, Field, Schema};
+use lance_arrow::FixedSizeListArrayExt;
+use serde_json::json;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use anyhow::{Result, Context};
-use arrow_array::{RecordBatch, StringArray, FixedSizeListArray, Float32Array};
-use arrow_schema::{Schema, Field, DataType};
-use serde_json::json;
-use lance_arrow::FixedSizeListArrayExt;
 
 use crate::config::Config;
 use crate::db::{Record, Store};
@@ -23,13 +23,20 @@ pub async fn index_file(
     embedder: Arc<Embedder>,
     summarizer: Arc<Summarizer>,
 ) -> Result<()> {
-    let raw_bytes = std::fs::read(path)
+    let raw_bytes = tokio::fs::read(path)
+        .await
         .with_context(|| format!("Reading file for indexing: {path}"))?;
-    
+
     let extension = std::path::Path::new(path)
         .extension()
         .and_then(|e| e.to_str())
-        .map(|e| if e.starts_with('.') { e.to_string() } else { format!(".{}", e) })
+        .map(|e| {
+            if e.starts_with('.') {
+                e.to_string()
+            } else {
+                format!(".{}", e)
+            }
+        })
         .unwrap_or_else(|| "".to_string());
 
     let chunks = if extension == ".pdf" {
@@ -50,20 +57,24 @@ pub async fn index_file(
 
     for (i, chunk) in chunks.into_iter().enumerate() {
         let vector = embedder.embed_text(&chunk.content)?;
-        
+
         // Optional: Generate AI summary if local LLM is enabled.
         // We only do this for function/class chunks to save time, or if requested.
-        let ai_summary: String = if config.feature_toggles.enable_local_llm && chunk.function_score > 0.5 {
-            match summarizer.summarize_chunk(&chunk.content, Arc::clone(&config)).await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!("Summary failed for {}: {}", path, e);
-                    "Summary failed".to_string()
+        let ai_summary: String =
+            if config.feature_toggles.enable_local_llm && chunk.function_score > 0.5 {
+                match summarizer
+                    .summarize_chunk(&chunk.content, Arc::clone(&config))
+                    .await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::error!("Summary failed for {}: {}", path, e);
+                        "Summary failed".to_string()
+                    }
                 }
-            }
-        } else {
-            "No AI summary generated".to_string()
-        };
+            } else {
+                "No AI summary generated".to_string()
+            };
 
         let metadata = json!({
             "path": path,
@@ -110,14 +121,24 @@ fn records_to_batch(records: Vec<Record>, dimension: usize) -> Result<RecordBatc
     ]));
 
     let ids = StringArray::from(records.iter().map(|r| r.id.as_str()).collect::<Vec<_>>());
-    let contents = StringArray::from(records.iter().map(|r| r.content.as_str()).collect::<Vec<_>>());
-    let metadatas = StringArray::from(records.iter().map(|r| r.metadata.as_str()).collect::<Vec<_>>());
+    let contents = StringArray::from(
+        records
+            .iter()
+            .map(|r| r.content.as_str())
+            .collect::<Vec<_>>(),
+    );
+    let metadatas = StringArray::from(
+        records
+            .iter()
+            .map(|r| r.metadata.as_str())
+            .collect::<Vec<_>>(),
+    );
 
     let mut flattened_vectors = Vec::new();
     for r in &records {
         flattened_vectors.extend_from_slice(&r.vector);
     }
-    
+
     let vector_values = Float32Array::from(flattened_vectors);
     let vectors = FixedSizeListArray::try_new_from_values(vector_values, dimension as i32)?;
 
@@ -129,5 +150,6 @@ fn records_to_batch(records: Vec<Record>, dimension: usize) -> Result<RecordBatc
             Arc::new(vectors),
             Arc::new(metadatas),
         ],
-    ).context("Creating RecordBatch for indexing")
+    )
+    .context("Creating RecordBatch for indexing")
 }

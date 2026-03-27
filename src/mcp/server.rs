@@ -14,9 +14,9 @@ use crate::llm::summarizer::Summarizer;
 
 use super::handlers;
 use super::protocol::{
-    CallToolParams, CallToolResult, InitializeResult, JsonRpcErrorResponse,
-    JsonRpcRequest, JsonRpcResponse, ServerCapabilities, ServerInfo,
-    ToolCapability, INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND,
+    CallToolParams, CallToolResult, INTERNAL_ERROR, INVALID_PARAMS, InitializeResult,
+    JsonRpcErrorResponse, JsonRpcRequest, JsonRpcResponse, METHOD_NOT_FOUND, ServerCapabilities,
+    ServerInfo, ToolCapability,
 };
 use super::tools;
 
@@ -103,11 +103,8 @@ impl Server {
             Ok(r) => r,
             Err(e) => {
                 error!(err = %e, "failed to parse JSON-RPC request");
-                let resp = JsonRpcErrorResponse::new(
-                    None,
-                    INVALID_PARAMS,
-                    format!("Invalid JSON: {e}"),
-                );
+                let resp =
+                    JsonRpcErrorResponse::new(None, INVALID_PARAMS, format!("Invalid JSON: {e}"));
                 return to_json_rpc_value(&resp, None);
             }
         };
@@ -119,12 +116,13 @@ impl Server {
                 let result = self.handle_initialize();
                 to_json_rpc_value(&JsonRpcResponse::new(id.clone(), json_value(&result)), id)
             }
-            "initialized" => {
-                to_json_rpc_value(&JsonRpcResponse::new(id.clone(), json!({})), id)
-            }
+            "initialized" => to_json_rpc_value(&JsonRpcResponse::new(id.clone(), json!({})), id),
             "tools/list" => {
                 let tools = tools::tool_definitions();
-                to_json_rpc_value(&JsonRpcResponse::new(id.clone(), json!({ "tools": tools })), id)
+                to_json_rpc_value(
+                    &JsonRpcResponse::new(id.clone(), json!({ "tools": tools })),
+                    id,
+                )
             }
             "tools/call" => self.handle_tools_call(id, &request.params).await,
             "notifications/cancelled" | "notifications/progress" => {

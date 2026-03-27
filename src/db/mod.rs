@@ -1,13 +1,13 @@
-use std::sync::Arc;
 use anyhow::{Context, Result};
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
-use lancedb::index::scalar::{FullTextSearchQuery, InvertedIndexParams as FtsIndexBuilder};
 use lancedb::index::Index;
+use lancedb::index::scalar::{FullTextSearchQuery, InvertedIndexParams as FtsIndexBuilder};
 use lancedb::query::{ExecutableQuery, QueryBase};
-use lancedb::{connect, Connection, Table as LanceTable};
+use lancedb::{Connection, Table as LanceTable, connect};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
 // Database Record Schema
@@ -66,8 +66,14 @@ impl Store {
     }
 
     /// Perform a hybrid search (Vector + Full-Text Search).
-    pub async fn hybrid_search(&self, vector: Vec<f32>, query: &str, limit: usize) -> Result<Vec<Record>> {
-        let results = self.code_vectors
+    pub async fn hybrid_search(
+        &self,
+        vector: Vec<f32>,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<Record>> {
+        let results = self
+            .code_vectors
             .query()
             .nearest_to(vector)?
             .full_text_search(FullTextSearchQuery::new(query.to_string()))
@@ -81,16 +87,20 @@ impl Store {
 
     /// Delete all records associated with a specific file path.
     pub async fn delete_by_path(&self, path: &str) -> Result<()> {
-        let predicate = format!("metadata LIKE '%\"path\":\"{}\"%'", path.replace('\'', "''"));
-        self.code_vectors.delete(&predicate).await.context("Deleting records by path").map(|_| ())
+        let predicate = format!(
+            "metadata LIKE '%\"path\":\"{}\"%'",
+            path.replace('\'', "''")
+        );
+        self.code_vectors
+            .delete(&predicate)
+            .await
+            .context("Deleting records by path")
+            .map(|_| ())
     }
 
     /// Retrieve all records from the database (used for full codebase analysis).
     pub async fn get_all_records(&self) -> Result<Vec<Record>> {
-        let results = self.code_vectors
-            .query()
-            .execute()
-            .await?;
+        let results = self.code_vectors.query().execute().await?;
 
         let batches = results.try_collect::<Vec<_>>().await?;
         self.batches_to_records(batches).await
@@ -158,17 +168,25 @@ async fn open_or_create_table(
 ) -> Result<LanceTable> {
     let table_names = connection.table_names().execute().await?;
     if table_names.contains(&name.to_string()) {
-        connection.open_table(name).execute().await.context("Opening table")
+        connection
+            .open_table(name)
+            .execute()
+            .await
+            .context("Opening table")
     } else {
         let table = connection
             .create_table(name, empty_batch)
             .execute()
             .await
             .context("Creating table")?;
-        
+
         // Create Full-Text Search index on the content column for hybrid search.
-        table.create_index(&["content"], Index::FTS(FtsIndexBuilder::default())).execute().await.context("Creating FTS index")?;
-        
+        table
+            .create_index(&["content"], Index::FTS(FtsIndexBuilder::default()))
+            .execute()
+            .await
+            .context("Creating FTS index")?;
+
         Ok(table)
     }
 }

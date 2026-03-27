@@ -35,7 +35,9 @@ pub fn tool_definitions() -> Vec<ToolInfo> {
 fn tool_reindex_all() -> ToolInfo {
     ToolInfo {
         name: "reindex_all".into(),
-        description: "Force a full re-index of the entire project to refresh metadata and AI summaries.".into(),
+        description:
+            "Force a full re-index of the entire project to refresh metadata and AI summaries."
+                .into(),
         input_schema: empty_schema(),
     }
 }
@@ -58,7 +60,9 @@ fn tool_get_summarized_context() -> ToolInfo {
 fn tool_verify_implementation_gap() -> ToolInfo {
     ToolInfo {
         name: "verify_implementation_gap".into(),
-        description: "Verifies if things from docs and client feedback are actually implemented in the code.".into(),
+        description:
+            "Verifies if things from docs and client feedback are actually implemented in the code."
+                .into(),
         input_schema: ToolInputSchema {
             schema_type: "object",
             properties: json!({
@@ -80,7 +84,9 @@ fn tool_find_missing_tests() -> ToolInfo {
 fn tool_list_api_endpoints() -> ToolInfo {
     ToolInfo {
         name: "list_api_endpoints".into(),
-        description: "Identifies potential API route definitions in the codebase across various frameworks.".into(),
+        description:
+            "Identifies potential API route definitions in the codebase across various frameworks."
+                .into(),
         input_schema: empty_schema(),
     }
 }
@@ -186,7 +192,9 @@ fn tool_find_duplicate_code() -> ToolInfo {
 fn tool_delete_context() -> ToolInfo {
     ToolInfo {
         name: "delete_context".into(),
-        description: "Delete specific shared memory context, or completely wipe a project's vector index.".into(),
+        description:
+            "Delete specific shared memory context, or completely wipe a project's vector index."
+                .into(),
         input_schema: ToolInputSchema {
             schema_type: "object",
             properties: json!({
@@ -258,7 +266,8 @@ fn tool_generate_docstring_prompt() -> ToolInfo {
 fn tool_analyze_architecture() -> ToolInfo {
     ToolInfo {
         name: "analyze_architecture".into(),
-        description: "Generates a Mermaid.js dependency graph between packages in a monorepo.".into(),
+        description: "Generates a Mermaid.js dependency graph between packages in a monorepo."
+            .into(),
         input_schema: ToolInputSchema {
             schema_type: "object",
             properties: json!({

@@ -1,20 +1,20 @@
 //! SSE transport for MCP.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
 use axum::{
+    Router,
     extract::{Query, State},
     http::StatusCode,
-    response::{sse::Event, Sse},
+    response::{Sse, sse::Event},
     routing::{get, post},
-    Router,
 };
+use futures::stream::Stream;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::{Mutex, mpsc};
+use tokio_stream::StreamExt;
 use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
 use uuid::Uuid;
-use futures::stream::Stream;
-use tokio_stream::StreamExt;
 
 use super::server::Server;
 
@@ -66,11 +66,13 @@ async fn sse_handler(
     // Send the endpoint event as per MCP spec.
     // The client will use this URL to POST messages.
     // Use an absolute URL as some clients are sensitive to relative paths.
-    let endpoint_url = format!("http://localhost:{}/message?session_id={}", manager.port, session_id);
+    let endpoint_url = format!(
+        "http://localhost:{}/message?session_id={}",
+        manager.port, session_id
+    );
     let _ = tx.send(Event::default().event("endpoint").data(endpoint_url));
 
-    let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx)
-        .map(Ok);
+    let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx).map(Ok);
 
     Sse::new(stream)
 }
@@ -101,7 +103,7 @@ async fn message_handler(
     tokio::spawn(async move {
         let response = server.process_message(&body).await;
         let response_json = serde_json::to_string(&response).unwrap_or_default();
-        
+
         let event = Event::default().event("message").data(response_json);
         if let Err(_) = tx.send(event) {
             warn!(session = %session_id, "failed to send response to SSE stream (client disconnected)");
@@ -128,7 +130,7 @@ pub async fn start_sse_server(server: Arc<Server>, port: u16) -> anyhow::Result<
 
     let addr = format!("0.0.0.0:{}", port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    
+
     info!("SSE server listening on http://{}", addr);
     axum::serve(listener, app).await?;
 
