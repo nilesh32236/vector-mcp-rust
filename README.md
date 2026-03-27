@@ -52,11 +52,18 @@ curl -N http://localhost:47821/sse
 
 ## Tools Provided
 
-The server registers 16+ MCP tools, including:
-- `search_codebase`: Hybrid semantic search.
-- `get_definition`: Find where a symbol is defined.
+The server registers 22 MCP tools, including:
+- `search_codebase`: Hybrid semantic search with Reranking.
+- `get_summarized_context`: Local AI summary of search results.
+- `reindex_all`: Force refresh of the entire codebase index.
 - `analyze_architecture`: High-level summary of code relationships.
 - `find_duplicate_code`: Identify semantic duplication across files.
+- `check_dependency_health`: Deep import vs package.json/go.mod analysis.
+- `find_dead_code`: Identify unused exported symbols.
+- `verify_implementation_gap`: Compare docs/feedback with implementation.
+- `find_missing_tests`: Map source symbols to missing test coverage.
+- `list_api_endpoints`: Discover potential API routes.
+- `get_code_history`: Git history for specific files.
 
 ## License
 MIT

@@ -144,7 +144,17 @@ pub fn parse_file(content: &str, file_path: &str, extension: &str) -> Result<Vec
 
     let spec = match resolve_language(extension) {
         Some(s) => s,
-        None => return Ok(fast_chunk(content, file_path)),
+        None => {
+            let mut chunks = fast_chunk(content, file_path);
+            for c in &mut chunks {
+                c.relationships.clone_from(&relationships);
+                c.contextual_string = format!(
+                    "File: {file_path}. Entity: Global. Type: {}. Relationships: {:?}. Code:\n{}",
+                    c.node_type, c.relationships, c.content
+                );
+            }
+            return Ok(chunks);
+        }
     };
 
     let chunks = match tree_sitter_chunk(content, file_path, &spec) {
@@ -306,21 +316,22 @@ fn walk_calls(node: tree_sitter::Node, source: &[u8], out: &mut HashSet<String>)
         for i in 0..child_count {
             if let Some(child) = node.child(i) {
                 let ct = child.kind();
-                if (ct == "identifier" || ct == "property_identifier" || ct == "name")
-                    && let Ok(text) = child.utf8_text(source)
-                {
-                    out.insert(text.to_owned());
+                if ct == "identifier" || ct == "property_identifier" || ct == "name" {
+                    if let Ok(text) = child.utf8_text(source) {
+                        out.insert(text.to_owned());
+                    }
                 } else if (ct == "selector_expression"
                     || ct == "member_expression"
                     || ct == "field_expression")
                     && child.child_count() > 0
-                    && let Some(last) = child.child(child.child_count() - 1)
                 {
-                    let lt = last.kind();
-                    if (lt == "field_identifier" || lt == "property_identifier")
-                        && let Ok(text) = last.utf8_text(source)
-                    {
-                        out.insert(text.to_owned());
+                    if let Some(last) = child.child(child.child_count() - 1) {
+                        let lt = last.kind();
+                        if lt == "field_identifier" || lt == "property_identifier" {
+                            if let Ok(text) = last.utf8_text(source) {
+                                out.insert(text.to_owned());
+                            }
+                        }
                     }
                 }
             }
@@ -405,12 +416,12 @@ fn parse_relationships(text: &str, ext: &str) -> Vec<String> {
             if let Ok(re) = block_re {
                 let inner_re = regex::Regex::new(r#"["']([^"']+)["']"#);
                 for cap in re.captures_iter(text) {
-                    if let Some(block) = cap.get(1)
-                        && let Ok(ref ire) = inner_re
-                    {
-                        for ic in ire.captures_iter(block.as_str()) {
-                            if let Some(m) = ic.get(1) {
-                                relations.push(m.as_str().to_owned());
+                    if let Some(block) = cap.get(1) {
+                        if let Ok(ref ire) = inner_re {
+                            for ic in ire.captures_iter(block.as_str()) {
+                                if let Some(m) = ic.get(1) {
+                                    relations.push(m.as_str().to_owned());
+                                }
                             }
                         }
                     }

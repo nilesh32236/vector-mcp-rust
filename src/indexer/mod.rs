@@ -21,7 +21,7 @@ pub async fn index_file(
     config: Arc<Config>,
     store: Arc<Store>,
     embedder: Arc<Embedder>,
-    _summarizer: Arc<Summarizer>,
+    summarizer: Arc<Summarizer>,
 ) -> Result<()> {
     let raw_bytes = std::fs::read(path)
         .with_context(|| format!("Reading file for indexing: {path}"))?;
@@ -50,6 +50,14 @@ pub async fn index_file(
 
     for (i, chunk) in chunks.into_iter().enumerate() {
         let vector = embedder.embed_text(&chunk.content)?;
+        
+        // Optional: Generate AI summary if local LLM is enabled.
+        // We only do this for function/class chunks to save time, or if requested.
+        let ai_summary: String = if config.feature_toggles.enable_local_llm && chunk.function_score > 0.5 {
+            summarizer.summarize_chunk(&chunk.content, Arc::clone(&config)).await.unwrap_or_else(|_| "Summary failed".to_string())
+        } else {
+            "No AI summary generated".to_string()
+        };
 
         let metadata = json!({
             "path": path,
@@ -60,7 +68,9 @@ pub async fn index_file(
             "end_line": chunk.end_line,
             "symbols": chunk.symbols,
             "calls": chunk.calls,
+            "relationships": chunk.relationships,
             "function_score": chunk.function_score,
+            "summary": ai_summary,
         });
 
         records.push(Record {

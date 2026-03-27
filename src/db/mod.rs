@@ -23,6 +23,18 @@ pub struct Record {
     pub metadata: String, // JSON blob containing path, symbols, calls, etc.
 }
 
+impl Record {
+    /// Returns the parsed metadata JSON object.
+    pub fn metadata_json(&self) -> serde_json::Value {
+        serde_json::from_str(&self.metadata).unwrap_or(serde_json::Value::Null)
+    }
+
+    /// Helper to get a specific metadata string field.
+    pub fn metadata_str(&self, key: &str) -> String {
+        self.metadata_json()[key].as_str().unwrap_or("").to_string()
+    }
+}
+
 /// `Store` holds the LanceDB table handles.
 pub struct Store {
     pub code_vectors: LanceTable,
@@ -71,6 +83,17 @@ impl Store {
     pub async fn delete_by_path(&self, path: &str) -> Result<()> {
         let predicate = format!("metadata LIKE '%\"path\":\"{}\"%'", path.replace('\'', "''"));
         self.code_vectors.delete(&predicate).await.context("Deleting records by path").map(|_| ())
+    }
+
+    /// Retrieve all records from the database (used for full codebase analysis).
+    pub async fn get_all_records(&self) -> Result<Vec<Record>> {
+        let results = self.code_vectors
+            .query()
+            .execute()
+            .await?;
+
+        let batches = results.try_collect::<Vec<_>>().await?;
+        self.batches_to_records(batches).await
     }
 
     /// Helper: Converts Arrow RecordBatches back into our `Record` structs.

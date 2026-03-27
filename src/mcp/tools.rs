@@ -23,7 +23,80 @@ pub fn tool_definitions() -> Vec<ToolInfo> {
         tool_filesystem_grep(),
         tool_search_codebase(),
         tool_get_indexing_diagnostics(),
+        tool_get_summarized_context(),
+        tool_verify_implementation_gap(),
+        tool_find_missing_tests(),
+        tool_list_api_endpoints(),
+        tool_get_code_history(),
+        tool_reindex_all(),
     ]
+}
+
+fn tool_reindex_all() -> ToolInfo {
+    ToolInfo {
+        name: "reindex_all".into(),
+        description: "Force a full re-index of the entire project to refresh metadata and AI summaries.".into(),
+        input_schema: empty_schema(),
+    }
+}
+
+fn tool_get_summarized_context() -> ToolInfo {
+    ToolInfo {
+        name: "get_summarized_context".into(),
+        description: "Retrieves context for a query and uses a local LLM to provide a concise summary instead of raw chunks.".into(),
+        input_schema: ToolInputSchema {
+            schema_type: "object",
+            properties: json!({
+                "query": { "type": "string", "description": "The search query to summarize" },
+                "topK": { "type": "number", "description": "Optional: Number of chunks to include in summary (default 5)" }
+            }),
+            required: vec!["query".into()],
+        },
+    }
+}
+
+fn tool_verify_implementation_gap() -> ToolInfo {
+    ToolInfo {
+        name: "verify_implementation_gap".into(),
+        description: "Verifies if things from docs and client feedback are actually implemented in the code.".into(),
+        input_schema: ToolInputSchema {
+            schema_type: "object",
+            properties: json!({
+                "query": { "type": "string", "description": "The requirement or feedback query to verify (e.g. 'user authentication')" }
+            }),
+            required: vec!["query".into()],
+        },
+    }
+}
+
+fn tool_find_missing_tests() -> ToolInfo {
+    ToolInfo {
+        name: "find_missing_tests".into(),
+        description: "Identifies exported symbols that lack corresponding test coverage by mapping source to tests.".into(),
+        input_schema: empty_schema(),
+    }
+}
+
+fn tool_list_api_endpoints() -> ToolInfo {
+    ToolInfo {
+        name: "list_api_endpoints".into(),
+        description: "Identifies potential API route definitions in the codebase across various frameworks.".into(),
+        input_schema: empty_schema(),
+    }
+}
+
+fn tool_get_code_history() -> ToolInfo {
+    ToolInfo {
+        name: "get_code_history".into(),
+        description: "Retrieves recent git history (last 10 commits) for a specific file to understand its evolution.".into(),
+        input_schema: ToolInputSchema {
+            schema_type: "object",
+            properties: json!({
+                "file_path": { "type": "string", "description": "The relative path of the file to check history for" }
+            }),
+            required: vec!["file_path".into()],
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
