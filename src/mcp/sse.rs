@@ -2,17 +2,17 @@
 
 use axum::{
     Router,
-    extract::{Query, State, Host},
+    extract::{Host, Query, State},
     http::StatusCode,
     response::{Sse, sse::Event},
     routing::{get, post},
 };
-use futures::stream::Stream;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use dashmap::DashMap;
+use futures::stream::Stream;
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tower_http::cors::CorsLayer;
@@ -40,7 +40,6 @@ impl SseManager {
         }
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // SSE Session Cleanup Wrapper
@@ -74,7 +73,6 @@ impl<S> Drop for SessionCleanupStream<S> {
 // Handlers
 // ---------------------------------------------------------------------------
 
-
 #[derive(serde::Deserialize)]
 struct MessageQuery {
     session_id: String,
@@ -96,10 +94,7 @@ async fn sse_handler(
     // The client will use this URL to POST messages.
     // Use an absolute URL as some clients are sensitive to relative paths.
     // Dynamically build the absolute URL based on the incoming Host header.
-    let endpoint_url = format!(
-        "http://{}/message?session_id={}",
-        host, session_id
-    );
+    let endpoint_url = format!("http://{}/message?session_id={}", host, session_id);
     let _ = tx.send(Event::default().event("endpoint").data(endpoint_url));
 
     let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx).map(Ok);
@@ -161,7 +156,7 @@ pub async fn start_sse_server(server: Arc<Server>, port: u16) -> anyhow::Result<
             CorsLayer::new()
                 .allow_origin(tower_http::cors::Any)
                 .allow_methods(tower_http::cors::Any)
-                .allow_headers(tower_http::cors::Any)
+                .allow_headers(tower_http::cors::Any),
         )
         .with_state(manager);
 
