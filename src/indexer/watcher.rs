@@ -89,8 +89,6 @@ pub async fn start_watcher(
         }
     });
 
-
-
     Ok(Some(watcher))
 }
 
