@@ -38,3 +38,7 @@ axum = { version = "0.7", features = ["macros"] }
 tower-http = { version = "0.5", features = ["cors"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 dashmap = "6.1.0"
+tiktoken-rs = "0.9.1"
+reqwest = { version = "0.12", features = ["json"] }
+sha2 = "0.10"
+hex = "0.4"

@@ -15,8 +15,8 @@ pub async fn dispatch(server: &Server, params: &CallToolParams) -> Result<CallTo
     match params.name.as_str() {
         "ping" => Ok(handle_ping()),
         "trigger_project_index" => handle_trigger_project_index(server, params).await,
-        "set_project_root" => handle_set_project_root(server, params),
-        "store_context" => handle_store_context(server, params),
+        "set_project_root" => handle_set_project_root(server, params).await,
+        "store_context" => handle_store_context(server, params).await,
         "get_related_context" => handle_get_related_context(server, params).await,
         "find_duplicate_code" => handle_find_duplicate_code(server, params).await,
         "delete_context" => handle_delete_context(server, params).await,
@@ -28,13 +28,16 @@ pub async fn dispatch(server: &Server, params: &CallToolParams) -> Result<CallTo
         "find_dead_code" => handle_find_dead_code(server, params).await,
         "filesystem_grep" => handle_filesystem_grep(server, params),
         "search_codebase" => handle_search_codebase(server, params).await,
-        "get_indexing_diagnostics" => handle_get_indexing_diagnostics(server),
+        "get_indexing_diagnostics" => handle_get_indexing_diagnostics(server).await,
         "get_summarized_context" => handle_get_summarized_context(server, params).await,
         "verify_implementation_gap" => handle_verify_implementation_gap(server, params).await,
         "find_missing_tests" => handle_find_missing_tests(server, params).await,
         "list_api_endpoints" => handle_list_api_endpoints(server, params).await,
         "get_code_history" => handle_get_code_history(server, params).await,
         "reindex_all" => handle_reindex_all(server, params).await,
+        "check_llm_connectivity" => handle_check_llm_connectivity(server).await,
+        "distill_knowledge" => handle_distill_knowledge(server, params).await,
+        "verify_proposed_change" => handle_verify_proposed_change(server, params).await,
         _ => Ok(CallToolResult::error(format!(
             "Unknown tool: {}",
             params.name
@@ -95,15 +98,41 @@ async fn handle_trigger_project_index(
     )))
 }
 
-fn handle_set_project_root(_server: &Server, params: &CallToolParams) -> Result<CallToolResult> {
-    let _path = require_string_arg(params, "project_path")?;
-    Ok(CallToolResult::text("Project root updated"))
+async fn handle_set_project_root(
+    server: &Server,
+    params: &CallToolParams,
+) -> Result<CallToolResult> {
+    let path = require_string_arg(params, "project_path")?;
+
+    {
+        let mut root = server.config.project_root.write().unwrap();
+        *root = path.clone();
+    }
+
+    // Send signal to reload the watcher
+    if let Err(e) = server.reload_watcher_tx.send(path.clone()).await {
+        tracing::warn!("Failed to send watcher reload signal: {}", e);
+    }
+
+    Ok(CallToolResult::text(format!(
+        "Project root updated to {}",
+        path
+    )))
 }
 
-fn handle_store_context(_server: &Server, params: &CallToolParams) -> Result<CallToolResult> {
+async fn handle_store_context(server: &Server, params: &CallToolParams) -> Result<CallToolResult> {
     let text = require_string_arg(params, "text")?;
+    let project_id = optional_string_arg(params, "project_id")
+        .unwrap_or_else(|| server.config.project_root.read().unwrap().clone());
+
+    server
+        .store
+        .store_project_context(&project_id, &text)
+        .await?;
+
     Ok(CallToolResult::text(format!(
-        "Context stored: {} chars",
+        "Context stored successfully for project {}: {} chars",
+        project_id,
         text.len()
     )))
 }
@@ -113,6 +142,14 @@ async fn handle_get_related_context(
     params: &CallToolParams,
 ) -> Result<CallToolResult> {
     let file_path = require_string_arg(params, "filePath")?;
+
+    // 0. Fetch stored project context
+    let project_id = server.config.project_root.read().unwrap().clone();
+    let project_contexts = server
+        .store
+        .get_project_context(&project_id)
+        .await
+        .unwrap_or_default();
 
     // 1. Fetch records for the target file
     let records = server.store.get_all_records().await?;
@@ -206,6 +243,14 @@ async fn handle_get_related_context(
         out.push_str("  </usage_samples>\n");
     }
 
+    if !project_contexts.is_empty() {
+        out.push_str("  <project_instructions>\n");
+        for ctx in project_contexts {
+            out.push_str(&format!("    <instruction>\n{}\n    </instruction>\n", ctx));
+        }
+        out.push_str("  </project_instructions>\n");
+    }
+
     out.push_str("</context>");
     Ok(CallToolResult::text(out))
 }
@@ -251,16 +296,98 @@ async fn handle_delete_context(server: &Server, params: &CallToolParams) -> Resu
 
 async fn handle_index_status(server: &Server) -> Result<CallToolResult> {
     let count = server.store.code_vectors.count_rows(None).await?;
-    Ok(CallToolResult::text(format!(
-        "Index contains {count} vectors. Status: Ready."
-    )))
+    let records = server.store.get_all_records().await?;
+
+    let root = server.config.project_root.read().unwrap().clone();
+    let walker = ignore::WalkBuilder::new(&root)
+        .standard_filters(true)
+        .hidden(true)
+        .build();
+
+    let mut disk_files = std::collections::HashSet::new();
+    let mut modified = 0;
+    let mut missing = 0;
+
+    // Build map of indexed paths and their update timestamps
+    let mut indexed_files: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
+    for r in &records {
+        let meta = r.metadata_json();
+        if let Some(path) = meta["path"].as_str() {
+            let updated_at_str = meta["updated_at"].as_str().unwrap_or("0");
+            let updated_at = updated_at_str.parse::<u64>().unwrap_or(0);
+
+            // Keep the newest timestamp for a given file
+            let entry = indexed_files.entry(path.to_string()).or_insert(updated_at);
+            if updated_at > *entry {
+                *entry = updated_at;
+            }
+        }
+    }
+
+    for result in walker {
+        if let Ok(entry) = result {
+            if entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+                let path_buf = entry.path();
+                let path_str = path_buf.to_string_lossy().to_string();
+
+                // Only consider files we actually try to index
+                let ext = path_buf.extension().and_then(|e| e.to_str()).unwrap_or("");
+                let is_source = matches!(
+                    ext,
+                    "go" | "rs" | "js" | "ts" | "tsx" | "php" | "py" | "md" | "pdf"
+                );
+
+                if !is_source {
+                    continue;
+                }
+
+                disk_files.insert(path_str.clone());
+
+                let file_mtime = if let Ok(meta) = std::fs::metadata(&path_buf) {
+                    if let Ok(mtime) = meta.modified() {
+                        mtime
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs()
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                };
+
+                if let Some(indexed_time) = indexed_files.get(&path_str) {
+                    if file_mtime > *indexed_time {
+                        modified += 1;
+                    }
+                } else {
+                    missing += 1;
+                }
+            }
+        }
+    }
+
+    let mut deleted = 0;
+    for path in indexed_files.keys() {
+        if !disk_files.contains(path) {
+            deleted += 1;
+        }
+    }
+
+    let out = format!(
+        "## Index Sync Status\n\n        - **Total Indexed**: {} chunks\n        - **Modified**: {} files\n        - **Missing/New**: {} files\n        - **Deleted**: {} records correspond to removed files",
+        count, modified, missing, deleted
+    );
+
+    Ok(CallToolResult::text(out))
 }
 
 async fn handle_get_codebase_skeleton(
     server: &Server,
     params: &CallToolParams,
 ) -> Result<CallToolResult> {
-    let root = &*server.config.project_root;
+    let root = server.config.project_root.read().unwrap().clone();
     let target_path = optional_string_arg(params, "target_path").unwrap_or_else(|| ".".into());
     let max_depth = optional_f64_arg(params, "max_depth").unwrap_or(3.0) as usize;
     let max_items = optional_f64_arg(params, "max_items").unwrap_or(1000.0) as usize;
@@ -268,7 +395,7 @@ async fn handle_get_codebase_skeleton(
     let abs_path = if std::path::Path::new(&target_path).is_absolute() {
         std::path::PathBuf::from(target_path)
     } else {
-        std::path::Path::new(root).join(target_path)
+        std::path::Path::new(&root).join(target_path)
     };
 
     if !abs_path.exists() {
@@ -329,7 +456,8 @@ async fn handle_check_dependency_health(
     params: &CallToolParams,
 ) -> Result<CallToolResult> {
     let dir_path = require_string_arg(params, "directory_path")?;
-    let abs_path = std::path::Path::new(&*server.config.project_root).join(&dir_path);
+    let abs_path =
+        std::path::Path::new(&*server.config.project_root.read().unwrap()).join(&dir_path);
     let mut declared_deps = HashSet::new();
     let mut project_type = "unknown";
 
@@ -415,7 +543,7 @@ async fn handle_check_dependency_health(
                     } else if project_type == "go" {
                         // Skip stdlib (heuristic: no dot in first path component)
                         if import_path.contains('.')
-                            && !import_path.contains(&*server.config.project_root)
+                            && !import_path.contains(&*server.config.project_root.read().unwrap())
                         {
                             used_deps.insert(import_path.to_string());
                         }
@@ -563,7 +691,7 @@ async fn handle_find_dead_code(server: &Server, params: &CallToolParams) -> Resu
 
 fn handle_filesystem_grep(server: &Server, params: &CallToolParams) -> Result<CallToolResult> {
     let query = require_string_arg(params, "query")?.to_lowercase();
-    let root = &*server.config.project_root;
+    let root = server.config.project_root.read().unwrap().clone();
     let mut results = Vec::new();
 
     use walkdir::WalkDir;
@@ -628,19 +756,94 @@ async fn handle_search_codebase(
         final_records.truncate(top_k);
     }
 
+    let max_tokens = optional_f64_arg(params, "max_tokens").unwrap_or(10000.0) as usize;
+    let bpe = tiktoken_rs::cl100k_base().unwrap();
+    let mut total_tokens = 0;
     let mut out = String::new();
+
     for r in final_records {
+        let meta = r.metadata_json();
+        let path = meta["path"].as_str().unwrap_or("unknown_path");
+        let start_line = meta["start_line"].as_u64().unwrap_or(0);
+        let end_line = meta["end_line"].as_u64().unwrap_or(0);
+
+        let mut symbols = String::new();
+        if let Some(syms) = meta["symbols"].as_array() {
+            let names: Vec<&str> = syms.iter().filter_map(|s| s.as_str()).collect();
+            symbols = names.join(", ");
+        }
+        if symbols.is_empty() {
+            symbols = "None".to_string();
+        }
+
         let summary = r.metadata_str("summary");
-        out.push_str(&format!(
-            "### {}\n**Summary**: {}\n\n{}\n\n",
-            r.id, summary, r.content
-        ));
+
+        let chunk_text = format!(
+            "#### [{}] (Lines {}-{})
+- **Entities**: `{}`
+- **Summary**: {}
+{}
+
+",
+            path, start_line, end_line, symbols, summary, r.content
+        );
+
+        let tokens = bpe.encode_with_special_tokens(&chunk_text).len();
+        if total_tokens + tokens > max_tokens && total_tokens > 0 {
+            out.push_str(
+                "... (truncating further results to stay within context window)
+",
+            );
+            break;
+        }
+
+        out.push_str(&chunk_text);
+        total_tokens += tokens;
     }
+
+    if out.is_empty() {
+        out = "No matches found within the token limit.".to_string();
+    }
+
     Ok(CallToolResult::text(out))
 }
 
-fn handle_get_indexing_diagnostics(_server: &Server) -> Result<CallToolResult> {
-    Ok(CallToolResult::text("System status: Optimal"))
+async fn handle_get_indexing_diagnostics(server: &Server) -> Result<CallToolResult> {
+    let status = server
+        .indexing_progress
+        .get("status")
+        .and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_else(|| "idle".to_string());
+    let current_file = server
+        .indexing_progress
+        .get("current_file")
+        .and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_else(|| "None".to_string());
+    let indexed_files = server
+        .indexing_progress
+        .get("indexed_files")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+
+    let mut errors_str = String::from("None");
+    if let Some(errs) = server.indexing_progress.get("errors") {
+        if let Some(arr) = errs.as_array() {
+            if !arr.is_empty() {
+                let msgs: Vec<String> = arr
+                    .iter()
+                    .filter_map(|e| e.as_str().map(String::from))
+                    .collect();
+                errors_str = msgs.join("\n- ");
+                errors_str.insert_str(0, "\n- ");
+            }
+        }
+    }
+
+    let out = format!(
+        "## Indexing Diagnostics\n\n- **Status**: {}\n- **Current File**: {}\n- **Files Indexed**: {}\n- **Recent Errors**: {}",
+        status, current_file, indexed_files, errors_str
+    );
+    Ok(CallToolResult::text(out))
 }
 
 async fn handle_get_summarized_context(
@@ -751,7 +954,7 @@ async fn handle_get_code_history(
     let path = require_string_arg(params, "file_path")?;
     let output = std::process::Command::new("git")
         .args(["log", "-n", "5", "--pretty=format:%h - %s", "--", &path])
-        .current_dir(&*server.config.project_root)
+        .current_dir(&*server.config.project_root.read().unwrap())
         .output()?;
     Ok(CallToolResult::text(
         String::from_utf8_lossy(&output.stdout).to_string(),
@@ -763,12 +966,89 @@ async fn handle_reindex_all(server: &Server, _params: &CallToolParams) -> Result
     let store = Arc::clone(&server.store);
     let embedder = Arc::clone(&server.embedder);
     let summarizer = Arc::clone(&server.summarizer);
+    let progress = Arc::clone(&server.indexing_progress);
 
     tokio::spawn(async move {
-        let _ = crate::indexer::scanner::scan_project(config, store, embedder, summarizer).await;
+        let _ =
+            crate::indexer::scanner::scan_project(config, store, embedder, summarizer, progress)
+                .await;
     });
 
     Ok(CallToolResult::text(
         "Full project re-indexing initiated in background.",
     ))
+}
+async fn handle_check_llm_connectivity(server: &Server) -> Result<CallToolResult> {
+    let client = crate::llm::gemini::GeminiClient::new(&server.config);
+    match client.list_models().await {
+        Ok(models) => {
+            let mut out = String::from("### ✅ LLM Connectivity Status\n\n**Status**: Connected Successfully\n");
+            out.push_str(&format!("**Configured Default**: `{}`\n\n", server.config.default_gemini_model));
+            out.push_str("**Available Models**:\n");
+            for m in models {
+                out.push_str(&format!("- `{}` ({}): {}\n", m.name, m.display_name, m.description));
+            }
+            Ok(CallToolResult::text(out))
+        }
+        Err(e) => {
+            Ok(CallToolResult::text(format!(
+                "### ❌ LLM Connectivity Status\n\n**Status**: API Error\n**Error**: {e}\n\n**Troubleshooting**:\n1. Verify your GEMINI_API_KEY is correct.\n2. Ensure your key has permissions for the Generative Language API."
+            )))
+        }
+    }
+}
+
+async fn handle_distill_knowledge(server: &Server, params: &CallToolParams) -> Result<CallToolResult> {
+    let path_prefix = require_string_arg(params, "path")?;
+    let records = server.store.get_records_by_path(&path_prefix).await?;
+
+    if records.is_empty() {
+        return Ok(CallToolResult::error(format!("No indexed content found for path: {path_prefix}")));
+    }
+
+    let mut relevant_content = String::new();
+    let mut count = 0;
+    for r in records {
+        if r.metadata_str("path").starts_with(&path_prefix) {
+            relevant_content.push_str(&format!("File: {}\nContent:\n{}\n---\n", r.metadata_str("path"), r.content));
+            count += 1;
+        }
+    }
+
+    if count == 0 {
+        return Ok(CallToolResult::error(format!("No indexed content found starting with: {path_prefix}")));
+    }
+
+    let system_prompt = "You are a Senior Software Architect. Your task is to analyze the provided source code and \"distill\" it into a set of architectural patterns, coding standards, and business rules.\nFormat the output as a high-quality Markdown Knowledge Item (KI) including:\n1. Overview: What is this component/module for?\n2. Key Architectural Decisions: Why was it built this way?\n3. Implementation Rules: Mandatory patterns for anyone modifying this code.\n4. Security/Compliance: PHI handling, encryption rules, etc. (if applicable).\nKeep it concise and actionable.";
+    let user_prompt = format!("Analyze these files from path '{}':\n\n{}", path_prefix, relevant_content);
+
+    let client = crate::llm::gemini::GeminiClient::new(&server.config);
+    let distilled = client.generate_completion(&server.config.default_gemini_model, system_prompt, &user_prompt).await?;
+
+    // Store distilled knowledge
+    let project_id = server.config.project_root.read().unwrap().clone();
+    server.store.store_project_context(&project_id, &distilled).await?;
+
+    Ok(CallToolResult::text(format!("### ✅ Knowledge Distilled & Indexed\n\n{distilled}")))
+}
+
+async fn handle_verify_proposed_change(server: &Server, params: &CallToolParams) -> Result<CallToolResult> {
+    let proposed_change = require_string_arg(params, "proposed_change")?;
+    let project_id = server.config.project_root.read().unwrap().clone();
+    
+    // Retrieve distilled knowledge (KIs)
+    let contexts = server.store.get_project_context(&project_id).await?;
+    let ki_context = if contexts.is_empty() {
+        "No Architectural Decisions or Knowledge Items found for this project.".to_string()
+    } else {
+        contexts.join("\n\n---\n\n")
+    };
+
+    let system_prompt = "You are a Senior Software Engineer performing a code review. Your task is to verify if a proposed change complies with the existing architectural decisions and knowledge items provided below.\n\nReply with a structured verification report identifying potential violations or confirming compliance.";
+    let user_prompt = format!("### Existing Knowledge Items:\n{}\n\n### Proposed Change:\n{}", ki_context, proposed_change);
+
+    let client = crate::llm::gemini::GeminiClient::new(&server.config);
+    let review = client.generate_completion(&server.config.default_gemini_model, system_prompt, &user_prompt).await?;
+
+    Ok(CallToolResult::text(format!("### 🔎 Proposed Change Verification\n\n{review}\n\n---\n*Verified against indexed Knowledge Items using {}.*", server.config.default_gemini_model)))
 }

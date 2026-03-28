@@ -17,10 +17,22 @@ pub async fn scan_project(
     store: Arc<Store>,
     embedder: Arc<Embedder>,
     summarizer: Arc<Summarizer>,
+    progress: Arc<dashmap::DashMap<String, serde_json::Value>>,
 ) -> Result<()> {
-    info!("Starting initial project scan: {}", config.project_root);
+    info!(
+        "Starting initial project scan: {}",
+        config.project_root.read().unwrap().clone()
+    );
+    progress.clear();
+    progress.insert("status".to_string(), serde_json::json!("scanning"));
+    progress.insert("current_file".to_string(), serde_json::json!(""));
+    progress.insert("indexed_files".to_string(), serde_json::json!(0));
+    progress.insert(
+        "errors".to_string(),
+        serde_json::json!(Vec::<String>::new()),
+    );
 
-    let walker = WalkBuilder::new(&config.project_root)
+    let walker = WalkBuilder::new(&*config.project_root.read().unwrap())
         .standard_filters(true) // respects .gitignore, etc.
         .hidden(true)
         .build();
@@ -40,6 +52,10 @@ pub async fn scan_project(
             if is_indexable(path) {
                 let path_str = path.to_string_lossy().to_string();
                 info!("Scanning: {}", path_str);
+                progress.insert(
+                    "current_file".to_string(),
+                    serde_json::json!(path_str.clone()),
+                );
 
                 if let Err(e) = indexer::index_file(
                     &path_str,
@@ -51,14 +67,21 @@ pub async fn scan_project(
                 .await
                 {
                     warn!("Failed to index {}: {:?}", path_str, e);
+                    if let Some(mut errs) = progress.get_mut("errors") {
+                        if let Some(arr) = errs.value_mut().as_array_mut() {
+                            arr.push(serde_json::json!(format!("{}: {}", path_str, e)));
+                        }
+                    }
                 } else {
                     count += 1;
+                    progress.insert("indexed_files".to_string(), serde_json::json!(count));
                 }
             }
         }
     }
 
     info!("Initial scan complete. Indexed {} files.", count);
+    progress.insert("status".to_string(), serde_json::json!("complete"));
     Ok(())
 }
 

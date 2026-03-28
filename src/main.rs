@@ -45,12 +45,14 @@ async fn start_background_tasks(
     let embedder_clone = Arc::clone(&embedder);
     let summarizer_clone = Arc::clone(&summarizer);
 
+    let dummy_progress = Arc::new(dashmap::DashMap::new());
     tokio::spawn(async move {
         let _ = crate::indexer::scanner::scan_project(
             config_clone,
             store_clone,
             embedder_clone,
             summarizer_clone,
+            dummy_progress,
         )
         .await;
     });
@@ -75,7 +77,7 @@ async fn main() -> Result<()> {
     // 2. Load configuration from env / .env file.
     let cfg = config::Config::load()?;
     info!(
-        project_root = %cfg.project_root,
+        project_root = %*cfg.project_root.read().unwrap(),
         db_path = %cfg.db_path.display(),
         model = %cfg.model_name,
         local_llm = cfg.feature_toggles.enable_local_llm,
@@ -97,12 +99,36 @@ async fn main() -> Result<()> {
     )
     .await?;
 
+    let (reload_watcher_tx, mut reload_watcher_rx) = tokio::sync::mpsc::channel::<String>(10);
+
+    // Spawn task to listen for watcher reloads
+    let watcher_config = Arc::clone(&config);
+    let watcher_store = Arc::clone(&store);
+    let watcher_embedder = Arc::clone(&embedder);
+    let watcher_summarizer = Arc::clone(&summarizer);
+    tokio::spawn(async move {
+        while let Some(_new_root) = reload_watcher_rx.recv().await {
+            tracing::info!("Restarting watcher for new root: {}", _new_root);
+            if let Err(e) = indexer::watcher::start_watcher(
+                Arc::clone(&watcher_config),
+                Arc::clone(&watcher_store),
+                Arc::clone(&watcher_embedder),
+                Arc::clone(&watcher_summarizer),
+            )
+            .await
+            {
+                tracing::error!("Failed to restart watcher: {}", e);
+            }
+        }
+    });
+
     // 6. Start MCP server.
     let server = Arc::new(mcp::server::Server::new(
         Arc::clone(&store),
         Arc::clone(&config),
         Arc::clone(&embedder),
         Arc::clone(&summarizer),
+        reload_watcher_tx,
     ));
 
     let port_str = config.api_port.clone();

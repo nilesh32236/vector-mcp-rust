@@ -33,11 +33,17 @@ impl Record {
     pub fn metadata_str(&self, key: &str) -> String {
         self.metadata_json()[key].as_str().unwrap_or("").to_string()
     }
+
+    /// Helper to get the content hash from metadata.
+    pub fn content_hash(&self) -> String {
+        self.metadata_str("content_hash")
+    }
 }
 
 /// `Store` holds the LanceDB table handles.
 pub struct Store {
     pub code_vectors: LanceTable,
+    pub project_context: LanceTable,
 }
 
 impl Store {
@@ -61,8 +67,21 @@ impl Store {
             ]))),
         )
         .await?;
+        let project_context = open_or_create_table(
+            &connection,
+            "project_context",
+            RecordBatch::new_empty(Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Utf8, false),
+                Field::new("project_id", DataType::Utf8, false),
+                Field::new("text", DataType::Utf8, false),
+            ]))),
+        )
+        .await?;
 
-        Ok(Self { code_vectors })
+        Ok(Self {
+            code_vectors,
+            project_context,
+        })
     }
 
     /// Perform a hybrid search (Vector + Full-Text Search).
@@ -98,6 +117,22 @@ impl Store {
             .map(|_| ())
     }
 
+    /// Retrieve records associated with a specific file path.
+    pub async fn get_records_by_path(&self, path: &str) -> Result<Vec<Record>> {
+        let predicate = format!(
+            "metadata LIKE '%\"path\":\"{}\"%'",
+            path.replace('\'', "''")
+        );
+        let results = self.code_vectors
+            .query()
+            .only_if(predicate)
+            .execute()
+            .await?;
+
+        let batches = results.try_collect::<Vec<_>>().await?;
+        self.batches_to_records(batches).await
+    }
+
     /// Retrieve all records from the database (used for full codebase analysis).
     pub async fn get_all_records(&self) -> Result<Vec<Record>> {
         let results = self.code_vectors.query().execute().await?;
@@ -107,6 +142,53 @@ impl Store {
     }
 
     /// Helper: Converts Arrow RecordBatches back into our `Record` structs.
+
+    pub async fn store_project_context(&self, project_id: &str, text: &str) -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("project_id", DataType::Utf8, false),
+            Field::new("text", DataType::Utf8, false),
+        ]));
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let ids = arrow_array::StringArray::from(vec![id.as_str()]);
+        let project_ids = arrow_array::StringArray::from(vec![project_id]);
+        let texts = arrow_array::StringArray::from(vec![text]);
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(ids), Arc::new(project_ids), Arc::new(texts)],
+        )?;
+
+        self.project_context.add(vec![batch]).execute().await?;
+        Ok(())
+    }
+
+    pub async fn get_project_context(&self, project_id: &str) -> Result<Vec<String>> {
+        let predicate = format!("project_id = '{}'", project_id.replace("'", "''"));
+        let stream = self
+            .project_context
+            .query()
+            .only_if(predicate)
+            .execute()
+            .await?;
+        let batches: Vec<RecordBatch> = stream.try_collect::<Vec<_>>().await?;
+
+        let mut contexts = Vec::new();
+        for batch in batches {
+            let texts = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .context("text column is not StringArray")?;
+
+            for i in 0..batch.num_rows() {
+                contexts.push(texts.value(i).to_string());
+            }
+        }
+        Ok(contexts)
+    }
+
     async fn batches_to_records(&self, batches: Vec<RecordBatch>) -> Result<Vec<Record>> {
         let mut records = Vec::new();
         for batch in batches {

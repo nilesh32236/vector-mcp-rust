@@ -28,7 +28,7 @@ pub async fn start_watcher(
 
     info!(
         "Initializing background CDC watcher on: {}",
-        config.project_root
+        config.project_root.read().unwrap().clone()
     );
 
     let (tx, mut rx) = mpsc::channel::<PathBuf>(100);
@@ -45,7 +45,7 @@ pub async fn start_watcher(
     })?;
 
     watcher.watch(
-        std::path::Path::new(&config.project_root),
+        std::path::Path::new(&config.project_root.read().unwrap().clone()),
         RecursiveMode::Recursive,
     )?;
 

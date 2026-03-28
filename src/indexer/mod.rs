@@ -9,6 +9,7 @@ use lance_arrow::FixedSizeListArrayExt;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use sha2::{Sha256, Digest};
 
 use crate::config::Config;
 use crate::db::{Record, Store};
@@ -26,6 +27,19 @@ pub async fn index_file(
     let raw_bytes = tokio::fs::read(path)
         .await
         .with_context(|| format!("Reading file for indexing: {path}"))?;
+
+    let current_hash = compute_hash(&raw_bytes);
+
+    // Check if the file already exists in the DB and has the same hash.
+    if let Ok(existing_records) = store.get_records_by_path(path).await {
+        if !existing_records.is_empty() {
+            let existing_hash = existing_records[0].content_hash();
+            if existing_hash == current_hash {
+                tracing::debug!("Skipping indexing for {}: content hash unchanged", path);
+                return Ok(());
+            }
+        }
+    }
 
     let extension = std::path::Path::new(path)
         .extension()
@@ -78,9 +92,10 @@ pub async fn index_file(
 
         let metadata = json!({
             "path": path,
-            "project_id": config.project_root,
+            "project_id": config.project_root.read().unwrap().clone(),
             "type": chunk.node_type,
             "updated_at": updated_at,
+            "content_hash": current_hash,
             "start_line": chunk.start_line,
             "end_line": chunk.end_line,
             "symbols": chunk.symbols,
@@ -91,7 +106,12 @@ pub async fn index_file(
         });
 
         records.push(Record {
-            id: format!("{}-{}-{}", config.project_root, path, i),
+            id: format!(
+                "{}-{}-{}",
+                config.project_root.read().unwrap().clone(),
+                path,
+                i
+            ),
             content: chunk.content,
             vector,
             metadata: metadata.to_string(),
@@ -152,4 +172,11 @@ fn records_to_batch(records: Vec<Record>, dimension: usize) -> Result<RecordBatc
         ],
     )
     .context("Creating RecordBatch for indexing")
+}
+
+fn compute_hash(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let result = hasher.finalize();
+    hex::encode(result)
 }

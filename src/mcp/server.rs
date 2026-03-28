@@ -30,6 +30,8 @@ pub struct Server {
     pub config: Arc<Config>,
     pub embedder: Arc<Embedder>,
     pub summarizer: Arc<Summarizer>,
+    pub reload_watcher_tx: tokio::sync::mpsc::Sender<String>,
+    pub indexing_progress: Arc<dashmap::DashMap<String, serde_json::Value>>,
 }
 
 impl Server {
@@ -38,12 +40,16 @@ impl Server {
         config: Arc<Config>,
         embedder: Arc<Embedder>,
         summarizer: Arc<Summarizer>,
+        reload_watcher_tx: tokio::sync::mpsc::Sender<String>,
     ) -> Self {
+        let indexing_progress = Arc::new(dashmap::DashMap::new());
         Self {
             store,
             config,
             embedder,
             summarizer,
+            reload_watcher_tx,
+            indexing_progress,
         }
     }
 

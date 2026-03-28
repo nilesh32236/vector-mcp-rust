@@ -29,6 +29,9 @@ pub fn tool_definitions() -> Vec<ToolInfo> {
         tool_list_api_endpoints(),
         tool_get_code_history(),
         tool_reindex_all(),
+        tool_verify_proposed_change(),
+        tool_check_llm_connectivity(),
+        tool_distill_knowledge(),
     ]
 }
 
@@ -337,11 +340,53 @@ fn tool_search_codebase() -> ToolInfo {
     }
 }
 
+fn tool_verify_proposed_change() -> ToolInfo {
+    ToolInfo {
+        name: "verify_proposed_change".into(),
+        description: "Checks a proposed code change or task against stored Knowledge Items and Architectural Decisions to ensure pattern compliance.".into(),
+        input_schema: ToolInputSchema {
+            schema_type: "object",
+            properties: json!({
+                "proposed_change": {
+                    "type": "string",
+                    "description": "The description or diff of the proposed change"
+                },
+                "project_id": {
+                    "type": "string",
+                    "description": "Optional: Filter by project ID"
+                }
+            }),
+            required: vec!["proposed_change".into()],
+        },
+    }
+}
 fn tool_get_indexing_diagnostics() -> ToolInfo {
     ToolInfo {
         name: "get_indexing_diagnostics".into(),
         description: "Provides detailed diagnostics on the indexing process, including recent errors and queue status.".into(),
         input_schema: empty_schema(),
+    }
+}
+
+fn tool_check_llm_connectivity() -> ToolInfo {
+    ToolInfo {
+        name: "check_llm_connectivity".into(),
+        description: "Checks the Gemini API connectivity and lists available models for the current API key.".into(),
+        input_schema: empty_schema(),
+    }
+}
+
+fn tool_distill_knowledge() -> ToolInfo {
+    ToolInfo {
+        name: "distill_knowledge".into(),
+        description: "Analyzes a directory and automatically generates a Knowledge Item summary.".into(),
+        input_schema: ToolInputSchema {
+            schema_type: "object",
+            properties: json!({
+                "path": { "type": "string", "description": "The relative path to analyze" }
+            }),
+            required: vec!["path".into()],
+        },
     }
 }
 
