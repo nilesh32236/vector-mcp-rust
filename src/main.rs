@@ -106,25 +106,25 @@ async fn main() -> Result<()> {
     ));
 
     let port_str = config.api_port.clone();
-    let sse_server = if let Ok(port) = port_str.parse::<u16>() {
+    if let Ok(port) = port_str.parse::<u16>() {
         let server_for_sse = Arc::clone(&server);
-        Some(tokio::spawn(async move {
-            if let Err(e) = mcp::sse::start_sse_server(server_for_sse, port).await {
-                tracing::error!(err = %e, "SSE server failed");
+        info!("vector-mcp-rust ready ✓ (SSE transport on port {})", port);
+
+        // Block on the SSE server, allowing Ctrl-C to terminate it cleanly.
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                info!("Received Ctrl-C, shutting down gracefully...");
             }
-        }))
+            res = mcp::sse::start_sse_server(server_for_sse, port) => {
+                if let Err(e) = res {
+                    tracing::error!(err = %e, "SSE server failed");
+                }
+            }
+        }
     } else {
-        None
-    };
-
-    info!("vector-mcp-rust ready ✓");
-
-    // Standard MCP transport via stdio.
-    server.run().await?;
-
-    // Graceful shutdown of SSE server if it was running.
-    if let Some(task) = sse_server {
-        task.abort();
+        info!("vector-mcp-rust ready ✓ (stdio transport)");
+        // Standard MCP transport via stdio.
+        server.run().await?;
     }
 
     Ok(())
