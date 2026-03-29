@@ -39,7 +39,7 @@ async fn start_background_tasks(
     store: Arc<Store>,
     embedder: Arc<Embedder>,
     summarizer: Arc<Summarizer>,
-) -> Result<Option<notify::RecommendedWatcher>> {
+) -> Result<()> {
     let config_clone = Arc::clone(&config);
     let store_clone = Arc::clone(&store);
     let embedder_clone = Arc::clone(&embedder);
@@ -55,7 +55,7 @@ async fn start_background_tasks(
         .await;
     });
 
-    let watcher = indexer::watcher::start_watcher(
+    indexer::watcher::start_watcher(
         Arc::clone(&config),
         Arc::clone(&store),
         Arc::clone(&embedder),
@@ -64,7 +64,7 @@ async fn start_background_tasks(
     .await
     .context("Starting background watcher")?;
 
-    Ok(watcher)
+    Ok(())
 }
 
 #[tokio::main]
@@ -89,7 +89,7 @@ async fn main() -> Result<()> {
     let config = Arc::new(cfg);
 
     // 5. Initial Scan & Background Watcher (if enabled).
-    let _watcher = start_background_tasks(
+    start_background_tasks(
         Arc::clone(&config),
         Arc::clone(&store),
         Arc::clone(&embedder),
