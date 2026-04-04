@@ -867,38 +867,26 @@ async fn handle_search_codebase(
 }
 
 async fn handle_get_indexing_diagnostics(server: &Server) -> Result<CallToolResult> {
-    let status = server
-        .indexing_progress
-        .get("status")
-        .and_then(|v| v.as_str().map(String::from))
-        .unwrap_or_else(|| "idle".to_string());
-    let current_file = server
-        .indexing_progress
-        .get("current_file")
-        .and_then(|v| v.as_str().map(String::from))
-        .unwrap_or_else(|| "None".to_string());
-    let indexed_files = server
-        .indexing_progress
-        .get("indexed_files")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0);
-
-    let mut errors_str = String::from("None");
-    if let Some(errs) = server.indexing_progress.get("errors")
-        && let Some(arr) = errs.as_array()
-        && !arr.is_empty()
-    {
-        let msgs: Vec<String> = arr
-            .iter()
-            .filter_map(|e| e.as_str().map(String::from))
-            .collect();
-        errors_str = msgs.join("\n- ");
-        errors_str.insert_str(0, "\n- ");
-    }
+    let p = server.indexing_progress.read().unwrap();
+    let status = if p.status.is_empty() {
+        "idle".to_string()
+    } else {
+        p.status.clone()
+    };
+    let current_file = if p.current_file.is_empty() {
+        "None".to_string()
+    } else {
+        p.current_file.clone()
+    };
+    let errors_str = if p.errors.is_empty() {
+        "None".to_string()
+    } else {
+        format!("\n- {}", p.errors.join("\n- "))
+    };
 
     let out = format!(
         "## Indexing Diagnostics\n\n- **Status**: {}\n- **Current File**: {}\n- **Files Indexed**: {}\n- **Recent Errors**: {}",
-        status, current_file, indexed_files, errors_str
+        status, current_file, p.indexed_files, errors_str
     );
     Ok(CallToolResult::text(out))
 }

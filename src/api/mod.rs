@@ -34,7 +34,7 @@ pub struct ApiState {
     pub index_tx: tokio::sync::mpsc::Sender<String>,
     #[allow(dead_code)]
     pub rate_limiter: Arc<RateLimiter>,
-    pub progress: Arc<dashmap::DashMap<String, serde_json::Value>>,
+    pub progress: Arc<std::sync::RwLock<crate::indexer::scanner::ProgressState>>,
     pub version: &'static str,
 }
 
@@ -106,20 +106,19 @@ async fn handle_live() -> impl IntoResponse {
 }
 
 async fn handle_stats(State(s): State<Arc<ApiState>>) -> impl IntoResponse {
-    let mut stats = serde_json::json!({});
-    for entry in s.progress.iter() {
-        stats[entry.key()] = entry.value().clone();
-    }
-    Json(stats)
+    let p = s.progress.read().unwrap();
+    Json(serde_json::to_value(&*p).unwrap_or_default())
 }
 
 // --- UI Compatibility Handlers ---
 
 async fn handle_tools_repos(State(s): State<Arc<ApiState>>) -> impl IntoResponse {
     let root = s.config.project_root.read().unwrap().clone();
-    let status = match s.progress.get("status") {
-        Some(v) => v.as_str().unwrap_or("Ready").to_string(),
-        None => "Ready".to_string(),
+    let status = s.progress.read().unwrap().status.clone();
+    let status = if status.is_empty() {
+        "Ready".to_string()
+    } else {
+        status
     };
     Json(serde_json::json!([{
         "path": root,
@@ -128,16 +127,13 @@ async fn handle_tools_repos(State(s): State<Arc<ApiState>>) -> impl IntoResponse
 }
 
 async fn handle_tools_status(State(s): State<Arc<ApiState>>) -> impl IntoResponse {
-    let mut stats = serde_json::json!({
-        "status": "idle",
-        "indexed_files": 0,
-        "total_files": 0,
-        "current_file": ""
-    });
-    for entry in s.progress.iter() {
-        stats[entry.key()] = entry.value().clone();
-    }
-    Json(stats)
+    let p = s.progress.read().unwrap();
+    Json(serde_json::json!({
+        "status": p.status,
+        "indexed_files": p.indexed_files,
+        "total_files": p.total_files,
+        "current_file": p.current_file,
+    }))
 }
 
 #[derive(Deserialize)]

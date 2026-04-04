@@ -165,6 +165,9 @@ async fn message_handler(
         let response = server
             .process_message_with_session(&body_str, Some(&sid_for_task))
             .await;
+        if response.get("error").is_some() {
+            tracing::error!(session = %sid_for_task, response = %response, "process_message_with_session returned error");
+        }
         if !response.is_null()
             && let Some(tx) = sender
         {

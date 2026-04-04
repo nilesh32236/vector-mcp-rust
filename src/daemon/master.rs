@@ -84,8 +84,8 @@ pub struct MasterServer {
     embedder: Arc<Embedder>,
     /// Channel for enqueuing paths to the background indexer.
     index_tx: tokio::sync::mpsc::Sender<String>,
-    /// Live indexing progress map (shared with the scanner).
-    progress: Arc<dashmap::DashMap<String, serde_json::Value>>,
+    /// Live indexing progress (shared with the scanner).
+    progress: Arc<std::sync::RwLock<crate::indexer::scanner::ProgressState>>,
 }
 
 impl MasterServer {
@@ -97,7 +97,7 @@ impl MasterServer {
         store: Arc<Store>,
         embedder: Arc<Embedder>,
         index_tx: tokio::sync::mpsc::Sender<String>,
-        progress: Arc<dashmap::DashMap<String, serde_json::Value>>,
+        progress: Arc<std::sync::RwLock<crate::indexer::scanner::ProgressState>>,
     ) -> Self {
         Self {
             socket_path: socket_path.into(),
@@ -207,12 +207,8 @@ impl MasterServer {
             },
 
             Request::GetProgress => {
-                let map: std::collections::HashMap<String, serde_json::Value> = self
-                    .progress
-                    .iter()
-                    .map(|e| (e.key().clone(), e.value().clone()))
-                    .collect();
-                Response::ok(map)
+                let p = self.progress.read().unwrap();
+                Response::ok(serde_json::to_value(&*p).unwrap_or_default())
             }
 
             Request::Insert { records } => match self.store.upsert_records(records).await {

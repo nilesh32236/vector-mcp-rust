@@ -34,7 +34,7 @@ pub struct Server {
     pub embedder: Arc<Embedder>,
     pub summarizer: Arc<Summarizer>,
     pub reload_watcher_tx: tokio::sync::mpsc::Sender<String>,
-    pub indexing_progress: Arc<dashmap::DashMap<String, serde_json::Value>>,
+    pub indexing_progress: Arc<std::sync::RwLock<crate::indexer::scanner::ProgressState>>,
     /// session_id → SSE sender for `$/progress` notifications.
     pub progress_senders:
         Arc<dashmap::DashMap<String, tokio::sync::mpsc::UnboundedSender<serde_json::Value>>>,
@@ -51,7 +51,9 @@ impl Server {
         summarizer: Arc<Summarizer>,
         reload_watcher_tx: tokio::sync::mpsc::Sender<String>,
     ) -> Self {
-        let indexing_progress = Arc::new(dashmap::DashMap::new());
+        let indexing_progress = Arc::new(std::sync::RwLock::new(
+            crate::indexer::scanner::ProgressState::default(),
+        ));
         let root = config.project_root.read().unwrap().clone();
         let path_guard =
             PathGuard::new(&root).unwrap_or_else(|_| PathGuard::new(std::env::temp_dir()).unwrap());

@@ -43,7 +43,7 @@ use crate::llm::summarizer::Summarizer;
 /// clients like Claude Desktop or Cursor.
 ///
 /// Set `RUST_LOG` to control the log level (default: `info`).
-fn setup_logging(log_path: &std::path::Path) {
+fn setup_logging(log_path: &std::path::Path) -> tracing_appender::non_blocking::WorkerGuard {
     use tracing_subscriber::prelude::*;
 
     // Ensure the log directory exists.
@@ -57,8 +57,7 @@ fn setup_logging(log_path: &std::path::Path) {
             .file_name()
             .unwrap_or(std::ffi::OsStr::new("mcp.log")),
     );
-    let (non_blocking_file, _guard_file) = tracing_appender::non_blocking(file_appender);
-    std::mem::forget(_guard_file);
+    let (non_blocking_file, guard) = tracing_appender::non_blocking(file_appender);
 
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
@@ -75,6 +74,7 @@ fn setup_logging(log_path: &std::path::Path) {
         .with(file_layer)
         .with(stderr_layer)
         .init();
+    guard
 }
 
 // ---------------------------------------------------------------------------
@@ -97,7 +97,7 @@ async fn start_background_tasks(
     store: Arc<Store>,
     embedder: Arc<Embedder>,
     summarizer: Arc<Summarizer>,
-    progress: Arc<dashmap::DashMap<String, serde_json::Value>>,
+    progress: Arc<std::sync::RwLock<crate::indexer::scanner::ProgressState>>,
 ) -> Result<()> {
     // Initial scan.
     let (c, s, e, su, p) = (
@@ -134,7 +134,7 @@ async fn main() -> Result<()> {
     let cfg = config::Config::load()?;
 
     // 2. Structured logging → file (stderr stays clean for MCP JSON-RPC).
-    setup_logging(&cfg.log_path);
+    let _log_guard = setup_logging(&cfg.log_path);
 
     info!(
         project_root = %*cfg.project_root.read().unwrap(),
@@ -170,7 +170,9 @@ async fn run_master(cfg: Config, socket_path: String) -> Result<()> {
     let config = Arc::new(cfg);
 
     // Shared indexing progress map.
-    let progress = Arc::new(dashmap::DashMap::new());
+    let progress = Arc::new(std::sync::RwLock::new(
+        crate::indexer::scanner::ProgressState::default(),
+    ));
 
     // Background indexing channel (wired to daemon + watcher).
     let (index_tx, mut index_rx) = tokio::sync::mpsc::channel::<String>(256);
@@ -262,7 +264,9 @@ async fn run_slave(cfg: Config, socket_path: String) -> Result<()> {
     info!(socket = %socket_path, "Starting in SLAVE mode — delegating to master");
 
     let config = Arc::new(cfg);
-    let progress = Arc::new(dashmap::DashMap::new());
+    let progress = Arc::new(std::sync::RwLock::new(
+        crate::indexer::scanner::ProgressState::default(),
+    ));
     let (index_tx, _index_rx) = tokio::sync::mpsc::channel::<String>(1);
 
     // Slaves do not open LanceDB or load ONNX — they delegate everything.
@@ -304,7 +308,7 @@ async fn start_servers(
     embedder: Arc<Embedder>,
     summarizer: Arc<Summarizer>,
     config: Arc<Config>,
-    progress: Arc<dashmap::DashMap<String, serde_json::Value>>,
+    progress: Arc<std::sync::RwLock<crate::indexer::scanner::ProgressState>>,
     index_tx: tokio::sync::mpsc::Sender<String>,
 ) -> Result<()> {
     let port_str = config.api_port.clone();
