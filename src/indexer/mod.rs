@@ -3,7 +3,6 @@ pub mod scanner;
 pub mod watcher;
 
 use anyhow::{Context, Result};
-use futures::future::join_all;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -122,17 +121,22 @@ pub async fn index_file(
         all_vectors.extend(vecs);
     }
 
-    // Run all AI summarizations concurrently.
+    // Run AI summarizations with bounded concurrency (semaphore) to avoid OOM / rate limits.
+    const MAX_CONCURRENT_LLM_REQUESTS: usize = 4;
     let enable_llm = config.feature_toggles.enable_local_llm;
-    let summary_futures: Vec<_> = chunks
+    let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_LLM_REQUESTS));
+    let summary_handles: Vec<_> = chunks
         .iter()
         .map(|chunk| {
             let content = chunk.content.clone();
+            let score = chunk.function_score;
             let summarizer = Arc::clone(&summarizer);
             let config = Arc::clone(&config);
             let path = path.to_string();
-            async move {
-                if enable_llm && chunk.function_score > 0.5 {
+            let sem = Arc::clone(&sem);
+            tokio::spawn(async move {
+                let _permit = sem.acquire().await;
+                if enable_llm && score > 0.5 {
                     match summarizer.summarize_chunk(&content, config).await {
                         Ok(s) => s,
                         Err(e) => {
@@ -143,10 +147,17 @@ pub async fn index_file(
                 } else {
                     "No AI summary generated".to_string()
                 }
-            }
+            })
         })
         .collect();
-    let summaries = join_all(summary_futures).await;
+    let mut summaries = Vec::with_capacity(summary_handles.len());
+    for handle in summary_handles {
+        summaries.push(
+            handle
+                .await
+                .unwrap_or_else(|_| "Summary failed".to_string()),
+        );
+    }
 
     let mut records = Vec::with_capacity(chunks.len());
     for (i, ((chunk, vector), ai_summary)) in chunks
