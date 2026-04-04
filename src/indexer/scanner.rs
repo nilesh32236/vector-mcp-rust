@@ -145,11 +145,15 @@ pub async fn scan_project(
     let accumulator_task = async move {
         let mut batch: Vec<crate::db::Record> = Vec::with_capacity(BATCH_INSERT_THRESHOLD);
         let mut paths_in_batch: Vec<String> = Vec::new();
+        let mut deleted_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         while let Some((path, records)) = record_rx.recv().await {
-            // Delete stale records for this path before accumulating new ones.
-            if let Err(e) = store_clone.delete_by_path(&path).await {
-                warn!("Failed to delete stale records for {}: {:?}", path, e);
+            // Only delete stale records once per path per scan run.
+            if !deleted_paths.contains(&path) {
+                if let Err(e) = store_clone.delete_by_path(&path).await {
+                    warn!("Failed to delete stale records for {}: {:?}", path, e);
+                }
+                deleted_paths.insert(path.clone());
             }
             batch.extend(records);
             paths_in_batch.push(path);

@@ -185,24 +185,44 @@ impl Embedder {
             return Ok(vec![]);
         }
         let batch_size = texts.len();
-        let mut all_ids = Vec::with_capacity(batch_size * MAX_SEQ_LEN);
-        let mut all_mask = Vec::with_capacity(batch_size * MAX_SEQ_LEN);
-        let mut all_type_ids = Vec::with_capacity(batch_size * MAX_SEQ_LEN);
 
+        // Tokenize each text and track the actual max sequence length in this batch.
+        let mut encodings = Vec::with_capacity(batch_size);
+        let mut max_len: usize = 0;
         for text in texts {
             let adapted = apply_adapter(text, &self.model_name, false);
             let enc = self
                 .tokenizer
                 .encode(adapted.as_str(), true)
                 .map_err(|e| anyhow::anyhow!("Tokenization failed: {e}"))?;
-            all_ids.extend(enc.get_ids().iter().map(|&x| x as i64));
-            all_mask.extend(enc.get_attention_mask().iter().map(|&x| x as i64));
-            all_type_ids.extend(enc.get_type_ids().iter().map(|&x| x as i64));
+            let seq_len = enc.get_ids().len().min(MAX_SEQ_LEN);
+            if seq_len > max_len {
+                max_len = seq_len;
+            }
+            encodings.push(enc);
         }
 
-        let input_ids = Array2::from_shape_vec((batch_size, MAX_SEQ_LEN), all_ids)?;
-        let attention_mask = Array2::from_shape_vec((batch_size, MAX_SEQ_LEN), all_mask)?;
-        let token_type_ids = Array2::from_shape_vec((batch_size, MAX_SEQ_LEN), all_type_ids)?;
+        // Build flat padded arrays using the dynamic max_len (not MAX_SEQ_LEN).
+        let mut all_ids = vec![0i64; batch_size * max_len];
+        let mut all_mask = vec![0i64; batch_size * max_len];
+        let mut all_type_ids = vec![0i64; batch_size * max_len];
+
+        for (i, enc) in encodings.iter().enumerate() {
+            let ids = enc.get_ids();
+            let mask = enc.get_attention_mask();
+            let type_ids = enc.get_type_ids();
+            let seq_len = ids.len().min(max_len);
+            let offset = i * max_len;
+            for j in 0..seq_len {
+                all_ids[offset + j] = ids[j] as i64;
+                all_mask[offset + j] = mask[j] as i64;
+                all_type_ids[offset + j] = type_ids[j] as i64;
+            }
+        }
+
+        let input_ids = Array2::from_shape_vec((batch_size, max_len), all_ids)?;
+        let attention_mask = Array2::from_shape_vec((batch_size, max_len), all_mask)?;
+        let token_type_ids = Array2::from_shape_vec((batch_size, max_len), all_type_ids)?;
 
         let mut session = self
             .session

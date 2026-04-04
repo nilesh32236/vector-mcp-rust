@@ -3,6 +3,7 @@ pub mod scanner;
 pub mod watcher;
 
 use anyhow::{Context, Result};
+use futures::future::join_all;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -121,24 +122,39 @@ pub async fn index_file(
         all_vectors.extend(vecs);
     }
 
-    let mut records = Vec::with_capacity(chunks.len());
-    for (i, (chunk, vector)) in chunks.into_iter().zip(all_vectors).enumerate() {
-        let ai_summary: String =
-            if config.feature_toggles.enable_local_llm && chunk.function_score > 0.5 {
-                match summarizer
-                    .summarize_chunk(&chunk.content, Arc::clone(&config))
-                    .await
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::error!("Summary failed for {}: {}", path, e);
-                        "Summary failed".to_string()
+    // Run all AI summarizations concurrently.
+    let enable_llm = config.feature_toggles.enable_local_llm;
+    let summary_futures: Vec<_> = chunks
+        .iter()
+        .map(|chunk| {
+            let content = chunk.content.clone();
+            let summarizer = Arc::clone(&summarizer);
+            let config = Arc::clone(&config);
+            let path = path.to_string();
+            async move {
+                if enable_llm && chunk.function_score > 0.5 {
+                    match summarizer.summarize_chunk(&content, config).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::error!("Summary failed for {}: {}", path, e);
+                            "Summary failed".to_string()
+                        }
                     }
+                } else {
+                    "No AI summary generated".to_string()
                 }
-            } else {
-                "No AI summary generated".to_string()
-            };
+            }
+        })
+        .collect();
+    let summaries = join_all(summary_futures).await;
 
+    let mut records = Vec::with_capacity(chunks.len());
+    for (i, ((chunk, vector), ai_summary)) in chunks
+        .into_iter()
+        .zip(all_vectors)
+        .zip(summaries)
+        .enumerate()
+    {
         let metadata = json!({
             "path": path,
             "project_id": config.project_root.read().unwrap().clone(),
