@@ -20,10 +20,10 @@ pub async fn start_watcher(
     db: Arc<Store>,
     embedder: Arc<Embedder>,
     summarizer: Arc<Summarizer>,
-) -> Result<()> {
+) -> Result<Option<notify::RecommendedWatcher>> {
     if !config.feature_toggles.enable_live_indexing {
         info!("Live indexing disabled via config");
-        return Ok(());
+        return Ok(None);
     }
 
     info!(
@@ -97,9 +97,7 @@ pub async fn start_watcher(
         }
     });
 
-    Box::leak(Box::new(watcher));
-
-    Ok(())
+    Ok(Some(watcher))
 }
 
 fn get_relative_path(path: &str, root: &str) -> String {

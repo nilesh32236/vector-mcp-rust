@@ -393,26 +393,46 @@ fn calculate_score(node: tree_sitter::Node, calls: &[String]) -> f32 {
 // Relationship parsing (mirrors Go's `parseRelationships`)
 // ---------------------------------------------------------------------------
 
+use std::sync::LazyLock;
+
+static JS_PATH_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"(?:import|from|require)\s*\(?\s*['"]([^'"]+)['"]"#).unwrap()
+});
+static JS_NAMED_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"import\s*\{([^}]+)\}").unwrap());
+
+static GO_SINGLE_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"import\s+(?:[a-zA-Z0-9_.]+\s+)?["']([^"']+)["']"#).unwrap()
+});
+static GO_BLOCK_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"import\s+\(([\s\S]*?)\)").unwrap());
+static GO_INNER_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r#"["']([^"']+)["']"#).unwrap());
+
+static PHP_REQ_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"(?:require|require_once|include|include_once)\s*\(?\s*['"]([^'"]+)['"]"#)
+        .unwrap()
+});
+static PHP_USE_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"use\s+([^;]+);").unwrap());
+
+static RUST_USE_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"use\s+([^;]+);").unwrap());
+
 fn parse_js_relationships(text: &str, relations: &mut Vec<String>) {
     // import/from/require paths
-    let path_re = regex::Regex::new(r#"(?:import|from|require)\s*\(?\s*['"]([^'"]+)['"]"#);
-    if let Ok(re) = path_re {
-        for cap in re.captures_iter(text) {
-            if let Some(m) = cap.get(1) {
-                relations.push(m.as_str().to_owned());
-            }
+    for cap in JS_PATH_RE.captures_iter(text) {
+        if let Some(m) = cap.get(1) {
+            relations.push(m.as_str().to_owned());
         }
     }
     // named imports
-    let named_re = regex::Regex::new(r"import\s*\{([^}]+)\}");
-    if let Ok(re) = named_re {
-        for cap in re.captures_iter(text) {
-            if let Some(m) = cap.get(1) {
-                for name in m.as_str().split(',') {
-                    let cleaned = name.split(" as ").next().unwrap_or("").trim();
-                    if !cleaned.is_empty() {
-                        relations.push(cleaned.to_owned());
-                    }
+    for cap in JS_NAMED_RE.captures_iter(text) {
+        if let Some(m) = cap.get(1) {
+            for name in m.as_str().split(',') {
+                let cleaned = name.split(" as ").next().unwrap_or("").trim();
+                if !cleaned.is_empty() {
+                    relations.push(cleaned.to_owned());
                 }
             }
         }
@@ -421,26 +441,17 @@ fn parse_js_relationships(text: &str, relations: &mut Vec<String>) {
 
 fn parse_go_relationships(text: &str, relations: &mut Vec<String>) {
     // single import
-    let single_re = regex::Regex::new(r#"import\s+(?:[a-zA-Z0-9_.]+\s+)?["']([^"']+)["']"#);
-    if let Ok(re) = single_re {
-        for cap in re.captures_iter(text) {
-            if let Some(m) = cap.get(1) {
-                relations.push(m.as_str().to_owned());
-            }
+    for cap in GO_SINGLE_RE.captures_iter(text) {
+        if let Some(m) = cap.get(1) {
+            relations.push(m.as_str().to_owned());
         }
     }
     // block import
-    let block_re = regex::Regex::new(r"import\s+\(([\s\S]*?)\)");
-    if let Ok(re) = block_re {
-        let inner_re = regex::Regex::new(r#"["']([^"']+)["']"#);
-        for cap in re.captures_iter(text) {
-            if let Some(block) = cap.get(1)
-                && let Ok(ref ire) = inner_re
-            {
-                for ic in ire.captures_iter(block.as_str()) {
-                    if let Some(m) = ic.get(1) {
-                        relations.push(m.as_str().to_owned());
-                    }
+    for cap in GO_BLOCK_RE.captures_iter(text) {
+        if let Some(block) = cap.get(1) {
+            for ic in GO_INNER_RE.captures_iter(block.as_str()) {
+                if let Some(m) = ic.get(1) {
+                    relations.push(m.as_str().to_owned());
                 }
             }
         }
@@ -448,25 +459,17 @@ fn parse_go_relationships(text: &str, relations: &mut Vec<String>) {
 }
 
 fn parse_php_relationships(text: &str, relations: &mut Vec<String>) {
-    let req_re = regex::Regex::new(
-        r#"(?:require|require_once|include|include_once)\s*\(?\s*['"]([^'"]+)['"]"#,
-    );
-    if let Ok(re) = req_re {
-        for cap in re.captures_iter(text) {
-            if let Some(m) = cap.get(1) {
-                relations.push(m.as_str().to_owned());
-            }
+    for cap in PHP_REQ_RE.captures_iter(text) {
+        if let Some(m) = cap.get(1) {
+            relations.push(m.as_str().to_owned());
         }
     }
-    let use_re = regex::Regex::new(r"use\s+([^;]+);");
-    if let Ok(re) = use_re {
-        for cap in re.captures_iter(text) {
-            if let Some(m) = cap.get(1) {
-                for part in m.as_str().split(',') {
-                    let cleaned = part.split(" as ").next().unwrap_or("").trim();
-                    if !cleaned.is_empty() {
-                        relations.push(cleaned.to_owned());
-                    }
+    for cap in PHP_USE_RE.captures_iter(text) {
+        if let Some(m) = cap.get(1) {
+            for part in m.as_str().split(',') {
+                let cleaned = part.split(" as ").next().unwrap_or("").trim();
+                if !cleaned.is_empty() {
+                    relations.push(cleaned.to_owned());
                 }
             }
         }
@@ -474,12 +477,9 @@ fn parse_php_relationships(text: &str, relations: &mut Vec<String>) {
 }
 
 fn parse_rust_relationships(text: &str, relations: &mut Vec<String>) {
-    let use_re = regex::Regex::new(r"use\s+([^;]+);");
-    if let Ok(re) = use_re {
-        for cap in re.captures_iter(text) {
-            if let Some(m) = cap.get(1) {
-                relations.push(m.as_str().trim().to_owned());
-            }
+    for cap in RUST_USE_RE.captures_iter(text) {
+        if let Some(m) = cap.get(1) {
+            relations.push(m.as_str().trim().to_owned());
         }
     }
 }
