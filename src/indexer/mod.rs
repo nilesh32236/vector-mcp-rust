@@ -135,8 +135,8 @@ pub async fn index_file(
             let path = path.to_string();
             let sem = Arc::clone(&sem);
             tokio::spawn(async move {
-                let _permit = sem.acquire().await;
                 if enable_llm && score > 0.5 {
+                    let _permit = sem.acquire().await;
                     match summarizer.summarize_chunk(&content, config).await {
                         Ok(s) => s,
                         Err(e) => {
