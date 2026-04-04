@@ -54,29 +54,28 @@ pub fn get_directory_tree(path: &std::path::Path, max_depth: usize) -> Result<St
     Ok(out)
 }
 
-/// Indexes a single file, replacing any existing vectors for that path.
+/// Indexes a single file: returns the records to be inserted (does NOT write to DB).
+/// The caller is responsible for batching and flushing to the store.
 pub async fn index_file(
     path: &str,
     config: Arc<Config>,
     store: Arc<Store>,
     embedder: Arc<Embedder>,
     summarizer: Arc<Summarizer>,
-) -> Result<()> {
+) -> Result<Vec<Record>> {
     let raw_bytes = tokio::fs::read(path)
         .await
         .with_context(|| format!("Reading file for indexing: {path}"))?;
 
     let current_hash = compute_hash(&raw_bytes);
 
-    // Check if the file already exists in the DB and has the same hash.
+    // Skip if content unchanged.
     if let Ok(existing_records) = store.get_records_by_path(path).await
         && !existing_records.is_empty()
+        && existing_records[0].content_hash() == current_hash
     {
-        let existing_hash = existing_records[0].content_hash();
-        if existing_hash == current_hash {
-            tracing::debug!("Skipping indexing for {}: content hash unchanged", path);
-            return Ok(());
-        }
+        tracing::debug!("Skipping indexing for {}: content hash unchanged", path);
+        return Ok(vec![]);
     }
 
     let extension = std::path::Path::new(path)
@@ -91,27 +90,39 @@ pub async fn index_file(
         })
         .unwrap_or_default();
 
-    let chunks = if extension == ".pdf" {
-        chunker::parse_pdf(&raw_bytes, path)?
-    } else {
-        let content = String::from_utf8_lossy(&raw_bytes);
-        chunker::parse_file(&content, path, &extension)?
-    };
+    // Offload CPU-bound parsing to a blocking thread so the async runtime stays free.
+    let path_owned = path.to_string();
+    let ext_owned = extension.clone();
+    let chunks = tokio::task::spawn_blocking(move || -> Result<Vec<chunker::Chunk>> {
+        if ext_owned == ".pdf" {
+            chunker::parse_pdf(&raw_bytes, &path_owned)
+        } else {
+            let content = String::from_utf8_lossy(&raw_bytes).into_owned();
+            chunker::parse_file(&content, &path_owned, &ext_owned)
+        }
+    })
+    .await??;
+
     if chunks.is_empty() {
-        return Ok(());
+        return Ok(vec![]);
     }
 
-    let mut records = Vec::new();
     let updated_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)?
         .as_secs()
         .to_string();
 
-    for (i, chunk) in chunks.into_iter().enumerate() {
-        let vector = embedder.embed_text(&chunk.content)?;
+    // Batch-embed all chunks in one ONNX forward pass.
+    const EMBED_BATCH_SIZE: usize = 32;
+    let chunk_texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
+    let mut all_vectors: Vec<Vec<f32>> = Vec::with_capacity(chunk_texts.len());
+    for batch in chunk_texts.chunks(EMBED_BATCH_SIZE) {
+        let vecs = embedder.embed_batch(batch)?;
+        all_vectors.extend(vecs);
+    }
 
-        // Optional: Generate AI summary if local LLM is enabled.
-        // We only do this for function/class chunks to save time, or if requested.
+    let mut records = Vec::with_capacity(chunks.len());
+    for (i, (chunk, vector)) in chunks.into_iter().zip(all_vectors).enumerate() {
         let ai_summary: String =
             if config.feature_toggles.enable_local_llm && chunk.function_score > 0.5 {
                 match summarizer
@@ -156,10 +167,7 @@ pub async fn index_file(
         });
     }
 
-    store.delete_by_path(path).await?;
-    store.upsert_records(records).await?;
-
-    Ok(())
+    Ok(records)
 }
 
 fn compute_hash(bytes: &[u8]) -> String {

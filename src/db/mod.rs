@@ -233,6 +233,24 @@ impl Store {
         Ok(())
     }
 
+    /// Bulk-insert a pre-built batch of records without touching the graph.
+    /// Callers are responsible for deleting stale records beforehand.
+    /// Use this for high-throughput scan ingestion.
+    pub async fn insert_batch(&self, records: &[Record]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let batch = records_to_batch(records)?;
+        {
+            let mut idx = self.bm25.write().unwrap();
+            for r in records {
+                idx.add(&r.id, &bm25_document_text(r));
+            }
+        }
+        self.code_vectors.add(vec![batch]).execute().await?;
+        Ok(())
+    }
+
     pub async fn delete_by_path(&self, path: &str) -> Result<()> {
         let predicate = format!(
             "metadata LIKE '%\"path\":\"{}\"%'",

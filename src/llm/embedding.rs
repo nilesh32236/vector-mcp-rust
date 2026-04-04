@@ -178,6 +178,69 @@ impl Embedder {
         self.embed_inner(text, true)
     }
 
+    /// Embed a batch of texts in a single ONNX forward pass.
+    /// Returns one embedding vector per input string.
+    pub fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(vec![]);
+        }
+        let batch_size = texts.len();
+        let mut all_ids = Vec::with_capacity(batch_size * MAX_SEQ_LEN);
+        let mut all_mask = Vec::with_capacity(batch_size * MAX_SEQ_LEN);
+        let mut all_type_ids = Vec::with_capacity(batch_size * MAX_SEQ_LEN);
+
+        for text in texts {
+            let adapted = apply_adapter(text, &self.model_name, false);
+            let enc = self
+                .tokenizer
+                .encode(adapted.as_str(), true)
+                .map_err(|e| anyhow::anyhow!("Tokenization failed: {e}"))?;
+            all_ids.extend(enc.get_ids().iter().map(|&x| x as i64));
+            all_mask.extend(enc.get_attention_mask().iter().map(|&x| x as i64));
+            all_type_ids.extend(enc.get_type_ids().iter().map(|&x| x as i64));
+        }
+
+        let input_ids = Array2::from_shape_vec((batch_size, MAX_SEQ_LEN), all_ids)?;
+        let attention_mask = Array2::from_shape_vec((batch_size, MAX_SEQ_LEN), all_mask)?;
+        let token_type_ids = Array2::from_shape_vec((batch_size, MAX_SEQ_LEN), all_type_ids)?;
+
+        let mut session = self
+            .session
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Embedder mutex poisoned"))?;
+
+        let mut inputs = ort::inputs![
+            "input_ids" => Value::from_array(input_ids)?,
+            "attention_mask" => Value::from_array(attention_mask)?,
+        ];
+        if session
+            .inputs()
+            .iter()
+            .any(|i| i.name() == "token_type_ids")
+        {
+            inputs.push((
+                "token_type_ids".into(),
+                Value::from_array(token_type_ids)?.into(),
+            ));
+        }
+
+        let outputs = session.run(inputs)?;
+        let output_value = outputs
+            .get("last_hidden_state")
+            .or_else(|| outputs.get("output"))
+            .unwrap_or(&outputs[0]);
+        let output_array = output_value.try_extract_array::<f32>()?;
+
+        let target_dim = self.matryoshka_dim.unwrap_or(self.dimension);
+        let mut result = Vec::with_capacity(batch_size);
+        for i in 0..batch_size {
+            let mut emb = output_array.slice(ndarray::s![i, 0, ..target_dim]).to_vec();
+            normalize(&mut emb);
+            result.push(emb);
+        }
+        Ok(result)
+    }
+
     pub fn rerank(&self, query: &str, documents: Vec<String>) -> Result<Vec<f32>> {
         let session_mutex = self
             .rerank_session

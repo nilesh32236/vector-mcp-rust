@@ -79,9 +79,21 @@ pub async fn start_watcher(
                         let summarizer = Arc::clone(&summarizer);
 
                         tokio::spawn(async move {
-                            if let Err(e) = indexer::index_file(&path_str, Arc::clone(&config), Arc::clone(&db), Arc::clone(&embedder), Arc::clone(&summarizer)).await {
-                                error!("Failed to re-index {}: {:?}", path_str, e);
-                                return;
+                            match indexer::index_file(&path_str, Arc::clone(&config), Arc::clone(&db), Arc::clone(&embedder), Arc::clone(&summarizer)).await {
+                                Ok(records) if !records.is_empty() => {
+                                    if let Err(e) = db.delete_by_path(&path_str).await {
+                                        error!("Failed to delete stale records for {}: {:?}", path_str, e);
+                                    }
+                                    if let Err(e) = db.insert_batch(&records).await {
+                                        error!("Failed to insert records for {}: {:?}", path_str, e);
+                                        return;
+                                    }
+                                }
+                                Ok(_) => {} // empty = skipped (hash unchanged or no chunks)
+                                Err(e) => {
+                                    error!("Failed to re-index {}: {:?}", path_str, e);
+                                    return;
+                                }
                             }
 
                             // --- Architectural Guardrails ---
