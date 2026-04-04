@@ -12,14 +12,17 @@ pub struct ModelConfig {
 pub fn get_model_registry() -> HashMap<&'static str, ModelConfig> {
     let mut m = HashMap::new();
 
-    m.insert("Xenova/bge-m3", ModelConfig {
-        name: "Xenova/bge-m3",
-        onnx_url: "https://huggingface.co/Xenova/bge-m3/resolve/main/onnx/model_quantized.onnx",
-        tokenizer_url: "https://huggingface.co/Xenova/bge-m3/resolve/main/tokenizer.json",
-        filename: "bge-m3-q4.onnx",
-        dimension: 1024,
-        is_reranker: false,
-    });
+    m.insert(
+        "Xenova/bge-m3",
+        ModelConfig {
+            name: "Xenova/bge-m3",
+            onnx_url: "https://huggingface.co/Xenova/bge-m3/resolve/main/onnx/model_quantized.onnx",
+            tokenizer_url: "https://huggingface.co/Xenova/bge-m3/resolve/main/tokenizer.json",
+            filename: "bge-m3-q4.onnx",
+            dimension: 1024,
+            is_reranker: false,
+        },
+    );
 
     m.insert("BAAI/bge-small-en-v1.5", ModelConfig {
         name: "BAAI/bge-small-en-v1.5",

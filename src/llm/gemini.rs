@@ -1,7 +1,7 @@
 #![allow(dead_code)]
+use crate::config::Config;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use crate::config::Config;
 
 #[derive(Debug, Serialize)]
 #[allow(dead_code)]
@@ -114,15 +114,25 @@ impl GeminiClient {
         let status = response.status();
         if !status.is_success() {
             let error_text = response.text().await?;
-            return Err(anyhow::anyhow!("Gemini API error ({}): {}", status, error_text));
+            return Err(anyhow::anyhow!(
+                "Gemini API error ({}): {}",
+                status,
+                error_text
+            ));
         }
 
-        let result: GeminiGenerateResponse = response.json().await.context("Failed to parse Gemini response")?;
-        
-        let text = result.candidates.first()
+        let result: GeminiGenerateResponse = response
+            .json()
+            .await
+            .context("Failed to parse Gemini response")?;
+
+        let text = result
+            .candidates
+            .first()
             .context("No candidates in Gemini response")?
             .content
-            .parts.first()
+            .parts
+            .first()
             .context("No parts in Gemini candidate content")?
             .text
             .clone();
@@ -146,10 +156,17 @@ impl GeminiClient {
         let status = response.status();
         if !status.is_success() {
             let error_text = response.text().await?;
-            return Err(anyhow::anyhow!("Gemini API error ({}): {}", status, error_text));
+            return Err(anyhow::anyhow!(
+                "Gemini API error ({}): {}",
+                status,
+                error_text
+            ));
         }
 
-        let result: GeminiModelList = response.json().await.context("Failed to parse Gemini model list")?;
+        let result: GeminiModelList = response
+            .json()
+            .await
+            .context("Failed to parse Gemini model list")?;
         Ok(result.models)
     }
 }

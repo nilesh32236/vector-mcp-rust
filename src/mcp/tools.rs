@@ -41,7 +41,8 @@ fn tool_search_workspace() -> ToolInfo {
             "action='regex': exact text / regex grep across files. ",
             "action='graph': knowledge-graph traversal (interface implementations, symbol usage). ",
             "action='index_status': check background indexing progress."
-        ).into(),
+        )
+        .into(),
         input_schema: ToolInputSchema {
             schema_type: "object",
             properties: json!({
@@ -79,7 +80,8 @@ fn tool_workspace_manager() -> ToolInfo {
             "action='get_indexing_diagnostics': detailed health and progress report. ",
             "action='store_context': persist architectural decisions or rules. ",
             "action='delete_context': remove stored context entries."
-        ).into(),
+        )
+        .into(),
         input_schema: ToolInputSchema {
             schema_type: "object",
             properties: json!({
@@ -117,7 +119,8 @@ fn tool_analyze_code() -> ToolInfo {
             "action='duplicate_code': detect semantically similar code blocks. ",
             "action='dependencies': validate package.json / go.mod / requirements.txt. ",
             "action='distill_package': summarise a package and re-index with 2x priority."
-        ).into(),
+        )
+        .into(),
         input_schema: ToolInputSchema {
             schema_type: "object",
             properties: json!({
@@ -149,7 +152,8 @@ fn tool_modify_workspace() -> ToolInfo {
             "action='create_file': create a new file with content. ",
             "action='run_linter': run a formatter (gofmt | rustfmt | prettier). ",
             "action='verify_patch': dry-run — check if a patch is applicable without writing."
-        ).into(),
+        )
+        .into(),
         input_schema: ToolInputSchema {
             schema_type: "object",
             properties: json!({

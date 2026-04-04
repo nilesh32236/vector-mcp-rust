@@ -11,12 +11,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use dashmap::DashMap;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{Mutex, oneshot};
 use tokio::time::Instant;
 use tracing::info;
 
@@ -37,12 +37,12 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Returns the command + args for the LSP server associated with a file extension.
 pub fn server_command(ext: &str) -> Option<Vec<&'static str>> {
     match ext.to_lowercase().trim_start_matches('.') {
-        "go"              => Some(vec!["gopls"]),
-        "js" | "jsx"      => Some(vec!["typescript-language-server", "--stdio"]),
-        "ts" | "tsx"      => Some(vec!["typescript-language-server", "--stdio"]),
-        "rs"              => Some(vec!["rust-analyzer"]),
-        "py"              => Some(vec!["pylsp"]),
-        _                 => None,
+        "go" => Some(vec!["gopls"]),
+        "js" | "jsx" => Some(vec!["typescript-language-server", "--stdio"]),
+        "ts" | "tsx" => Some(vec!["typescript-language-server", "--stdio"]),
+        "rs" => Some(vec!["rust-analyzer"]),
+        "py" => Some(vec!["pylsp"]),
+        _ => None,
     }
 }
 
@@ -185,10 +185,7 @@ impl LspManager {
     ///
     /// The sender is consumed the first time diagnostics arrive for that URI.
     /// Used by mutation safety to verify patches before writing to disk.
-    pub async fn wait_for_diagnostics(
-        &self,
-        uri: &str,
-    ) -> oneshot::Receiver<Vec<Diagnostic>> {
+    pub async fn wait_for_diagnostics(&self, uri: &str) -> oneshot::Receiver<Vec<Diagnostic>> {
         let (tx, rx) = oneshot::channel();
         let mut g = self.inner.lock().await;
         g.diag_waiters.insert(uri.to_string(), tx);
@@ -323,10 +320,9 @@ async fn read_loop(stdout: ChildStdout, inner: Arc<Mutex<Inner>>) {
         if method == "textDocument/publishDiagnostics" {
             let uri = msg["params"]["uri"].as_str().unwrap_or("").to_string();
             if let Some(tx) = g.diag_waiters.remove(&uri) {
-                let diags: Vec<Diagnostic> = serde_json::from_value(
-                    msg["params"]["diagnostics"].clone(),
-                )
-                .unwrap_or_default();
+                let diags: Vec<Diagnostic> =
+                    serde_json::from_value(msg["params"]["diagnostics"].clone())
+                        .unwrap_or_default();
                 let _ = tx.send(diags);
             }
         }

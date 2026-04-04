@@ -27,10 +27,13 @@ impl RateLimiter {
     /// Returns `true` if the request is allowed, `false` if rate-limited.
     pub fn allow(&self, key: &str) -> bool {
         let now = Instant::now();
-        let mut entry = self.buckets.entry(key.to_string()).or_insert_with(|| Bucket {
-            tokens: self.burst,
-            last_update: now,
-        });
+        let mut entry = self
+            .buckets
+            .entry(key.to_string())
+            .or_insert_with(|| Bucket {
+                tokens: self.burst,
+                last_update: now,
+            });
 
         let elapsed = now.duration_since(entry.last_update).as_secs_f64();
         entry.tokens = (entry.tokens + elapsed * self.rate).min(self.burst);
@@ -48,8 +51,7 @@ impl RateLimiter {
     #[allow(dead_code)]
     pub fn cleanup(&self, max_age_secs: f64) {
         let now = Instant::now();
-        self.buckets.retain(|_, b| {
-            now.duration_since(b.last_update).as_secs_f64() < max_age_secs
-        });
+        self.buckets
+            .retain(|_, b| now.duration_since(b.last_update).as_secs_f64() < max_age_secs);
     }
 }

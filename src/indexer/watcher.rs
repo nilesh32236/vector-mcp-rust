@@ -108,9 +108,14 @@ fn get_relative_path(path: &str, root: &str) -> String {
     }
 }
 
-async fn check_architectural_compliance(rel_path: &str, config: Arc<Config>, db: Arc<Store>, embedder: Arc<Embedder>) {
+async fn check_architectural_compliance(
+    rel_path: &str,
+    config: Arc<Config>,
+    db: Arc<Store>,
+    embedder: Arc<Embedder>,
+) {
     let _project_root = config.project_root.read().unwrap().clone();
-    
+
     // 1. Fetch the records for the file we just indexed
     let records = match db.get_records_by_path(rel_path).await {
         Ok(r) if !r.is_empty() => r,
@@ -132,14 +137,18 @@ async fn check_architectural_compliance(rel_path: &str, config: Arc<Config>, db:
         let meta = r.metadata_json();
         let current_deps: Vec<String> = meta["relationships"]
             .as_array()
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
             .unwrap_or_default();
 
         for rule in &relevant_rules {
             let rule_meta = rule.metadata_json();
             let cat = rule_meta["category"].as_str().unwrap_or("");
             let rule_type = rule_meta["type"].as_str().unwrap_or("");
-            
+
             if cat != "adr" && rule_type != "distilled_summary" {
                 continue;
             }
@@ -147,10 +156,14 @@ async fn check_architectural_compliance(rel_path: &str, config: Arc<Config>, db:
             let content_lower = rule.content.to_lowercase();
             for dep in &current_deps {
                 let dep_lower = dep.to_lowercase();
-                if content_lower.contains(&format!("no {}", dep_lower)) || content_lower.contains(&format!("forbidden: {}", dep_lower)) {
+                if content_lower.contains(&format!("no {}", dep_lower))
+                    || content_lower.contains(&format!("forbidden: {}", dep_lower))
+                {
                     let msg = format!(
                         "🛡️ Architectural Alert: File `{}` might violate rule in `{}`. Found forbidden dependency: `{}`",
-                        rel_path, rule_meta["path"].as_str().unwrap_or("unknown"), dep
+                        rel_path,
+                        rule_meta["path"].as_str().unwrap_or("unknown"),
+                        dep
                     );
                     warn!("{}", msg);
                 }
@@ -159,7 +172,13 @@ async fn check_architectural_compliance(rel_path: &str, config: Arc<Config>, db:
     }
 }
 
-async fn redistill_dependents(rel_path: &str, config: Arc<Config>, db: Arc<Store>, embedder: Arc<Embedder>, summarizer: Arc<Summarizer>) {
+async fn redistill_dependents(
+    rel_path: &str,
+    config: Arc<Config>,
+    db: Arc<Store>,
+    embedder: Arc<Embedder>,
+    summarizer: Arc<Summarizer>,
+) {
     let pkg = std::path::Path::new(rel_path)
         .parent()
         .map(|p| p.to_string_lossy().to_string())
@@ -188,24 +207,46 @@ async fn redistill_dependents(rel_path: &str, config: Arc<Config>, db: Arc<Store
     }
 
     for d_pkg in dependent_pkgs {
-        info!("Triggering autonomous re-distillation for dependent package: {} (reason: {})", d_pkg, rel_path);
+        info!(
+            "Triggering autonomous re-distillation for dependent package: {} (reason: {})",
+            d_pkg, rel_path
+        );
         let config_clone = Arc::clone(&config);
         let db_clone = Arc::clone(&db);
         let embedder_clone = Arc::clone(&embedder);
         let summarizer_clone = Arc::clone(&summarizer);
         tokio::spawn(async move {
-            let _ = distill_package_internal(&d_pkg, config_clone, db_clone, embedder_clone, summarizer_clone).await;
+            let _ = distill_package_internal(
+                &d_pkg,
+                config_clone,
+                db_clone,
+                embedder_clone,
+                summarizer_clone,
+            )
+            .await;
         });
     }
 }
 
-async fn distill_package_internal(pkg_path: &str, config: Arc<Config>, db: Arc<Store>, embedder: Arc<Embedder>, _summarizer: Arc<Summarizer>) -> Result<()> {
+async fn distill_package_internal(
+    pkg_path: &str,
+    config: Arc<Config>,
+    db: Arc<Store>,
+    embedder: Arc<Embedder>,
+    _summarizer: Arc<Summarizer>,
+) -> Result<()> {
     let records = db.get_records_by_path(pkg_path).await?;
-    if records.is_empty() { return Ok(()); }
+    if records.is_empty() {
+        return Ok(());
+    }
 
     let mut content = String::new();
     for r in &records {
-        content.push_str(&format!("File: {}\n{}\n---\n", r.metadata_str("path"), r.content));
+        content.push_str(&format!(
+            "File: {}\n{}\n---\n",
+            r.metadata_str("path"),
+            r.content
+        ));
     }
 
     let system_prompt = "You are a Senior Software Architect. Analyse the provided source code and produce a concise Markdown summary covering: 1) Purpose, 2) Key architectural decisions, 3) Implementation rules. Be brief and actionable.";

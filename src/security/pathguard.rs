@@ -1,6 +1,6 @@
 //! Path guard — prevents directory traversal, mirrors Go's pathguard package.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use std::path::{Path, PathBuf};
 
 pub struct PathGuard {

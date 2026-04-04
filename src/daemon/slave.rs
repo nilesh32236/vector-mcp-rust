@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -24,13 +24,10 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Send one JSON request line to the master and read one JSON response line.
 async fn rpc_call(socket_path: &str, request: &Value) -> Result<Value> {
-    let stream = tokio::time::timeout(
-        Duration::from_secs(2),
-        UnixStream::connect(socket_path),
-    )
-    .await
-    .context("connect timeout")?
-    .with_context(|| format!("failed to connect to master at {socket_path}"))?;
+    let stream = tokio::time::timeout(Duration::from_secs(2), UnixStream::connect(socket_path))
+        .await
+        .context("connect timeout")?
+        .with_context(|| format!("failed to connect to master at {socket_path}"))?;
 
     let (reader, mut writer) = stream.into_split();
 
@@ -76,7 +73,9 @@ pub struct RemoteEmbedder {
 
 impl RemoteEmbedder {
     pub fn new(socket_path: impl Into<String>) -> Self {
-        Self { socket_path: socket_path.into() }
+        Self {
+            socket_path: socket_path.into(),
+        }
     }
 
     /// Embed a document chunk.
@@ -115,7 +114,9 @@ pub struct RemoteStore {
 
 impl RemoteStore {
     pub fn new(socket_path: impl Into<String>) -> Self {
-        Self { socket_path: socket_path.into() }
+        Self {
+            socket_path: socket_path.into(),
+        }
     }
 
     /// Hybrid search (vector + BM25 RRF) delegated to the master.

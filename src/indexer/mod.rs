@@ -4,9 +4,9 @@ pub mod watcher;
 
 use anyhow::{Context, Result};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use sha2::{Sha256, Digest};
 
 use crate::config::Config;
 use crate::db::{Record, Store};
@@ -35,9 +35,14 @@ pub fn get_directory_tree(path: &std::path::Path, max_depth: usize) -> Result<St
             }
             let name = entry.file_name().to_string_lossy();
             let depth = entry.depth();
-            
+
             // Skip common noise
-            if name == "node_modules" || name == ".git" || name == "target" || name == ".next" || name == ".data" {
+            if name == "node_modules"
+                || name == ".git"
+                || name == "target"
+                || name == ".next"
+                || name == ".data"
+            {
                 continue;
             }
 
@@ -65,13 +70,14 @@ pub async fn index_file(
 
     // Check if the file already exists in the DB and has the same hash.
     if let Ok(existing_records) = store.get_records_by_path(path).await
-        && !existing_records.is_empty() {
-            let existing_hash = existing_records[0].content_hash();
-            if existing_hash == current_hash {
-                tracing::debug!("Skipping indexing for {}: content hash unchanged", path);
-                return Ok(());
-            }
+        && !existing_records.is_empty()
+    {
+        let existing_hash = existing_records[0].content_hash();
+        if existing_hash == current_hash {
+            tracing::debug!("Skipping indexing for {}: content hash unchanged", path);
+            return Ok(());
         }
+    }
 
     let extension = std::path::Path::new(path)
         .extension()

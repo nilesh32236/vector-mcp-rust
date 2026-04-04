@@ -31,11 +31,14 @@ impl Summarizer {
         } else {
             tracing::info!("Local model not found in models_dir, provisioning...");
             std::fs::create_dir_all(&config.models_dir)?;
-            
+
             // Try direct download first for reliability
             let qwen_gguf_url = "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf";
             if let Err(e) = download_direct(qwen_gguf_url, &local_model) {
-                tracing::warn!("Direct download of Qwen GGUF failed: {}. Falling back to HF Hub...", e);
+                tracing::warn!(
+                    "Direct download of Qwen GGUF failed: {}. Falling back to HF Hub...",
+                    e
+                );
                 let api = Api::new().context("Failed to create HF API client")?;
                 let repo = api.model("Qwen/Qwen2.5-0.5B-Instruct-GGUF".to_string());
                 let downloaded_path = repo
@@ -43,7 +46,7 @@ impl Summarizer {
                     .context("Failed to download model from Hugging Face")?;
                 std::fs::copy(&downloaded_path, &local_model)?;
             }
-            
+
             local_model
         };
 
@@ -61,10 +64,14 @@ impl Summarizer {
             local_tokenizer
         } else {
             tracing::info!("Local tokenizer not found in models_dir, provisioning...");
-            
-            let qwen_tokenizer_url = "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/main/tokenizer.json";
+
+            let qwen_tokenizer_url =
+                "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/main/tokenizer.json";
             if let Err(e) = download_direct(qwen_tokenizer_url, &local_tokenizer) {
-                tracing::warn!("Direct download of Qwen tokenizer failed: {}. Falling back to HF Hub...", e);
+                tracing::warn!(
+                    "Direct download of Qwen tokenizer failed: {}. Falling back to HF Hub...",
+                    e
+                );
                 let api = Api::new().context("Failed to create HF API client")?;
                 let token_repo = api.model("Qwen/Qwen2.5-0.5B-Instruct".to_string());
                 let downloaded_path = token_repo
@@ -73,7 +80,7 @@ impl Summarizer {
                     .context("Failed to download tokenizer from Hugging Face")?;
                 std::fs::copy(&downloaded_path, &local_tokenizer)?;
             }
-            
+
             local_tokenizer
         };
 

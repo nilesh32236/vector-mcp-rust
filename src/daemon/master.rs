@@ -65,7 +65,11 @@ impl Response {
     }
 
     fn err(msg: impl Into<String>) -> Self {
-        Self { ok: false, result: None, error: Some(msg.into()) }
+        Self {
+            ok: false,
+            result: None,
+            error: Some(msg.into()),
+        }
     }
 }
 
@@ -119,8 +123,8 @@ impl MasterServer {
         // Remove stale socket file.
         let _ = tokio::fs::remove_file(path).await;
 
-        let listener = UnixListener::bind(path)
-            .with_context(|| format!("binding Unix socket at {path}"))?;
+        let listener =
+            UnixListener::bind(path).with_context(|| format!("binding Unix socket at {path}"))?;
 
         info!(socket = %path, "Master daemon listening");
 
@@ -188,19 +192,19 @@ impl MasterServer {
                 Err(e) => Response::err(e.to_string()),
             },
 
-            Request::HybridSearch { query, vector, limit } => {
-                match self.store.hybrid_search(vector, &query, limit, None).await {
-                    Ok(records) => Response::ok(serde_json::json!({ "records": records })),
-                    Err(e) => Response::err(e.to_string()),
-                }
-            }
+            Request::HybridSearch {
+                query,
+                vector,
+                limit,
+            } => match self.store.hybrid_search(vector, &query, limit, None).await {
+                Ok(records) => Response::ok(serde_json::json!({ "records": records })),
+                Err(e) => Response::err(e.to_string()),
+            },
 
-            Request::IndexProject { path } => {
-                match self.index_tx.try_send(path) {
-                    Ok(_) => Response::ok(serde_json::json!({ "queued": true })),
-                    Err(_) => Response::err("index queue full"),
-                }
-            }
+            Request::IndexProject { path } => match self.index_tx.try_send(path) {
+                Ok(_) => Response::ok(serde_json::json!({ "queued": true })),
+                Err(_) => Response::err("index queue full"),
+            },
 
             Request::GetProgress => {
                 let map: std::collections::HashMap<String, serde_json::Value> = self

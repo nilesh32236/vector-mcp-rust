@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 use crate::config::Config;
-use crate::llm::models::{get_model_registry, ModelConfig};
+use crate::llm::models::{ModelConfig, get_model_registry};
 use crate::llm::util::download_direct;
 use anyhow::{Context, Result};
 use hf_hub::api::sync::Api;
@@ -64,7 +64,7 @@ pub struct Embedder {
 impl Embedder {
     pub fn new(config: &Config) -> Result<Self> {
         info!(model = %config.model_name, "Provisioning embedder model...");
-        
+
         let registry = get_model_registry();
         let model_cfg = registry.get(config.model_name.as_str());
 
@@ -76,7 +76,7 @@ impl Embedder {
         if !local_onnx_path.exists() || !local_tokenizer_path.exists() {
             info!("Model files not found locally, provisioning...");
             std::fs::create_dir_all(&local_model_dir)?;
-            
+
             if let Some(m_cfg) = model_cfg {
                 // Use Direct Download for known registry models
                 download_direct(m_cfg.onnx_url, &local_onnx_path)?;
@@ -87,7 +87,8 @@ impl Embedder {
                 let repo = api.model(config.model_name.clone());
 
                 if !local_onnx_path.exists() {
-                    let model_path = repo.get("onnx/model_quantized.onnx")
+                    let model_path = repo
+                        .get("onnx/model_quantized.onnx")
                         .or_else(|_| repo.get("onnx/model.onnx"))
                         .or_else(|_| repo.get("model.onnx"))
                         .context("Failed to download ONNX model from HF")?;
@@ -95,7 +96,8 @@ impl Embedder {
                 }
 
                 if !local_tokenizer_path.exists() {
-                    let tokenizer_path = repo.get("tokenizer.json")
+                    let tokenizer_path = repo
+                        .get("tokenizer.json")
                         .or_else(|_| repo.get("onnx/tokenizer.json"))
                         .context("Failed to download tokenizer.json from HF")?;
                     std::fs::copy(&tokenizer_path, &local_tokenizer_path)?;
@@ -121,7 +123,7 @@ impl Embedder {
         if !config.reranker_model_name.is_empty() {
             info!(model = %config.reranker_model_name, "Provisioning reranker...");
             let r_cfg = registry.get(config.reranker_model_name.as_str());
-            
+
             let r_filename = config.reranker_model_name.replace('/', "_");
             let r_dir = config.models_dir.join(&r_filename);
             let r_onnx = r_dir.join("model.onnx");
@@ -135,10 +137,12 @@ impl Embedder {
                 } else {
                     let api = Api::new().context("Failed to create HF API client for reranker")?;
                     let r_repo = api.model(config.reranker_model_name.clone());
-                    let m_path = r_repo.get("onnx/model_quantized.onnx")
+                    let m_path = r_repo
+                        .get("onnx/model_quantized.onnx")
                         .or_else(|_| r_repo.get("onnx/model.onnx"))
                         .or_else(|_| r_repo.get("model.onnx"))?;
-                    let t_path = r_repo.get("tokenizer.json")
+                    let t_path = r_repo
+                        .get("tokenizer.json")
                         .or_else(|_| r_repo.get("onnx/tokenizer.json"))?;
                     std::fs::copy(&m_path, &r_onnx)?;
                     std::fs::copy(&t_path, &r_tok)?;
@@ -175,7 +179,10 @@ impl Embedder {
     }
 
     pub fn rerank(&self, query: &str, documents: Vec<String>) -> Result<Vec<f32>> {
-        let session_mutex = self.rerank_session.as_ref().context("Reranker not loaded")?;
+        let session_mutex = self
+            .rerank_session
+            .as_ref()
+            .context("Reranker not loaded")?;
         let tokenizer = self
             .rerank_tokenizer
             .as_ref()
@@ -211,10 +218,17 @@ impl Embedder {
 
         // Handle models that don't support token_type_ids or have different names.
         // MS-Marco and BGE-Reranker usually just need the first two.
-        if session.inputs().iter().any(|i| i.name() == "token_type_ids") {
+        if session
+            .inputs()
+            .iter()
+            .any(|i| i.name() == "token_type_ids")
+        {
             let type_ids: Vec<i64> = vec![0; batch_size * MAX_SEQ_LEN];
             let token_type_ids = Array2::from_shape_vec((batch_size, MAX_SEQ_LEN), type_ids)?;
-            inputs.push(("token_type_ids".into(), Value::from_array(token_type_ids)?.into()));
+            inputs.push((
+                "token_type_ids".into(),
+                Value::from_array(token_type_ids)?.into(),
+            ));
         }
 
         let outputs = session.run(inputs)?;
@@ -255,8 +269,15 @@ impl Embedder {
             "attention_mask" => Value::from_array(attention_mask)?,
         ];
 
-        if session.inputs().iter().any(|i| i.name() == "token_type_ids") {
-            inputs.push(("token_type_ids".into(), Value::from_array(token_type_ids)?.into()));
+        if session
+            .inputs()
+            .iter()
+            .any(|i| i.name() == "token_type_ids")
+        {
+            inputs.push((
+                "token_type_ids".into(),
+                Value::from_array(token_type_ids)?.into(),
+            ));
         }
 
         let outputs = session.run(inputs)?;
@@ -272,9 +293,7 @@ impl Embedder {
         let full_dim = self.dimension;
         let target_dim = self.matryoshka_dim.unwrap_or(full_dim);
 
-        let mut embedding = output_array
-            .slice(ndarray::s![0, 0, ..target_dim])
-            .to_vec();
+        let mut embedding = output_array.slice(ndarray::s![0, 0, ..target_dim]).to_vec();
 
         normalize(&mut embedding);
         Ok(embedding)
@@ -282,8 +301,8 @@ impl Embedder {
 }
 
 fn build_tokenizer(path: std::path::PathBuf) -> Result<Tokenizer> {
-    let mut tok = Tokenizer::from_file(path)
-        .map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
+    let mut tok =
+        Tokenizer::from_file(path).map_err(|e| anyhow::anyhow!("Failed to load tokenizer: {e}"))?;
 
     let _ = tok.with_truncation(Some(tokenizers::TruncationParams {
         max_length: MAX_SEQ_LEN,

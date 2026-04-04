@@ -63,7 +63,13 @@ impl KnowledgeGraph {
 
             nodes.insert(
                 r.id.clone(),
-                EntityNode { name, node_type, path, docstring, metadata: struct_meta },
+                EntityNode {
+                    name,
+                    node_type,
+                    path,
+                    docstring,
+                    metadata: struct_meta,
+                },
             );
         }
 
@@ -82,7 +88,10 @@ impl KnowledgeGraph {
                         .keys()
                         .all(|m| node.metadata.contains_key(&format!("method:{m}")));
                     if implements {
-                        impls.entry(iface_name.clone()).or_default().push(id.clone());
+                        impls
+                            .entry(iface_name.clone())
+                            .or_default()
+                            .push(id.clone());
                     }
                 }
             }

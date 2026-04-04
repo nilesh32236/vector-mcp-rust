@@ -1,13 +1,12 @@
 //! SSE transport for MCP.
 
 use axum::{
-    Router,
+    Json, Router,
     extract::{Host, Query, State},
-    http::{StatusCode, Request, header},
-    response::{Sse, sse::Event, IntoResponse},
-    routing::{get, post},
+    http::{Request, StatusCode, header},
     middleware::{self, Next},
-    Json,
+    response::{IntoResponse, Sse, sse::Event},
+    routing::{get, post},
 };
 use dashmap::DashMap;
 use futures::stream::Stream;
@@ -72,7 +71,10 @@ impl<S> Drop for SessionCleanupStream<S> {
     fn drop(&mut self) {
         info!(session = %self.session_id, "SSE session disconnected, cleaning up");
         self.manager.sessions.remove(&self.session_id);
-        self.manager.server.progress_senders.remove(&self.session_id);
+        self.manager
+            .server
+            .progress_senders
+            .remove(&self.session_id);
     }
 }
 
@@ -112,8 +114,13 @@ async fn message_handler(
         // Pre-register a placeholder progress sender (replaced when GET /sse opens the stream)
         let (val_tx, _) = mpsc::unbounded_channel::<serde_json::Value>();
         manager.server.progress_senders.insert(sid.clone(), val_tx);
-        if let Ok(mut last) = manager.last_session.write() { *last = Some(sid.clone()); }
-        let response = manager.server.process_message_with_session(&body_str, Some(&sid)).await;
+        if let Ok(mut last) = manager.last_session.write() {
+            *last = Some(sid.clone());
+        }
+        let response = manager
+            .server
+            .process_message_with_session(&body_str, Some(&sid))
+            .await;
         return (
             StatusCode::OK,
             [
@@ -121,7 +128,8 @@ async fn message_handler(
                 (header::HeaderName::from_static("mcp-session-id"), sid),
             ],
             Json(response),
-        ).into_response();
+        )
+            .into_response();
     }
 
     // All other requests require a valid session ID — fall back to last known session
@@ -132,8 +140,13 @@ async fn message_handler(
     let server = Arc::clone(&manager.server);
 
     // Synchronous methods: respond directly in the HTTP body
-    if matches!(method.as_str(), "tools/list" | "tools/call" | "notifications/initialized" | "initialized") {
-        let response = server.process_message_with_session(&body_str, Some(&sid)).await;
+    if matches!(
+        method.as_str(),
+        "tools/list" | "tools/call" | "notifications/initialized" | "initialized"
+    ) {
+        let response = server
+            .process_message_with_session(&body_str, Some(&sid))
+            .await;
         return (
             StatusCode::OK,
             [
@@ -141,17 +154,22 @@ async fn message_handler(
                 (header::HeaderName::from_static("mcp-session-id"), sid),
             ],
             Json(response),
-        ).into_response();
+        )
+            .into_response();
     }
 
     // Async methods: push response over SSE stream
     let sender = manager.sessions.get(&sid).map(|s| s.clone());
     let sid_for_task = sid.clone();
     tokio::spawn(async move {
-        let response = server.process_message_with_session(&body_str, Some(&sid_for_task)).await;
+        let response = server
+            .process_message_with_session(&body_str, Some(&sid_for_task))
+            .await;
         if !response.is_null() {
             if let Some(tx) = sender {
-                let event = Event::default().event("message").data(serde_json::to_string(&response).unwrap_or_default());
+                let event = Event::default()
+                    .event("message")
+                    .data(serde_json::to_string(&response).unwrap_or_default());
                 let _ = tx.send(event);
             }
         }
@@ -164,7 +182,8 @@ async fn message_handler(
             (header::HeaderName::from_static("mcp-session-id"), sid),
         ],
         Json(serde_json::json!({})),
-    ).into_response()
+    )
+        .into_response()
 }
 
 /// GET /sse?session_id=<id> — Open the SSE stream for an existing session.
@@ -181,7 +200,9 @@ async fn sse_handler(
 
     let (tx, rx) = mpsc::unbounded_channel::<Event>();
     manager.sessions.insert(session_id.clone(), tx.clone());
-    if let Ok(mut last) = manager.last_session.write() { *last = Some(session_id.clone()); }
+    if let Ok(mut last) = manager.last_session.write() {
+        *last = Some(session_id.clone());
+    }
 
     // Wire up progress notifications for this session
     let (val_tx, mut val_rx) = mpsc::unbounded_channel::<serde_json::Value>();
@@ -189,12 +210,18 @@ async fn sse_handler(
     tokio::spawn(async move {
         while let Some(v) = val_rx.recv().await {
             let data = serde_json::to_string(&v).unwrap_or_default();
-            if event_tx.send(Event::default().event("message").data(data)).is_err() {
+            if event_tx
+                .send(Event::default().event("message").data(data))
+                .is_err()
+            {
                 break;
             }
         }
     });
-    manager.server.progress_senders.insert(session_id.clone(), val_tx);
+    manager
+        .server
+        .progress_senders
+        .insert(session_id.clone(), val_tx);
 
     info!(session = %session_id, "SSE stream opened");
 
@@ -226,10 +253,21 @@ pub async fn start_sse_server(server: Arc<Server>, port: u16) -> anyhow::Result<
     let manager = Arc::new(SseManager::new(server));
 
     let app = Router::new()
-        .route("/sse", get(sse_handler).post(message_handler).delete(delete_session_handler))
+        .route(
+            "/sse",
+            get(sse_handler)
+                .post(message_handler)
+                .delete(delete_session_handler),
+        )
         .route("/message", post(message_handler))
-        .route("/.well-known/oauth-protected-resource", get(oauth_not_required))
-        .route("/.well-known/oauth-protected-resource/sse", get(oauth_not_required))
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(oauth_not_required),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource/sse",
+            get(oauth_not_required),
+        )
         .layer(middleware::from_fn(logging_middleware))
         .layer(
             CorsLayer::new()
@@ -259,10 +297,7 @@ async fn oauth_not_required() -> impl IntoResponse {
     )
 }
 
-async fn logging_middleware(
-    req: Request<axum::body::Body>,
-    next: Next,
-) -> impl IntoResponse {
+async fn logging_middleware(req: Request<axum::body::Body>, next: Next) -> impl IntoResponse {
     let method = req.method().clone();
     let uri = req.uri().clone();
     info!(method = %method, uri = %uri, "Incoming request");

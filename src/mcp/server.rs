@@ -36,7 +36,8 @@ pub struct Server {
     pub reload_watcher_tx: tokio::sync::mpsc::Sender<String>,
     pub indexing_progress: Arc<dashmap::DashMap<String, serde_json::Value>>,
     /// session_id → SSE sender for `$/progress` notifications.
-    pub progress_senders: Arc<dashmap::DashMap<String, tokio::sync::mpsc::UnboundedSender<serde_json::Value>>>,
+    pub progress_senders:
+        Arc<dashmap::DashMap<String, tokio::sync::mpsc::UnboundedSender<serde_json::Value>>>,
     pub path_guard: Arc<PathGuard>,
     pub rate_limiter: Arc<RateLimiter>,
     pub lsp_pool: Arc<LspPool>,
@@ -52,8 +53,8 @@ impl Server {
     ) -> Self {
         let indexing_progress = Arc::new(dashmap::DashMap::new());
         let root = config.project_root.read().unwrap().clone();
-        let path_guard = PathGuard::new(&root)
-            .unwrap_or_else(|_| PathGuard::new(std::env::temp_dir()).unwrap());
+        let path_guard =
+            PathGuard::new(&root).unwrap_or_else(|_| PathGuard::new(std::env::temp_dir()).unwrap());
         Self {
             store,
             config,

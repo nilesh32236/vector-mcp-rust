@@ -5,7 +5,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use lancedb::index::Index;
-use lancedb::index::scalar::{InvertedIndexParams as FtsIndexBuilder};
+use lancedb::index::scalar::InvertedIndexParams as FtsIndexBuilder;
 use lancedb::index::vector::IvfPqIndexBuilder;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::{Connection, Table as LanceTable, connect};
@@ -131,10 +131,7 @@ impl Record {
     }
 
     pub fn metadata_str(&self, key: &str) -> String {
-        self.metadata_json()[key]
-            .as_str()
-            .unwrap_or("")
-            .to_string()
+        self.metadata_json()[key].as_str().unwrap_or("").to_string()
     }
 
     pub fn content_hash(&self) -> String {
@@ -276,14 +273,20 @@ impl Store {
         let mut query = self.code_vectors.query().nearest_to(vector)?.limit(limit);
 
         if let Some(pids) = project_ids
-            && !pids.is_empty() {
-                let parts: Vec<String> = pids
-                    .iter()
-                    .map(|p| format!("metadata LIKE '%\"project_id\":\"{}\"%'", p.replace('\'', "''")))
-                    .collect();
-                let predicate = parts.join(" OR ");
-                query = query.only_if(predicate);
-            }
+            && !pids.is_empty()
+        {
+            let parts: Vec<String> = pids
+                .iter()
+                .map(|p| {
+                    format!(
+                        "metadata LIKE '%\"project_id\":\"{}\"%'",
+                        p.replace('\'', "''")
+                    )
+                })
+                .collect();
+            let predicate = parts.join(" OR ");
+            query = query.only_if(predicate);
+        }
 
         let results = query.execute().await?;
         let batches = results.try_collect::<Vec<_>>().await?;
@@ -312,7 +315,9 @@ impl Store {
             .into_iter()
             .filter(|r| {
                 if let Some(pids) = project_ids {
-                    if pids.is_empty() { return true; }
+                    if pids.is_empty() {
+                        return true;
+                    }
                     let pid = r.metadata_str("project_id");
                     pids.contains(&pid)
                 } else {
@@ -549,10 +554,7 @@ fn records_to_batch(records: &[Record]) -> Result<RecordBatch> {
     use lance_arrow::FixedSizeListArrayExt;
 
     // Infer dimension from first record.
-    let dimension = records
-        .first()
-        .map(|r| r.vector.len())
-        .unwrap_or(0);
+    let dimension = records.first().map(|r| r.vector.len()).unwrap_or(0);
 
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
@@ -569,12 +571,23 @@ fn records_to_batch(records: &[Record]) -> Result<RecordBatch> {
     ]));
 
     let ids = StringArray::from(records.iter().map(|r| r.id.as_str()).collect::<Vec<_>>());
-    let contents =
-        StringArray::from(records.iter().map(|r| r.content.as_str()).collect::<Vec<_>>());
-    let metadatas =
-        StringArray::from(records.iter().map(|r| r.metadata.as_str()).collect::<Vec<_>>());
+    let contents = StringArray::from(
+        records
+            .iter()
+            .map(|r| r.content.as_str())
+            .collect::<Vec<_>>(),
+    );
+    let metadatas = StringArray::from(
+        records
+            .iter()
+            .map(|r| r.metadata.as_str())
+            .collect::<Vec<_>>(),
+    );
 
-    let flat: Vec<f32> = records.iter().flat_map(|r| r.vector.iter().copied()).collect();
+    let flat: Vec<f32> = records
+        .iter()
+        .flat_map(|r| r.vector.iter().copied())
+        .collect();
     let vector_values = Float32Array::from(flat);
     let vectors = FixedSizeListArray::try_new_from_values(vector_values, dimension as i32)?;
 

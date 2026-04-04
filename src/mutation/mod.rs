@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 
 use crate::lsp::{Diagnostic, LspManager};
 
@@ -88,7 +88,7 @@ impl SafetyChecker {
                 Some(1) => "Error",
                 Some(2) => "Warning",
                 Some(3) => "Info",
-                _       => "Hint",
+                _ => "Hint",
             };
             out.push_str(&format!(
                 "  [{severity}] line {}: {}\n",
@@ -116,11 +116,11 @@ fn language_id_for(path: &str) -> &'static str {
         .and_then(|e| e.to_str())
         .unwrap_or("")
     {
-        "go"         => "go",
-        "rs"         => "rust",
+        "go" => "go",
+        "rs" => "rust",
         "ts" | "tsx" => "typescript",
         "js" | "jsx" => "javascript",
-        "py"         => "python",
-        _            => "plaintext",
+        "py" => "python",
+        _ => "plaintext",
     }
 }

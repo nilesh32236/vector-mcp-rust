@@ -53,7 +53,9 @@ fn setup_logging(log_path: &std::path::Path) {
 
     let file_appender = tracing_appender::rolling::never(
         log_path.parent().unwrap_or(std::path::Path::new(".")),
-        log_path.file_name().unwrap_or(std::ffi::OsStr::new("mcp.log")),
+        log_path
+            .file_name()
+            .unwrap_or(std::ffi::OsStr::new("mcp.log")),
     );
     let (non_blocking_file, _guard_file) = tracing_appender::non_blocking(file_appender);
     std::mem::forget(_guard_file);
@@ -66,8 +68,7 @@ fn setup_logging(log_path: &std::path::Path) {
         .with_writer(non_blocking_file);
 
     // Also log to stderr so journalctl -u vector-mcp-rust -f works
-    let stderr_layer = tracing_subscriber::fmt::layer()
-        .with_writer(std::io::stderr);
+    let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
 
     tracing_subscriber::registry()
         .with(env_filter)
@@ -144,12 +145,8 @@ async fn main() -> Result<()> {
     );
 
     // 2. Resolve daemon socket path.
-    let socket_path = std::env::var("DAEMON_SOCKET").unwrap_or_else(|_| {
-        cfg.data_dir
-            .join("daemon.sock")
-            .display()
-            .to_string()
-    });
+    let socket_path = std::env::var("DAEMON_SOCKET")
+        .unwrap_or_else(|_| cfg.data_dir.join("daemon.sock").display().to_string());
 
     // 3. Detect master / slave mode.
     let is_slave = daemon::slave::master_is_running(&socket_path).await;
@@ -251,7 +248,10 @@ async fn run_master(cfg: Config, socket_path: String) -> Result<()> {
         reload_tx,
     ));
 
-    start_servers(server, store, embedder, summarizer, config, progress, index_tx).await
+    start_servers(
+        server, store, embedder, summarizer, config, progress, index_tx,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -288,7 +288,10 @@ async fn run_slave(cfg: Config, socket_path: String) -> Result<()> {
     ));
 
     // Slaves do NOT run the file watcher (master owns indexing).
-    start_servers(server, store, embedder, summarizer, config, progress, index_tx).await
+    start_servers(
+        server, store, embedder, summarizer, config, progress, index_tx,
+    )
+    .await
 }
 
 // ---------------------------------------------------------------------------

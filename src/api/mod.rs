@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{State, Query},
+    extract::{Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -49,7 +49,9 @@ struct SearchRequest {
     #[serde(default)]
     docs_only: bool,
 }
-fn default_top_k() -> usize { 5 }
+fn default_top_k() -> usize {
+    5
+}
 
 #[derive(Serialize)]
 struct SearchResponse {
@@ -73,17 +75,28 @@ struct ContextRequest {
 async fn handle_health(State(s): State<Arc<ApiState>>) -> impl IntoResponse {
     let db_ok = s.store.get_all_records().await.is_ok();
     let status = if db_ok { "ok" } else { "degraded" };
-    let code = if db_ok { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
-    (code, Json(serde_json::json!({
-        "status": status,
-        "version": s.version,
-        "checks": { "database": { "status": if db_ok { "ok" } else { "unhealthy" } } }
-    })))
+    let code = if db_ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        code,
+        Json(serde_json::json!({
+            "status": status,
+            "version": s.version,
+            "checks": { "database": { "status": if db_ok { "ok" } else { "unhealthy" } } }
+        })),
+    )
 }
 
 async fn handle_ready(State(s): State<Arc<ApiState>>) -> impl IntoResponse {
     let ready = s.store.get_all_records().await.is_ok();
-    let code = if ready { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    let code = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
     (code, Json(serde_json::json!({ "ready": ready })))
 }
 
@@ -135,7 +148,9 @@ async fn handle_tools_index(
     State(s): State<Arc<ApiState>>,
     Json(req): Json<IndexRequest>,
 ) -> impl IntoResponse {
-    let path = req.path.unwrap_or_else(|| s.config.project_root.read().unwrap().clone());
+    let path = req
+        .path
+        .unwrap_or_else(|| s.config.project_root.read().unwrap().clone());
     let _ = s.index_tx.send(path).await;
     Json(serde_json::json!({ "status": "triggered" }))
 }
@@ -144,16 +159,17 @@ async fn handle_tools_skeleton(
     State(s): State<Arc<ApiState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let path = params.get("path")
+    let path = params
+        .get("path")
         .cloned()
         .unwrap_or_else(|| s.config.project_root.read().unwrap().clone());
-    
+
     // Use the analyze_code logic or a simplified version
     let mut tree = String::new();
     if let Ok(walker) = crate::indexer::get_directory_tree(&std::path::PathBuf::from(path), 3) {
         tree = walker;
     }
-    
+
     Json(serde_json::json!(tree))
 }
 
@@ -165,14 +181,24 @@ async fn handle_search(
 
     let vector = match s.embedder.embed_query(&req.query) {
         Ok(v) => v,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() }))).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
     };
 
     let results = match s.store.hybrid_search(vector, &req.query, top_k, None).await {
         Ok(r) => r,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() }))).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
     };
 
     let resp: Vec<SearchResponse> = results
@@ -186,7 +212,12 @@ async fn handle_search(
         })
         .map(|r| {
             let path = r.metadata_str("path");
-            SearchResponse { id: r.id, text: r.content, similarity: 0.0, path }
+            SearchResponse {
+                id: r.id,
+                text: r.content,
+                similarity: 0.0,
+                path,
+            }
         })
         .collect();
 
@@ -199,8 +230,13 @@ async fn handle_context(
 ) -> impl IntoResponse {
     let vector = match s.embedder.embed_text(&req.text) {
         Ok(v) => v,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() }))).into_response(),
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
     };
 
     let id = format!("manual_{}", uuid::Uuid::new_v4());
@@ -219,8 +255,11 @@ async fn handle_context(
 
     match s.store.upsert_records(vec![record]).await {
         Ok(_) => Json(serde_json::json!({ "status": "ok" })).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() }))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
     }
 }
 
@@ -231,9 +270,9 @@ async fn handle_context(
 pub fn router(state: Arc<ApiState>) -> Router {
     Router::new()
         .route("/api/health", get(handle_health))
-        .route("/api/ready",  get(handle_ready))
-        .route("/api/live",   get(handle_live))
-        .route("/api/stats",  get(handle_stats))
+        .route("/api/ready", get(handle_ready))
+        .route("/api/live", get(handle_live))
+        .route("/api/stats", get(handle_stats))
         .route("/api/tools/repos", get(handle_tools_repos))
         .route("/api/tools/status", get(handle_tools_status))
         .route("/api/tools/index", post(handle_tools_index))

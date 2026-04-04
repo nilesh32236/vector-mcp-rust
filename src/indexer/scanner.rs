@@ -39,7 +39,10 @@ pub async fn scan_project(
     progress.insert("status".to_string(), serde_json::json!("scanning"));
     progress.insert("current_file".to_string(), serde_json::json!(""));
     progress.insert("indexed_files".to_string(), serde_json::json!(0));
-    progress.insert("errors".to_string(), serde_json::json!(Vec::<String>::new()));
+    progress.insert(
+        "errors".to_string(),
+        serde_json::json!(Vec::<String>::new()),
+    );
 
     // Collect all indexable paths first so we know the total.
     let all_paths: Vec<_> = WalkBuilder::new(&root)
@@ -55,7 +58,7 @@ pub async fn scan_project(
 
     let total = all_paths.len() as u64;
     progress.insert("total_files".to_string(), serde_json::json!(total));
-    
+
     let token = uuid::Uuid::new_v4().to_string();
     let mut count: u64 = 0;
 
@@ -74,9 +77,10 @@ pub async fn scan_project(
         {
             warn!("Failed to index {}: {:?}", path_str, e);
             if let Some(mut errs) = progress.get_mut("errors")
-                && let Some(arr) = errs.value_mut().as_array_mut() {
-                    arr.push(serde_json::json!(format!("{}: {}", path_str, e)));
-                }
+                && let Some(arr) = errs.value_mut().as_array_mut()
+            {
+                arr.push(serde_json::json!(format!("{}: {}", path_str, e)));
+            }
         } else {
             count += 1;
             progress.insert("indexed_files".to_string(), serde_json::json!(count));
@@ -84,17 +88,18 @@ pub async fn scan_project(
 
         // Emit progress notification every 10 files or on the last file.
         if let Some(tx) = &progress_tx
-            && (count.is_multiple_of(10) || count == total) {
-                let _ = tx
-                    .send(ScanProgress {
-                        progress_token: token.clone(),
-                        progress: count,
-                        total,
-                        current_file: path_str.clone(),
-                        status: "indexing",
-                    })
-                    .await;
-            }
+            && (count.is_multiple_of(10) || count == total)
+        {
+            let _ = tx
+                .send(ScanProgress {
+                    progress_token: token.clone(),
+                    progress: count,
+                    total,
+                    current_file: path_str.clone(),
+                    status: "indexing",
+                })
+                .await;
+        }
     }
 
     info!("Initial scan complete. Indexed {} files.", count);

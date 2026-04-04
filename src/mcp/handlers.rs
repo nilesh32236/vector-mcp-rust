@@ -16,13 +16,17 @@ use super::server::Server;
 /// Only the 5 Fat Tool names are matched here. All legacy sub-handlers are
 /// called internally by the Fat Tool dispatchers — they are never reachable
 /// directly from the MCP protocol, preventing accidental invocation.
-pub async fn dispatch(server: &Server, params: &CallToolParams, session_id: Option<&str>) -> Result<CallToolResult> {
+pub async fn dispatch(
+    server: &Server,
+    params: &CallToolParams,
+    session_id: Option<&str>,
+) -> Result<CallToolResult> {
     match params.name.as_str() {
-        "search_workspace"   => handle_search_workspace(server, params).await,
-        "workspace_manager"  => handle_workspace_manager(server, params, session_id).await,
-        "analyze_code"       => handle_analyze_code(server, params).await,
-        "modify_workspace"   => handle_modify_workspace(server, params).await,
-        "lsp_query"          => handle_lsp_query(server, params).await,
+        "search_workspace" => handle_search_workspace(server, params).await,
+        "workspace_manager" => handle_workspace_manager(server, params, session_id).await,
+        "analyze_code" => handle_analyze_code(server, params).await,
+        "modify_workspace" => handle_modify_workspace(server, params).await,
+        "lsp_query" => handle_lsp_query(server, params).await,
         _ => Ok(CallToolResult::error(format!(
             "Unknown tool '{}'. Available: search_workspace, workspace_manager, analyze_code, modify_workspace, lsp_query",
             params.name
@@ -58,8 +62,19 @@ fn optional_f64_arg(params: &CallToolParams, key: &str) -> Option<f64> {
 fn optional_string_array_arg(params: &CallToolParams, key: &str) -> Option<Vec<String>> {
     params.arguments.get(key).and_then(|v| {
         if let Some(arr) = v.as_array() {
-            Some(arr.iter().filter_map(|i| i.as_str().map(|s| s.to_string())).collect())
-        } else { v.as_str().map(|s| s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect()) }
+            Some(
+                arr.iter()
+                    .filter_map(|i| i.as_str().map(|s| s.to_string()))
+                    .collect(),
+            )
+        } else {
+            v.as_str().map(|s| {
+                s.split(',')
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty())
+                    .collect()
+            })
+        }
     })
 }
 
@@ -86,7 +101,8 @@ async fn handle_trigger_project_index(
     // Build a progress channel if we have an SSE session to push to.
     let progress_tx = session_id.and_then(|sid| {
         server.progress_senders.get(sid).map(|tx| {
-            let (scan_tx, mut scan_rx) = tokio::sync::mpsc::channel::<crate::indexer::scanner::ScanProgress>(32);
+            let (scan_tx, mut scan_rx) =
+                tokio::sync::mpsc::channel::<crate::indexer::scanner::ScanProgress>(32);
             let sse_tx = tx.clone();
             let sid = sid.to_string();
             tokio::spawn(async move {
@@ -300,7 +316,10 @@ async fn handle_find_duplicate_code(
     for r in records {
         if r.metadata_str("path") == target_path {
             let vector = r.vector.clone();
-            let matches = server.store.hybrid_search(vector, &r.content, 3, None).await?;
+            let matches = server
+                .store
+                .hybrid_search(vector, &r.content, 3, None)
+                .await?;
             for m in matches {
                 if m.metadata_str("path") != target_path {
                     out.push_str(&format!(
@@ -361,44 +380,45 @@ async fn handle_index_status(server: &Server) -> Result<CallToolResult> {
 
     for result in walker {
         if let Ok(entry) = result
-            && entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-                let path_buf = entry.path();
-                let path_str = path_buf.to_string_lossy().to_string();
+            && entry.file_type().map(|ft| ft.is_file()).unwrap_or(false)
+        {
+            let path_buf = entry.path();
+            let path_str = path_buf.to_string_lossy().to_string();
 
-                // Only consider files we actually try to index
-                let ext = path_buf.extension().and_then(|e| e.to_str()).unwrap_or("");
-                let is_source = matches!(
-                    ext,
-                    "go" | "rs" | "js" | "ts" | "tsx" | "php" | "py" | "md" | "pdf"
-                );
+            // Only consider files we actually try to index
+            let ext = path_buf.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let is_source = matches!(
+                ext,
+                "go" | "rs" | "js" | "ts" | "tsx" | "php" | "py" | "md" | "pdf"
+            );
 
-                if !is_source {
-                    continue;
-                }
+            if !is_source {
+                continue;
+            }
 
-                disk_files.insert(path_str.clone());
+            disk_files.insert(path_str.clone());
 
-                let file_mtime = if let Ok(meta) = std::fs::metadata(path_buf) {
-                    if let Ok(mtime) = meta.modified() {
-                        mtime
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs()
-                    } else {
-                        0
-                    }
+            let file_mtime = if let Ok(meta) = std::fs::metadata(path_buf) {
+                if let Ok(mtime) = meta.modified() {
+                    mtime
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
                 } else {
                     0
-                };
-
-                if let Some(indexed_time) = indexed_files.get(&path_str) {
-                    if file_mtime > *indexed_time {
-                        modified += 1;
-                    }
-                } else {
-                    missing += 1;
                 }
+            } else {
+                0
+            };
+
+            if let Some(indexed_time) = indexed_files.get(&path_str) {
+                if file_mtime > *indexed_time {
+                    modified += 1;
+                }
+            } else {
+                missing += 1;
             }
+        }
     }
 
     let mut deleted = 0;
@@ -866,14 +886,15 @@ async fn handle_get_indexing_diagnostics(server: &Server) -> Result<CallToolResu
     let mut errors_str = String::from("None");
     if let Some(errs) = server.indexing_progress.get("errors")
         && let Some(arr) = errs.as_array()
-            && !arr.is_empty() {
-                let msgs: Vec<String> = arr
-                    .iter()
-                    .filter_map(|e| e.as_str().map(String::from))
-                    .collect();
-                errors_str = msgs.join("\n- ");
-                errors_str.insert_str(0, "\n- ");
-            }
+        && !arr.is_empty()
+    {
+        let msgs: Vec<String> = arr
+            .iter()
+            .filter_map(|e| e.as_str().map(String::from))
+            .collect();
+        errors_str = msgs.join("\n- ");
+        errors_str.insert_str(0, "\n- ");
+    }
 
     let out = format!(
         "## Indexing Diagnostics\n\n- **Status**: {}\n- **Current File**: {}\n- **Files Indexed**: {}\n- **Recent Errors**: {}",
@@ -997,7 +1018,11 @@ async fn handle_get_code_history(
     ))
 }
 
-async fn handle_reindex_all(server: &Server, _params: &CallToolParams, session_id: Option<&str>) -> Result<CallToolResult> {
+async fn handle_reindex_all(
+    server: &Server,
+    _params: &CallToolParams,
+    session_id: Option<&str>,
+) -> Result<CallToolResult> {
     let config = Arc::clone(&server.config);
     let store = Arc::clone(&server.store);
     let embedder = Arc::clone(&server.embedder);
@@ -1006,7 +1031,8 @@ async fn handle_reindex_all(server: &Server, _params: &CallToolParams, session_i
 
     let progress_tx = session_id.and_then(|sid| {
         server.progress_senders.get(sid).map(|tx| {
-            let (scan_tx, mut scan_rx) = tokio::sync::mpsc::channel::<crate::indexer::scanner::ScanProgress>(32);
+            let (scan_tx, mut scan_rx) =
+                tokio::sync::mpsc::channel::<crate::indexer::scanner::ScanProgress>(32);
             let sse_tx = tx.clone();
             let sid = sid.to_string();
             tokio::spawn(async move {
@@ -1033,7 +1059,12 @@ async fn handle_reindex_all(server: &Server, _params: &CallToolParams, session_i
 
     tokio::spawn(async move {
         let _ = crate::indexer::scanner::scan_project(
-            config, store, embedder, summarizer, progress, progress_tx,
+            config,
+            store,
+            embedder,
+            summarizer,
+            progress,
+            progress_tx,
         )
         .await;
     });
@@ -1046,60 +1077,94 @@ async fn handle_check_llm_connectivity(server: &Server) -> Result<CallToolResult
     let client = crate::llm::gemini::GeminiClient::new(&server.config);
     match client.list_models().await {
         Ok(models) => {
-            let mut out = String::from("### ✅ LLM Connectivity Status\n\n**Status**: Connected Successfully\n");
-            out.push_str(&format!("**Configured Default**: `{}`\n\n", server.config.default_gemini_model));
+            let mut out = String::from(
+                "### ✅ LLM Connectivity Status\n\n**Status**: Connected Successfully\n",
+            );
+            out.push_str(&format!(
+                "**Configured Default**: `{}`\n\n",
+                server.config.default_gemini_model
+            ));
             out.push_str("**Available Models**:\n");
             for m in models {
-                out.push_str(&format!("- `{}` ({}): {}\n", m.name, m.display_name, m.description));
+                out.push_str(&format!(
+                    "- `{}` ({}): {}\n",
+                    m.name, m.display_name, m.description
+                ));
             }
             Ok(CallToolResult::text(out))
         }
-        Err(e) => {
-            Ok(CallToolResult::text(format!(
-                "### ❌ LLM Connectivity Status\n\n**Status**: API Error\n**Error**: {e}\n\n**Troubleshooting**:\n1. Verify your GEMINI_API_KEY is correct.\n2. Ensure your key has permissions for the Generative Language API."
-            )))
-        }
+        Err(e) => Ok(CallToolResult::text(format!(
+            "### ❌ LLM Connectivity Status\n\n**Status**: API Error\n**Error**: {e}\n\n**Troubleshooting**:\n1. Verify your GEMINI_API_KEY is correct.\n2. Ensure your key has permissions for the Generative Language API."
+        ))),
     }
 }
 
-async fn handle_distill_knowledge(server: &Server, params: &CallToolParams) -> Result<CallToolResult> {
+async fn handle_distill_knowledge(
+    server: &Server,
+    params: &CallToolParams,
+) -> Result<CallToolResult> {
     let path_prefix = require_string_arg(params, "path")?;
     let records = server.store.get_records_by_path(&path_prefix).await?;
 
     if records.is_empty() {
-        return Ok(CallToolResult::error(format!("No indexed content found for path: {path_prefix}")));
+        return Ok(CallToolResult::error(format!(
+            "No indexed content found for path: {path_prefix}"
+        )));
     }
 
     let mut relevant_content = String::new();
     let mut count = 0;
     for r in records {
         if r.metadata_str("path").starts_with(&path_prefix) {
-            relevant_content.push_str(&format!("File: {}\nContent:\n{}\n---\n", r.metadata_str("path"), r.content));
+            relevant_content.push_str(&format!(
+                "File: {}\nContent:\n{}\n---\n",
+                r.metadata_str("path"),
+                r.content
+            ));
             count += 1;
         }
     }
 
     if count == 0 {
-        return Ok(CallToolResult::error(format!("No indexed content found starting with: {path_prefix}")));
+        return Ok(CallToolResult::error(format!(
+            "No indexed content found starting with: {path_prefix}"
+        )));
     }
 
     let system_prompt = "You are a Senior Software Architect. Your task is to analyze the provided source code and \"distill\" it into a set of architectural patterns, coding standards, and business rules.\nFormat the output as a high-quality Markdown Knowledge Item (KI) including:\n1. Overview: What is this component/module for?\n2. Key Architectural Decisions: Why was it built this way?\n3. Implementation Rules: Mandatory patterns for anyone modifying this code.\n4. Security/Compliance: PHI handling, encryption rules, etc. (if applicable).\nKeep it concise and actionable.";
-    let user_prompt = format!("Analyze these files from path '{}':\n\n{}", path_prefix, relevant_content);
+    let user_prompt = format!(
+        "Analyze these files from path '{}':\n\n{}",
+        path_prefix, relevant_content
+    );
 
     let client = crate::llm::gemini::GeminiClient::new(&server.config);
-    let distilled = client.generate_completion(&server.config.default_gemini_model, system_prompt, &user_prompt).await?;
+    let distilled = client
+        .generate_completion(
+            &server.config.default_gemini_model,
+            system_prompt,
+            &user_prompt,
+        )
+        .await?;
 
     // Store distilled knowledge
     let project_id = server.config.project_root.read().unwrap().clone();
-    server.store.store_project_context(&project_id, &distilled).await?;
+    server
+        .store
+        .store_project_context(&project_id, &distilled)
+        .await?;
 
-    Ok(CallToolResult::text(format!("### ✅ Knowledge Distilled & Indexed\n\n{distilled}")))
+    Ok(CallToolResult::text(format!(
+        "### ✅ Knowledge Distilled & Indexed\n\n{distilled}"
+    )))
 }
 
-async fn handle_verify_proposed_change(server: &Server, params: &CallToolParams) -> Result<CallToolResult> {
+async fn handle_verify_proposed_change(
+    server: &Server,
+    params: &CallToolParams,
+) -> Result<CallToolResult> {
     let proposed_change = require_string_arg(params, "proposed_change")?;
     let project_id = server.config.project_root.read().unwrap().clone();
-    
+
     // Retrieve distilled knowledge (KIs)
     let contexts = server.store.get_project_context(&project_id).await?;
     let ki_context = if contexts.is_empty() {
@@ -1109,12 +1174,24 @@ async fn handle_verify_proposed_change(server: &Server, params: &CallToolParams)
     };
 
     let system_prompt = "You are a Senior Software Engineer performing a code review. Your task is to verify if a proposed change complies with the existing architectural decisions and knowledge items provided below.\n\nReply with a structured verification report identifying potential violations or confirming compliance.";
-    let user_prompt = format!("### Existing Knowledge Items:\n{}\n\n### Proposed Change:\n{}", ki_context, proposed_change);
+    let user_prompt = format!(
+        "### Existing Knowledge Items:\n{}\n\n### Proposed Change:\n{}",
+        ki_context, proposed_change
+    );
 
     let client = crate::llm::gemini::GeminiClient::new(&server.config);
-    let review = client.generate_completion(&server.config.default_gemini_model, system_prompt, &user_prompt).await?;
+    let review = client
+        .generate_completion(
+            &server.config.default_gemini_model,
+            system_prompt,
+            &user_prompt,
+        )
+        .await?;
 
-    Ok(CallToolResult::text(format!("### 🔎 Proposed Change Verification\n\n{review}\n\n---\n*Verified against indexed Knowledge Items using {}.*", server.config.default_gemini_model)))
+    Ok(CallToolResult::text(format!(
+        "### 🔎 Proposed Change Verification\n\n{review}\n\n---\n*Verified against indexed Knowledge Items using {}.*",
+        server.config.default_gemini_model
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -1122,7 +1199,10 @@ async fn handle_verify_proposed_change(server: &Server, params: &CallToolParams)
 // ---------------------------------------------------------------------------
 
 /// `search_workspace` — unified vector / regex / graph / index_status dispatcher.
-async fn handle_search_workspace(server: &Server, params: &CallToolParams) -> Result<CallToolResult> {
+async fn handle_search_workspace(
+    server: &Server,
+    params: &CallToolParams,
+) -> Result<CallToolResult> {
     let action = optional_string_arg(params, "action").unwrap_or_default();
     let query = optional_string_arg(params, "query").unwrap_or_default();
     let limit = optional_f64_arg(params, "limit").unwrap_or(10.0) as usize;
@@ -1136,7 +1216,10 @@ async fn handle_search_workspace(server: &Server, params: &CallToolParams) -> Re
                 return Ok(CallToolResult::error("query is required for vector search"));
             }
             let vector = server.embedder.embed_query(&query)?;
-            let mut results = server.store.hybrid_search(vector, &query, limit * 3, cross_reference.as_deref()).await?;
+            let mut results = server
+                .store
+                .hybrid_search(vector, &query, limit * 3, cross_reference.as_deref())
+                .await?;
 
             // Path filter
             if let Some(ref pf) = path_filter {
@@ -1153,7 +1236,10 @@ async fn handle_search_workspace(server: &Server, params: &CallToolParams) -> Re
                 let path = meta["path"].as_str().unwrap_or("?");
                 let start = meta["start_line"].as_u64().unwrap_or(0);
                 let end = meta["end_line"].as_u64().unwrap_or(0);
-                out.push_str(&format!("#### {path} (Lines {start}-{end})\n```\n{}\n```\n\n", r.content));
+                out.push_str(&format!(
+                    "#### {path} (Lines {start}-{end})\n```\n{}\n```\n\n",
+                    r.content
+                ));
             }
             Ok(CallToolResult::text(out))
         }
@@ -1185,7 +1271,9 @@ async fn handle_search_workspace(server: &Server, params: &CallToolParams) -> Re
             }
             let nodes = server.store.graph.search_by_name(&query);
             if nodes.is_empty() {
-                return Ok(CallToolResult::text(format!("No graph entries found for '{query}'.")));
+                return Ok(CallToolResult::text(format!(
+                    "No graph entries found for '{query}'."
+                )));
             }
             let mut out = format!("Graph results for '{query}':\n");
             for n in nodes.iter().take(limit) {
@@ -1281,7 +1369,10 @@ async fn handle_analyze_code(server: &Server, params: &CallToolParams) -> Result
 // ---------------------------------------------------------------------------
 
 /// `modify_workspace` — apply_patch / create_file / run_linter / verify_patch.
-async fn handle_modify_workspace(server: &Server, params: &CallToolParams) -> Result<CallToolResult> {
+async fn handle_modify_workspace(
+    server: &Server,
+    params: &CallToolParams,
+) -> Result<CallToolResult> {
     let action = optional_string_arg(params, "action").unwrap_or_default();
 
     match action.as_str() {
@@ -1314,7 +1405,8 @@ async fn handle_apply_patch(server: &Server, params: &CallToolParams) -> Result<
 
     // --- LSP safety verification (if a server is available for this language) ---
     if let Some(lsp) = server.lsp_pool.get_for_path(&abs_str) {
-        match crate::mutation::SafetyChecker::verify_patch(&lsp, &abs_str, &search, &replace).await {
+        match crate::mutation::SafetyChecker::verify_patch(&lsp, &abs_str, &search, &replace).await
+        {
             Ok(diags) if crate::mutation::SafetyChecker::has_errors(&diags) => {
                 let report = crate::mutation::SafetyChecker::format_diagnostics(&diags);
                 return Ok(CallToolResult::error(format!(
@@ -1355,16 +1447,16 @@ fn handle_create_file(server: &Server, params: &CallToolParams) -> Result<CallTo
     let path = require_string_arg(params, "path")?;
     let content = optional_string_arg(params, "content").unwrap_or_default();
 
-    let abs = server.path_guard.validate(&path)
+    let abs = server
+        .path_guard
+        .validate(&path)
         .map_err(|e| anyhow::anyhow!("path guard: {e}"))?;
 
     if let Some(parent) = abs.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| anyhow::anyhow!("mkdir failed: {e}"))?;
+        std::fs::create_dir_all(parent).map_err(|e| anyhow::anyhow!("mkdir failed: {e}"))?;
     }
 
-    std::fs::write(&abs, content)
-        .map_err(|e| anyhow::anyhow!("write failed: {e}"))?;
+    std::fs::write(&abs, content).map_err(|e| anyhow::anyhow!("write failed: {e}"))?;
 
     Ok(CallToolResult::text(format!("Created {path}")))
 }
@@ -1373,7 +1465,9 @@ async fn handle_run_linter(server: &Server, params: &CallToolParams) -> Result<C
     let path = require_string_arg(params, "path")?;
     let tool = optional_string_arg(params, "tool").unwrap_or_else(|| "fmt".into());
 
-    let abs = server.path_guard.validate(&path)
+    let abs = server
+        .path_guard
+        .validate(&path)
         .map_err(|e| anyhow::anyhow!("path guard: {e}"))?;
 
     let (cmd, args): (&str, Vec<&str>) = match tool.as_str() {
@@ -1401,16 +1495,21 @@ fn handle_verify_patch(server: &Server, params: &CallToolParams) -> Result<CallT
     let path = require_string_arg(params, "path")?;
     let search = require_string_arg(params, "search")?;
 
-    let abs = server.path_guard.validate(&path)
+    let abs = server
+        .path_guard
+        .validate(&path)
         .map_err(|e| anyhow::anyhow!("path guard: {e}"))?;
 
-    let content = std::fs::read_to_string(&abs)
-        .map_err(|e| anyhow::anyhow!("read failed: {e}"))?;
+    let content = std::fs::read_to_string(&abs).map_err(|e| anyhow::anyhow!("read failed: {e}"))?;
 
     if content.contains(&search) {
-        Ok(CallToolResult::text(format!("✅ Search string found in {path} — patch is applicable")))
+        Ok(CallToolResult::text(format!(
+            "✅ Search string found in {path} — patch is applicable"
+        )))
     } else {
-        Ok(CallToolResult::text(format!("❌ Search string NOT found in {path} — patch would fail")))
+        Ok(CallToolResult::text(format!(
+            "❌ Search string NOT found in {path} — patch would fail"
+        )))
     }
 }
 
@@ -1436,17 +1535,23 @@ pub async fn handle_lsp_query(server: &Server, params: &CallToolParams) -> Resul
 
     let lsp = match server.lsp_pool.get(&ext) {
         Some(l) => l,
-        None => return Ok(CallToolResult::error(format!("No LSP server for extension '{ext}'"))),
+        None => {
+            return Ok(CallToolResult::error(format!(
+                "No LSP server for extension '{ext}'"
+            )));
+        }
     };
 
     let lsp_method = match action.as_str() {
-        "definition"     => "textDocument/definition",
-        "references"     => "textDocument/references",
+        "definition" => "textDocument/definition",
+        "references" => "textDocument/references",
         "type_hierarchy" => "textDocument/prepareTypeHierarchy",
         "impact_analysis" => "textDocument/references",
-        _ => return Ok(CallToolResult::error(
-            "Invalid action. Use: definition, references, type_hierarchy, impact_analysis"
-        )),
+        _ => {
+            return Ok(CallToolResult::error(
+                "Invalid action. Use: definition, references, type_hierarchy, impact_analysis",
+            ));
+        }
     };
 
     let mut lsp_params = serde_json::json!({
@@ -1464,7 +1569,11 @@ pub async fn handle_lsp_query(server: &Server, params: &CallToolParams) -> Resul
     if action == "impact_analysis" {
         // Summarise blast radius from references list.
         let refs: usize = result.as_array().map(|a| a.len()).unwrap_or(0);
-        let risk = match refs { 0..=3 => "Low", 4..=10 => "Medium", _ => "High" };
+        let risk = match refs {
+            0..=3 => "Low",
+            4..=10 => "Medium",
+            _ => "High",
+        };
         return Ok(CallToolResult::text(format!(
             "### Impact Analysis\n- **Risk**: {risk}\n- **References**: {refs}\n\nRaw: {result}"
         )));
@@ -1477,11 +1586,16 @@ pub async fn handle_lsp_query(server: &Server, params: &CallToolParams) -> Resul
 // trace_data_flow — graph-based symbol usage tracing
 // ---------------------------------------------------------------------------
 
-pub async fn handle_trace_data_flow(server: &Server, params: &CallToolParams) -> Result<CallToolResult> {
+pub async fn handle_trace_data_flow(
+    server: &Server,
+    params: &CallToolParams,
+) -> Result<CallToolResult> {
     let field = require_string_arg(params, "field_name")?;
     let nodes = server.store.graph.find_usage(&field);
     if nodes.is_empty() {
-        return Ok(CallToolResult::text(format!("No entities found using symbol '{field}'.")));
+        return Ok(CallToolResult::text(format!(
+            "No entities found using symbol '{field}'."
+        )));
     }
     let mut out = format!("Entities using '{field}':\n");
     for n in nodes {
@@ -1497,17 +1611,26 @@ pub async fn handle_trace_data_flow(server: &Server, params: &CallToolParams) ->
 // distill_package_purpose — summarise a package via Gemini and re-index
 // ---------------------------------------------------------------------------
 
-pub async fn handle_distill_package_purpose(server: &Server, params: &CallToolParams) -> Result<CallToolResult> {
+pub async fn handle_distill_package_purpose(
+    server: &Server,
+    params: &CallToolParams,
+) -> Result<CallToolResult> {
     let pkg_path = require_string_arg(params, "path")?;
     let records = server.store.get_records_by_path(&pkg_path).await?;
 
     if records.is_empty() {
-        return Ok(CallToolResult::error(format!("No indexed content for path: {pkg_path}")));
+        return Ok(CallToolResult::error(format!(
+            "No indexed content for path: {pkg_path}"
+        )));
     }
 
     let mut content = String::new();
     for r in &records {
-        content.push_str(&format!("File: {}\n{}\n---\n", r.metadata_str("path"), r.content));
+        content.push_str(&format!(
+            "File: {}\n{}\n---\n",
+            r.metadata_str("path"),
+            r.content
+        ));
     }
 
     let system_prompt = "You are a Senior Software Architect. Analyse the provided source code and produce a concise Markdown summary covering: 1) Purpose, 2) Key architectural decisions, 3) Implementation rules. Be brief and actionable.";
@@ -1515,7 +1638,11 @@ pub async fn handle_distill_package_purpose(server: &Server, params: &CallToolPa
 
     let client = crate::llm::gemini::GeminiClient::new(&server.config);
     let summary = client
-        .generate_completion(&server.config.default_gemini_model, system_prompt, &user_prompt)
+        .generate_completion(
+            &server.config.default_gemini_model,
+            system_prompt,
+            &user_prompt,
+        )
         .await?;
 
     // Re-index the distilled summary with high-priority metadata.
