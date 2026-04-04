@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+#[allow(dead_code)]
 pub struct ModelConfig {
     pub name: &'static str,
     pub onnx_url: &'static str,
