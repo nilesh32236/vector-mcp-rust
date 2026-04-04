@@ -81,8 +81,10 @@ pub async fn start_watcher(
                         tokio::spawn(async move {
                             match indexer::index_file(&path_str, Arc::clone(&config), Arc::clone(&db), Arc::clone(&embedder), Arc::clone(&summarizer)).await {
                                 Ok(records) if !records.is_empty() => {
+                                    // Delete stale records BEFORE inserting new ones to prevent duplicates.
                                     if let Err(e) = db.delete_by_path(&path_str).await {
                                         error!("Failed to delete stale records for {}: {:?}", path_str, e);
+                                        return; // abort — don't insert on top of stale data
                                     }
                                     if let Err(e) = db.insert_batch(&records).await {
                                         error!("Failed to insert records for {}: {:?}", path_str, e);
@@ -252,22 +254,20 @@ async fn distill_package_internal(
         return Ok(());
     }
 
-    let mut content = String::new();
+    // Build a plain-text summary from indexed symbols — no external LLM needed.
+    let mut symbols: Vec<String> = Vec::new();
     for r in &records {
-        content.push_str(&format!(
-            "File: {}\n{}\n---\n",
-            r.metadata_str("path"),
-            r.content
-        ));
+        let meta = r.metadata_json();
+        if let Some(syms) = meta["symbols"].as_array() {
+            symbols.extend(syms.iter().filter_map(|v| v.as_str().map(String::from)));
+        }
     }
-
-    let system_prompt = "You are a Senior Software Architect. Analyse the provided source code and produce a concise Markdown summary covering: 1) Purpose, 2) Key architectural decisions, 3) Implementation rules. Be brief and actionable.";
-    let user_prompt = format!("Package path: {pkg_path}\n\n{content}");
-
-    let client = crate::llm::gemini::GeminiClient::new(&config);
-    let summary = client
-        .generate_completion(&config.default_gemini_model, system_prompt, &user_prompt)
-        .await?;
+    symbols.sort();
+    symbols.dedup();
+    let summary = format!(
+        "Package: {pkg_path}\nExported symbols: {}",
+        symbols.join(", ")
+    );
 
     let vector = embedder.embed_text(&summary)?;
     let metadata = serde_json::json!({
@@ -278,7 +278,7 @@ async fn distill_package_internal(
     });
     let record = crate::db::Record {
         id: format!("distill-{}", uuid::Uuid::new_v4()),
-        content: summary.clone(),
+        content: summary,
         vector,
         metadata: metadata.to_string(),
     };

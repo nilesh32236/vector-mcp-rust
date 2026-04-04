@@ -20,6 +20,8 @@ pub struct KnowledgeGraph {
     nodes: RwLock<HashMap<String, EntityNode>>,
     /// interface_name → vec of node IDs that implement it.
     impls: RwLock<HashMap<String, Vec<String>>>,
+    /// interface_name -> method_name -> signature/meta
+    interfaces: RwLock<HashMap<String, HashMap<String, String>>>,
 }
 
 impl KnowledgeGraph {
@@ -27,78 +29,101 @@ impl KnowledgeGraph {
         Self {
             nodes: RwLock::new(HashMap::new()),
             impls: RwLock::new(HashMap::new()),
+            interfaces: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Add or update a single record in the graph.
+    pub fn add_record(&self, r: &Record) {
+        let meta = r.metadata_json();
+        let name = meta["name"].as_str().unwrap_or("").to_string();
+        if name.is_empty() {
+            return;
+        }
+        let node_type = meta["type"].as_str().unwrap_or("").to_string();
+        let path = meta["path"].as_str().unwrap_or("").to_string();
+        let docstring = meta["docstring"].as_str().unwrap_or("").to_string();
+
+        let struct_meta: HashMap<String, String> = meta["structural_metadata"]
+            .as_str()
+            .and_then(|s| serde_json::from_str(s).ok())
+            .unwrap_or_default();
+
+        let node = EntityNode {
+            name: name.clone(),
+            node_type: node_type.clone(),
+            path,
+            docstring,
+            metadata: struct_meta.clone(),
+        };
+
+        {
+            let mut nodes = self.nodes.write().unwrap();
+            nodes.insert(r.id.clone(), node.clone());
+        }
+
+        if node_type == "interface_type" || node_type == "interface" {
+            let methods: HashMap<String, String> = struct_meta
+                .iter()
+                .filter(|(k, _)| k.starts_with("method:"))
+                .map(|(k, v)| (k.trim_start_matches("method:").to_string(), v.clone()))
+                .collect();
+
+            self.interfaces
+                .write()
+                .unwrap()
+                .insert(name.clone(), methods.clone());
+
+            // Re-check all structs against this new interface
+            let mut impls = self.impls.write().unwrap();
+            let nodes = self.nodes.read().unwrap();
+            let mut new_impls = Vec::new();
+            for (id, other_node) in nodes.iter() {
+                if (other_node.node_type == "struct_type"
+                    || other_node.node_type == "struct"
+                    || other_node.node_type == "class")
+                    && !methods.is_empty()
+                    && methods
+                        .keys()
+                        .all(|m| other_node.metadata.contains_key(&format!("method:{m}")))
+                {
+                    new_impls.push(id.clone());
+                }
+            }
+            impls.insert(name, new_impls);
+        } else if node_type == "struct_type" || node_type == "struct" || node_type == "class" {
+            // Check this new struct against all known interfaces
+            let interfaces = self.interfaces.read().unwrap();
+            let mut impls = self.impls.write().unwrap();
+            for (iface_name, iface_methods) in interfaces.iter() {
+                if iface_methods.is_empty() {
+                    continue;
+                }
+                let implements = iface_methods
+                    .keys()
+                    .all(|m| node.metadata.contains_key(&format!("method:{m}")));
+                let iface_impls = impls.entry(iface_name.clone()).or_default();
+                if implements {
+                    if !iface_impls.contains(&r.id) {
+                        iface_impls.push(r.id.clone());
+                    }
+                } else {
+                    iface_impls.retain(|id| id != &r.id);
+                }
+            }
         }
     }
 
     /// Rebuild the graph from a fresh set of DB records.
     pub fn populate(&self, records: &[Record]) {
-        let mut nodes: HashMap<String, EntityNode> = HashMap::new();
-        let mut interfaces: HashMap<String, HashMap<String, String>> = HashMap::new();
+        // Clear existing state
+        *self.nodes.write().unwrap() = HashMap::new();
+        *self.impls.write().unwrap() = HashMap::new();
+        *self.interfaces.write().unwrap() = HashMap::new();
 
-        // First pass — collect nodes.
         for r in records {
-            let meta = r.metadata_json();
-            let name = meta["name"].as_str().unwrap_or("").to_string();
-            if name.is_empty() {
-                continue;
-            }
-            let node_type = meta["type"].as_str().unwrap_or("").to_string();
-            let path = meta["path"].as_str().unwrap_or("").to_string();
-            let docstring = meta["docstring"].as_str().unwrap_or("").to_string();
-
-            // Parse structural_metadata JSON blob.
-            let struct_meta: HashMap<String, String> = meta["structural_metadata"]
-                .as_str()
-                .and_then(|s| serde_json::from_str(s).ok())
-                .unwrap_or_default();
-
-            if node_type == "interface_type" || node_type == "interface" {
-                let methods: HashMap<String, String> = struct_meta
-                    .iter()
-                    .filter(|(k, _)| k.starts_with("method:"))
-                    .map(|(k, v)| (k.trim_start_matches("method:").to_string(), v.clone()))
-                    .collect();
-                interfaces.insert(name.clone(), methods);
-            }
-
-            nodes.insert(
-                r.id.clone(),
-                EntityNode {
-                    name,
-                    node_type,
-                    path,
-                    docstring,
-                    metadata: struct_meta,
-                },
-            );
+            self.add_record(r);
         }
-
-        // Second pass — detect implementations.
-        let mut impls: HashMap<String, Vec<String>> = HashMap::new();
-        for (id, node) in &nodes {
-            if node.node_type == "struct_type"
-                || node.node_type == "struct"
-                || node.node_type == "class"
-            {
-                for (iface_name, iface_methods) in &interfaces {
-                    if iface_methods.is_empty() {
-                        continue;
-                    }
-                    let implements = iface_methods
-                        .keys()
-                        .all(|m| node.metadata.contains_key(&format!("method:{m}")));
-                    if implements {
-                        impls
-                            .entry(iface_name.clone())
-                            .or_default()
-                            .push(id.clone());
-                    }
-                }
-            }
-        }
-
-        *self.nodes.write().unwrap() = nodes;
-        *self.impls.write().unwrap() = impls;
     }
 
     pub fn get_implementations(&self, interface_name: &str) -> Vec<EntityNode> {

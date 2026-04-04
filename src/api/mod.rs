@@ -74,7 +74,7 @@ struct ContextRequest {
 // ---------------------------------------------------------------------------
 
 async fn handle_health(State(s): State<Arc<ApiState>>) -> impl IntoResponse {
-    let db_ok = s.store.get_all_records().await.is_ok();
+    let db_ok = s.store.code_vectors.count_rows(None).await.is_ok();
     let status = if db_ok { "ok" } else { "degraded" };
     let code = if db_ok {
         StatusCode::OK
@@ -92,7 +92,7 @@ async fn handle_health(State(s): State<Arc<ApiState>>) -> impl IntoResponse {
 }
 
 async fn handle_ready(State(s): State<Arc<ApiState>>) -> impl IntoResponse {
-    let ready = s.store.get_all_records().await.is_ok();
+    let ready = s.store.code_vectors.count_rows(None).await.is_ok();
     let code = if ready {
         StatusCode::OK
     } else {

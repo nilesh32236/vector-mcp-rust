@@ -2,113 +2,132 @@
 pub mod graph;
 use anyhow::{Context, Result};
 use arrow_array::RecordBatch;
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use futures::TryStreamExt;
-use lancedb::index::Index;
-use lancedb::index::scalar::InvertedIndexParams as FtsIndexBuilder;
+use lancedb::index::Index as LanceIndex;
 use lancedb::index::vector::IvfPqIndexBuilder;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::{Connection, Table as LanceTable, connect};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, RwLock};
-use tracing::warn;
+use tantivy::collector::TopDocs;
+use tantivy::query::QueryParser;
+use tantivy::schema::{
+    Field as TantivyField, STORED, STRING, Schema as TantivySchema, TEXT, Term,
+    Value as TantivyValue,
+};
+use tantivy::{Index as TantivyIndex, IndexReader, IndexWriter, ReloadPolicy, doc};
+use tracing::{info, warn};
 
 // ---------------------------------------------------------------------------
-// BM25 Lexical Index
+// Tantivy Lexical Index
 // ---------------------------------------------------------------------------
 
-/// Minimal in-memory BM25 index (k1=1.5, b=0.75) matching Go's lexical.Index.
-struct Bm25Index {
-    /// term → {doc_id → term_freq}
-    inverted: HashMap<String, HashMap<String, f32>>,
-    /// doc_id → doc_length (token count)
-    doc_lengths: HashMap<String, usize>,
-    avg_doc_len: f32,
-    k1: f32,
-    b: f32,
+pub struct LexicalIndex {
+    index: TantivyIndex,
+    reader: IndexReader,
+    writer: Arc<RwLock<IndexWriter>>,
+    fields: LexicalFields,
 }
 
-impl Bm25Index {
-    fn new() -> Self {
-        Self {
-            inverted: HashMap::new(),
-            doc_lengths: HashMap::new(),
-            avg_doc_len: 0.0,
-            k1: 1.5,
-            b: 0.75,
-        }
-    }
+struct LexicalFields {
+    id: TantivyField,
+    text: TantivyField,
+}
 
-    fn tokenize(text: &str) -> Vec<String> {
-        text.to_lowercase()
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|t| t.len() > 1)
-            .map(String::from)
-            .collect()
-    }
+impl LexicalIndex {
+    fn open_or_create(path: &Path) -> Result<Self> {
+        let mut schema_builder = TantivySchema::builder();
+        let id = schema_builder.add_text_field("id", STRING | STORED);
+        let text = schema_builder.add_text_field("text", TEXT | STORED);
+        let schema = schema_builder.build();
 
-    fn add(&mut self, doc_id: &str, text: &str) {
-        let tokens = Self::tokenize(text);
-        let len = tokens.len();
-        self.doc_lengths.insert(doc_id.to_string(), len);
-
-        let mut freq: HashMap<String, f32> = HashMap::new();
-        for t in tokens {
-            *freq.entry(t).or_default() += 1.0;
-        }
-        for (term, tf) in freq {
-            self.inverted
-                .entry(term)
-                .or_default()
-                .insert(doc_id.to_string(), tf);
-        }
-        self.recompute_avg();
-    }
-
-    fn remove(&mut self, doc_id: &str) {
-        self.doc_lengths.remove(doc_id);
-        for postings in self.inverted.values_mut() {
-            postings.remove(doc_id);
-        }
-        self.recompute_avg();
-    }
-
-    fn recompute_avg(&mut self) {
-        if self.doc_lengths.is_empty() {
-            self.avg_doc_len = 0.0;
+        let index = if path.exists() && path.is_dir() && std::fs::read_dir(path)?.next().is_some() {
+            TantivyIndex::open_in_dir(path).context("Opening Tantivy index")?
         } else {
-            let total: usize = self.doc_lengths.values().sum();
-            self.avg_doc_len = total as f32 / self.doc_lengths.len() as f32;
-        }
+            std::fs::create_dir_all(path).context("Creating index directory")?;
+            TantivyIndex::create_in_dir(path, schema).context("Creating Tantivy index")?
+        };
+
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .try_into()?;
+        let writer = Arc::new(RwLock::new(index.writer(50_000_000)?)); // 50MB heap
+
+        Ok(Self {
+            index,
+            reader,
+            writer,
+            fields: LexicalFields { id, text },
+        })
     }
 
-    fn search(&self, query: &str, top_k: usize) -> Vec<(String, f32)> {
-        let terms = Self::tokenize(query);
-        let n = self.doc_lengths.len() as f32;
-        if n == 0.0 || terms.is_empty() {
-            return vec![];
-        }
+    fn add(&self, doc_id: &str, text: &str) -> Result<()> {
+        let mut writer = self.writer.write().unwrap();
+        writer.delete_term(Term::from_field_text(self.fields.id, doc_id));
+        writer.add_document(doc!(
+            self.fields.id => doc_id,
+            self.fields.text => text,
+        ))?;
+        writer.commit()?;
+        Ok(())
+    }
 
-        let mut scores: HashMap<String, f32> = HashMap::new();
-        for term in &terms {
-            let Some(postings) = self.inverted.get(term) else {
-                continue;
-            };
-            let df = postings.len() as f32;
-            let idf = ((n - df + 0.5) / (df + 0.5) + 1.0).ln();
-            for (doc_id, &tf) in postings {
-                let dl = *self.doc_lengths.get(doc_id).unwrap_or(&0) as f32;
-                let norm = 1.0 - self.b + self.b * dl / self.avg_doc_len.max(1.0);
-                let score = idf * (tf * (self.k1 + 1.0)) / (tf + self.k1 * norm);
-                *scores.entry(doc_id.clone()).or_default() += score;
-            }
-        }
+    /// Add without committing — call `commit()` after a batch.
+    fn add_no_commit(&self, doc_id: &str, text: &str) -> Result<()> {
+        let writer = self.writer.write().unwrap();
+        writer.delete_term(Term::from_field_text(self.fields.id, doc_id));
+        writer.add_document(doc!(
+            self.fields.id => doc_id,
+            self.fields.text => text,
+        ))?;
+        Ok(())
+    }
 
-        let mut ranked: Vec<(String, f32)> = scores.into_iter().collect();
-        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        ranked.truncate(top_k);
-        ranked
+    fn commit(&self) -> Result<()> {
+        self.writer.write().unwrap().commit()?;
+        Ok(())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.reader.searcher().num_docs() == 0
+    }
+
+    fn remove(&self, doc_id: &str) -> Result<()> {
+        let mut writer = self.writer.write().unwrap();
+        writer.delete_term(Term::from_field_text(self.fields.id, doc_id));
+        writer.commit()?;
+        Ok(())
+    }
+
+    fn search(&self, query_str: &str, top_k: usize) -> Vec<(String, f32)> {
+        let searcher = self.reader.searcher();
+        let query_parser = QueryParser::for_index(&self.index, vec![self.fields.text]);
+
+        let query = match query_parser.parse_query(query_str) {
+            Ok(q) => q,
+            Err(_) => return vec![],
+        };
+
+        let top_docs = match searcher.search(&query, &TopDocs::with_limit(top_k)) {
+            Ok(docs) => docs,
+            Err(_) => return vec![],
+        };
+
+        top_docs
+            .into_iter()
+            .filter_map(|(score, doc_address)| {
+                let retrieved_doc = searcher.doc::<tantivy::TantivyDocument>(doc_address).ok()?;
+                let id = retrieved_doc
+                    .get_first(self.fields.id)?
+                    .as_str()?
+                    .to_string();
+                Some((id, score))
+            })
+            .collect()
     }
 }
 
@@ -146,27 +165,31 @@ impl Record {
 pub struct Store {
     pub code_vectors: LanceTable,
     pub project_context: LanceTable,
-    bm25: RwLock<Bm25Index>,
+    lexical: Arc<LexicalIndex>,
     pub graph: graph::KnowledgeGraph,
 }
 
 impl Store {
-    async fn open_tables(connection: Connection, dimension: usize) -> Result<Self> {
+    async fn open_tables(
+        connection: Connection,
+        dimension: usize,
+        index_path: &Path,
+    ) -> Result<Self> {
         let code_vectors = open_or_create_table(
             &connection,
             "code_vectors",
-            RecordBatch::new_empty(Arc::new(Schema::new(vec![
-                Field::new("id", DataType::Utf8, false),
-                Field::new("content", DataType::Utf8, false),
-                Field::new(
+            RecordBatch::new_empty(Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Utf8, false),
+                ArrowField::new("content", DataType::Utf8, false),
+                ArrowField::new(
                     "vector",
                     DataType::FixedSizeList(
-                        Arc::new(Field::new("item", DataType::Float32, true)),
+                        Arc::new(ArrowField::new("item", DataType::Float32, true)),
                         dimension as i32,
                     ),
                     false,
                 ),
-                Field::new("metadata", DataType::Utf8, true),
+                ArrowField::new("metadata", DataType::Utf8, true),
             ]))),
             dimension,
         )
@@ -175,31 +198,40 @@ impl Store {
         let project_context = open_or_create_table(
             &connection,
             "project_context",
-            RecordBatch::new_empty(Arc::new(Schema::new(vec![
-                Field::new("id", DataType::Utf8, false),
-                Field::new("project_id", DataType::Utf8, false),
-                Field::new("text", DataType::Utf8, false),
+            RecordBatch::new_empty(Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("id", DataType::Utf8, false),
+                ArrowField::new("project_id", DataType::Utf8, false),
+                ArrowField::new("text", DataType::Utf8, false),
             ]))),
             0, // no vector index needed
         )
         .await?;
 
+        let lexical = Arc::new(LexicalIndex::open_or_create(index_path)?);
+
         let store = Self {
             code_vectors,
             project_context,
-            bm25: RwLock::new(Bm25Index::new()),
+            lexical,
             graph: graph::KnowledgeGraph::new(),
         };
 
-        // Bootstrap BM25 and knowledge graph from existing records.
-        if let Ok(records) = store.get_all_records().await {
-            {
-                let mut idx = store.bm25.write().unwrap();
-                for r in &records {
-                    idx.add(&r.id, &bm25_document_text(r));
+        if store.code_vectors.count_rows(None).await? > 0 {
+            info!("Existing records found. Synchronizing in-memory graph and lexical index...");
+            if let Ok(records) = store.get_all_records().await {
+                store.graph.populate(&records);
+                // Rebuild Tantivy if it has no segments (e.g. fresh install or schema change).
+                if store.lexical.is_empty() {
+                    info!(
+                        "Tantivy index is empty — rebuilding from {} existing records.",
+                        records.len()
+                    );
+                    for r in &records {
+                        let _ = store.lexical.add_no_commit(&r.id, &bm25_document_text(r));
+                    }
+                    let _ = store.lexical.commit();
                 }
-            } // guard dropped before next await
-            store.graph.populate(&records);
+            }
         }
 
         Ok(store)
@@ -209,71 +241,77 @@ impl Store {
     // Write
     // -----------------------------------------------------------------------
 
-    /// Upsert a batch of records: delete existing by path then insert.
+    pub async fn get_record_by_id(&self, id: &str) -> Result<Option<Record>> {
+        let predicate = format!("id = '{}'", sql_escape(id));
+        let results = self
+            .code_vectors
+            .query()
+            .only_if(predicate)
+            .execute()
+            .await?;
+        let batches = results.try_collect::<Vec<_>>().await?;
+        let mut records = batches_to_records(batches)?;
+        Ok(records.pop())
+    }
+
+    pub async fn update_record_metadata(&self, record_id: &str, new_metadata: &str) -> Result<()> {
+        let escaped_id = sql_escape(record_id);
+        let escaped_meta = sql_escape(new_metadata);
+        self.code_vectors
+            .update()
+            .only_if(format!("id = '{escaped_id}'"))
+            .column("metadata", format!("'{escaped_meta}'"))
+            .execute()
+            .await
+            .context("Updating record metadata")?;
+        Ok(())
+    }
+
     pub async fn upsert_records(&self, records: Vec<Record>) -> Result<()> {
         if records.is_empty() {
             return Ok(());
         }
         let batch = records_to_batch(&records)?;
 
-        // Update BM25 before the await so the guard is dropped.
-        {
-            let mut idx = self.bm25.write().unwrap();
-            for r in &records {
-                idx.add(&r.id, &bm25_document_text(r));
-            }
-        } // guard dropped here
+        for r in &records {
+            let _ = self.lexical.add(&r.id, &bm25_document_text(r));
+            self.graph.add_record(r);
+        }
 
         self.code_vectors.add(vec![batch]).execute().await?;
-
-        // Refresh graph after the await.
-        if let Ok(all) = self.get_all_records().await {
-            self.graph.populate(&all);
-        }
         Ok(())
     }
 
-    /// Bulk-insert a pre-built batch of records without touching the graph.
-    /// Callers are responsible for deleting stale records beforehand.
-    /// Use this for high-throughput scan ingestion.
     pub async fn insert_batch(&self, records: &[Record]) -> Result<()> {
         if records.is_empty() {
             return Ok(());
         }
         let batch = records_to_batch(records)?;
-        {
-            let mut idx = self.bm25.write().unwrap();
-            for r in records {
-                idx.add(&r.id, &bm25_document_text(r));
-            }
+        for r in records {
+            let _ = self.lexical.add_no_commit(&r.id, &bm25_document_text(r));
+            self.graph.add_record(r);
         }
+        let _ = self.lexical.commit();
         self.code_vectors.add(vec![batch]).execute().await?;
         Ok(())
     }
 
     pub async fn delete_by_path(&self, path: &str) -> Result<()> {
-        let predicate = format!(
-            "metadata LIKE '%\"path\":\"{}\"%'",
-            path.replace('\'', "''")
-        );
+        let predicate = format!("metadata LIKE '%\"path\":\"{}\"%'", sql_escape(path));
+
+        // Fetch IDs for Tantivy cleanup, then immediately delete from LanceDB.
+        // Keeping the window between read and delete as small as possible.
+        let to_delete = self.get_records_by_path(path).await?;
         self.code_vectors
             .delete(&predicate)
             .await
             .context("Deleting records by path")
             .map(|_| ())?;
 
-        // Remove from BM25 — we don't have IDs here so rebuild lazily on next search.
-        // For correctness, remove any doc whose path matches.
-        let mut idx = self.bm25.write().unwrap();
-        let to_remove: Vec<String> = idx
-            .doc_lengths
-            .keys()
-            .filter(|id| id.contains(path))
-            .cloned()
-            .collect();
-        for id in to_remove {
-            idx.remove(&id);
+        for r in to_delete {
+            let _ = self.lexical.remove(&r.id);
         }
+
         Ok(())
     }
 
@@ -281,7 +319,6 @@ impl Store {
     // Search
     // -----------------------------------------------------------------------
 
-    /// Vector-only ANN search.
     pub async fn vector_search(
         &self,
         vector: Vec<f32>,
@@ -295,12 +332,7 @@ impl Store {
         {
             let parts: Vec<String> = pids
                 .iter()
-                .map(|p| {
-                    format!(
-                        "metadata LIKE '%\"project_id\":\"{}\"%'",
-                        p.replace('\'', "''")
-                    )
-                })
+                .map(|p| format!("metadata LIKE '%\"project_id\":\"{}\"%'", sql_escape(p)))
                 .collect();
             let predicate = parts.join(" OR ");
             query = query.only_if(predicate);
@@ -311,49 +343,37 @@ impl Store {
         batches_to_records(batches)
     }
 
-    /// Lexical BM25 search backed by in-memory index.
     pub async fn lexical_search(
         &self,
         query: &str,
         limit: usize,
         project_ids: Option<&[String]>,
     ) -> Result<Vec<Record>> {
-        let hits = {
-            let idx = self.bm25.read().unwrap();
-            idx.search(query, limit * 3)
-        };
+        let hits = self.lexical.search(query, limit * 3);
         if hits.is_empty() {
             return Ok(vec![]);
         }
 
-        let all = self.get_all_records().await?;
-        let id_set: HashMap<&str, f32> = hits.iter().map(|(id, s)| (id.as_str(), *s)).collect();
-
-        let mut matched: Vec<(Record, f32)> = all
-            .into_iter()
-            .filter(|r| {
+        let mut matched: Vec<(Record, f32)> = Vec::new();
+        for (id, score) in hits {
+            if let Ok(Some(r)) = self.get_record_by_id(&id).await {
                 if let Some(pids) = project_ids {
-                    if pids.is_empty() {
-                        return true;
+                    if !pids.is_empty() {
+                        let pid = r.metadata_str("project_id");
+                        if !pids.contains(&pid) {
+                            continue;
+                        }
                     }
-                    let pid = r.metadata_str("project_id");
-                    pids.contains(&pid)
-                } else {
-                    true
                 }
-            })
-            .filter_map(|r| {
-                let id = r.id.clone();
-                id_set.get(id.as_str()).map(|&s| (r, s))
-            })
-            .collect();
+                matched.push((r, score));
+            }
+        }
 
         matched.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         matched.truncate(limit);
         Ok(matched.into_iter().map(|(r, _)| r).collect())
     }
 
-    /// Hybrid search: RRF fusion of vector ANN + BM25 lexical, matching Go's implementation.
     pub async fn hybrid_search(
         &self,
         vector: Vec<f32>,
@@ -363,7 +383,6 @@ impl Store {
     ) -> Result<Vec<Record>> {
         let fetch = limit * 3;
 
-        // Run both searches concurrently.
         let (vec_res, lex_res) = tokio::join!(
             self.vector_search(vector, fetch, project_ids),
             self.lexical_search(query, fetch, project_ids),
@@ -372,7 +391,6 @@ impl Store {
         let vec_results = vec_res.unwrap_or_default();
         let lex_results = lex_res.unwrap_or_default();
 
-        // Reciprocal Rank Fusion (k=60) — same as Go.
         let k = 60.0_f64;
         let mut scores: HashMap<String, f64> = HashMap::new();
         let mut record_map: HashMap<String, Record> = HashMap::new();
@@ -413,10 +431,7 @@ impl Store {
         if self.code_vectors.count_rows(None).await? == 0 {
             return Ok(vec![]);
         }
-        let predicate = format!(
-            "metadata LIKE '%\"path\":\"{}\"%'",
-            path.replace('\'', "''")
-        );
+        let predicate = format!("metadata LIKE '%\"path\":\"{}\"%'", sql_escape(path));
         let results = self
             .code_vectors
             .query()
@@ -428,15 +443,15 @@ impl Store {
     }
 
     // -----------------------------------------------------------------------
-    // Project context (knowledge items)
+    // Project context
     // -----------------------------------------------------------------------
 
     pub async fn store_project_context(&self, project_id: &str, text: &str) -> Result<()> {
         use arrow_array::StringArray;
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Utf8, false),
-            Field::new("project_id", DataType::Utf8, false),
-            Field::new("text", DataType::Utf8, false),
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Utf8, false),
+            ArrowField::new("project_id", DataType::Utf8, false),
+            ArrowField::new("text", DataType::Utf8, false),
         ]));
         let id = uuid::Uuid::new_v4().to_string();
         let batch = RecordBatch::try_new(
@@ -452,7 +467,7 @@ impl Store {
     }
 
     pub async fn get_project_context(&self, project_id: &str) -> Result<Vec<String>> {
-        let predicate = format!("project_id = '{}'", project_id.replace('\'', "''"));
+        let predicate = format!("project_id = '{}'", sql_escape(project_id));
         let stream = self
             .project_context
             .query()
@@ -486,18 +501,27 @@ pub async fn connect_store(uri: &str, dimension: usize) -> Result<Store> {
     } else {
         uri.to_string()
     };
+
+    let path_str = final_uri.trim_start_matches("file://");
+    let tantivy_path = Path::new(path_str).join("lexical_index");
+
     let connection = connect(&final_uri)
         .execute()
         .await
         .with_context(|| format!("connecting to LanceDB at {final_uri}"))?;
-    Store::open_tables(connection, dimension).await
+    Store::open_tables(connection, dimension, &tantivy_path).await
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Text fed into BM25 — mirrors Go's `lexicalDocumentText`.
+/// Escape a string for use inside a single-quoted SQL literal.
+/// Escapes both single quotes (SQL standard) and backslashes (some dialects).
+fn sql_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\'', "''")
+}
+
 fn bm25_document_text(r: &Record) -> String {
     let meta = r.metadata_json();
     let mut parts = vec![r.content.clone()];
@@ -537,21 +561,10 @@ async fn open_or_create_table(
         .context("Creating table")?;
 
     if dimension > 0 {
-        // Full-Text Search index on content for lexical hybrid search.
-        if let Err(e) = table
-            .create_index(&["content"], Index::FTS(FtsIndexBuilder::default()))
-            .execute()
-            .await
-        {
-            warn!("FTS index creation failed (non-fatal): {e}");
-        }
-
-        // IvfPq ANN vector index — matches Go's HNSW intent but uses the
-        // lancedb Rust crate's available builder.
         if let Err(e) = table
             .create_index(
                 &["vector"],
-                Index::IvfPq(
+                LanceIndex::IvfPq(
                     IvfPqIndexBuilder::default()
                         .num_partitions(256)
                         .num_sub_vectors(16),
@@ -571,21 +584,20 @@ fn records_to_batch(records: &[Record]) -> Result<RecordBatch> {
     use arrow_array::{FixedSizeListArray, Float32Array, StringArray};
     use lance_arrow::FixedSizeListArrayExt;
 
-    // Infer dimension from first record.
     let dimension = records.first().map(|r| r.vector.len()).unwrap_or(0);
 
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Utf8, false),
-        Field::new("content", DataType::Utf8, false),
-        Field::new(
+    let schema = Arc::new(ArrowSchema::new(vec![
+        ArrowField::new("id", DataType::Utf8, false),
+        ArrowField::new("content", DataType::Utf8, false),
+        ArrowField::new(
             "vector",
             DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, true)),
+                Arc::new(ArrowField::new("item", DataType::Float32, true)),
                 dimension as i32,
             ),
             false,
         ),
-        Field::new("metadata", DataType::Utf8, true),
+        ArrowField::new("metadata", DataType::Utf8, true),
     ]));
 
     let ids = StringArray::from(records.iter().map(|r| r.id.as_str()).collect::<Vec<_>>());
@@ -621,7 +633,7 @@ fn records_to_batch(records: &[Record]) -> Result<RecordBatch> {
     .context("Building RecordBatch")
 }
 
-fn batches_to_records(batches: Vec<RecordBatch>) -> Result<Vec<Record>> {
+pub fn batches_to_records(batches: Vec<RecordBatch>) -> Result<Vec<Record>> {
     let mut records = Vec::new();
     for batch in batches {
         let ids = batch

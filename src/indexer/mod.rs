@@ -122,42 +122,45 @@ pub async fn index_file(
     }
 
     // Run AI summarizations with bounded concurrency (semaphore) to avoid OOM / rate limits.
+    // Only run if local LLM is enabled; otherwise skip and let the background worker handle it.
     const MAX_CONCURRENT_LLM_REQUESTS: usize = 4;
     let enable_llm = config.feature_toggles.enable_local_llm;
-    let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_LLM_REQUESTS));
-    let summary_handles: Vec<_> = chunks
-        .iter()
-        .map(|chunk| {
-            let content = chunk.content.clone();
-            let score = chunk.function_score;
-            let summarizer = Arc::clone(&summarizer);
-            let config = Arc::clone(&config);
-            let path = path.to_string();
-            let sem = Arc::clone(&sem);
-            tokio::spawn(async move {
-                if enable_llm && score > 0.5 {
-                    let _permit = sem.acquire().await;
-                    match summarizer.summarize_chunk(&content, config).await {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::error!("Summary failed for {}: {}", path, e);
-                            "Summary failed".to_string()
+    let summaries: Vec<String> = if enable_llm {
+        let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_LLM_REQUESTS));
+        let summary_handles: Vec<_> = chunks
+            .iter()
+            .map(|chunk| {
+                let content = chunk.content.clone();
+                let score = chunk.function_score;
+                let summarizer = Arc::clone(&summarizer);
+                let config = Arc::clone(&config);
+                let path = path.to_string();
+                let sem = Arc::clone(&sem);
+                tokio::spawn(async move {
+                    if score > 0.5 {
+                        let _permit = sem.acquire().await;
+                        match summarizer.summarize_chunk(&content, config).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::error!("Summary failed for {}: {}", path, e);
+                                String::new()
+                            }
                         }
+                    } else {
+                        String::new()
                     }
-                } else {
-                    "No AI summary generated".to_string()
-                }
+                })
             })
-        })
-        .collect();
-    let mut summaries = Vec::with_capacity(summary_handles.len());
-    for handle in summary_handles {
-        summaries.push(
-            handle
-                .await
-                .unwrap_or_else(|_| "Summary failed".to_string()),
-        );
-    }
+            .collect();
+        let mut out = Vec::with_capacity(summary_handles.len());
+        for h in summary_handles {
+            out.push(h.await.unwrap_or_default());
+        }
+        out
+    } else {
+        // Summaries deferred to background worker — leave empty for now.
+        vec![String::new(); chunks.len()]
+    };
 
     let mut records = Vec::with_capacity(chunks.len());
     for (i, ((chunk, vector), ai_summary)) in chunks

@@ -46,6 +46,12 @@ pub async fn scan_project(
     progress: Arc<std::sync::RwLock<ProgressState>>,
     progress_tx: Option<tokio::sync::mpsc::Sender<ScanProgress>>,
 ) -> Result<()> {
+    // Spawn background summary worker — fills in summaries after the fast scan.
+    let summary_tx = spawn_summary_worker(
+        Arc::clone(&store),
+        Arc::clone(&summarizer),
+        Arc::clone(&config),
+    );
     let root = config.project_root.read().unwrap().clone();
     info!("Starting initial project scan: {}", root);
 
@@ -219,7 +225,19 @@ pub async fn scan_project(
 
     // Refresh knowledge graph once after all inserts.
     if let Ok(all) = store.get_all_records().await {
-        store.graph.populate(&all);
+        // Enqueue records that need summarization (function_score > 0.5, no summary yet).
+        for r in &all {
+            let meta = r.metadata_json();
+            let already_summarized = meta["summary"]
+                .as_str()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+            if already_summarized {
+                continue;
+            }
+            let score = meta["function_score"].as_f64().unwrap_or(0.0) as f32;
+            let _ = summary_tx.try_send((r.id.clone(), r.content.clone(), score));
+        }
     }
 
     if let Some(tx) = &progress_tx {
@@ -237,6 +255,70 @@ pub async fn scan_project(
     Ok(())
 }
 
+/// Spawns a low-priority background task that fills in summaries for records
+/// that were indexed without one.
+///
+/// Callers send `(record_id, content, function_score)` tuples. The worker
+/// batches up to 10 items or waits 5 seconds, then generates summaries via
+/// the local model and patches LanceDB with `update_record_metadata` —
+/// no graph rebuild, no BM25 churn.
+pub fn spawn_summary_worker(
+    store: Arc<Store>,
+    summarizer: Arc<crate::llm::summarizer::Summarizer>,
+    config: Arc<Config>,
+) -> tokio::sync::mpsc::Sender<(String, String, f32)> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, String, f32)>(1024);
+
+    tokio::spawn(async move {
+        loop {
+            // Collect up to 10 items or wait at most 5 seconds.
+            let mut batch: Vec<(String, String, f32)> = Vec::with_capacity(10);
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+
+            loop {
+                match tokio::time::timeout_at(deadline, rx.recv()).await {
+                    Ok(Some(item)) => {
+                        batch.push(item);
+                        if batch.len() >= 10 {
+                            break;
+                        }
+                    }
+                    Ok(None) => return, // channel closed
+                    Err(_) => break,    // 5-second timeout
+                }
+            }
+
+            if batch.is_empty() || !config.feature_toggles.enable_local_llm {
+                continue;
+            }
+
+            for (record_id, content, score) in batch {
+                if score <= 0.5 {
+                    continue;
+                }
+                let summary = match summarizer
+                    .summarize_chunk(&content, Arc::clone(&config))
+                    .await
+                {
+                    Ok(s) if !s.is_empty() => s,
+                    _ => continue,
+                };
+
+                // Fetch current metadata, patch summary field, write back.
+                if let Ok(Some(r)) = store.get_record_by_id(&record_id).await {
+                    let mut meta = r.metadata_json();
+                    meta["summary"] = serde_json::Value::String(summary);
+                    let _ = store
+                        .update_record_metadata(&record_id, &meta.to_string())
+                        .await;
+                }
+            }
+        }
+    });
+
+    tx
+}
+
 /// Determines if a file is suitable for semantic indexing.
 /// Uses cached metadata from the `ignore` crate's `DirEntry` to avoid extra syscalls.
 fn is_indexable(entry: &DirEntry) -> bool {
@@ -252,16 +334,17 @@ fn is_indexable(entry: &DirEntry) -> bool {
     }
 
     // Use cached metadata from WalkBuilder — avoids a redundant stat() syscall.
-    if let Ok(metadata) = entry.metadata()
-        && metadata.len() > 1_000_000
-        && ext != "pdf"
-    {
-        warn!(
-            "Skipping oversized file: {} ({} bytes)",
-            path.display(),
-            metadata.len()
-        );
-        return false;
+    if let Ok(metadata) = entry.metadata() {
+        let size = metadata.len();
+        let limit = if ext == "pdf" { 10_000_000 } else { 1_000_000 };
+        if size > limit {
+            warn!(
+                "Skipping oversized file: {} ({} bytes)",
+                path.display(),
+                size
+            );
+            return false;
+        }
     }
 
     true

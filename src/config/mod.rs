@@ -41,6 +41,7 @@ pub struct Config {
     pub api_port: String,
     pub gemini_api_key: String,
     pub default_gemini_model: String,
+    // Kept for backward compat; Gemini integration removed — values are ignored.
     pub model_path: String,
     pub feature_toggles: FeatureToggles,
 }

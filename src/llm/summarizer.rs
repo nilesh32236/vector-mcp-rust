@@ -128,8 +128,9 @@ impl Summarizer {
 
             let logits = model.forward(&input_ids, start_pos)?;
             let logits = logits.squeeze(0)?;
-
-            let next_token = logits.argmax(0)?.to_scalar::<u32>()?;
+            // Slice the last token's logits, then argmax over the vocab dimension.
+            let last_token_logits = logits.get(logits.dim(0)? - 1)?;
+            let next_token = last_token_logits.argmax(0)?.to_scalar::<u32>()?;
 
             if next_token == 151643 || next_token == 151645 {
                 break;

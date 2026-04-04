@@ -129,6 +129,11 @@ async fn handle_trigger_project_index(
     });
 
     let path_clone = path.clone();
+    // Update project_root so scan_project indexes the requested path.
+    {
+        let mut root = config.project_root.write().unwrap();
+        *root = path.clone();
+    }
     tokio::spawn(async move {
         let _ = crate::indexer::scanner::scan_project(
             config,
@@ -186,152 +191,32 @@ async fn handle_store_context(server: &Server, params: &CallToolParams) -> Resul
     )))
 }
 
-async fn handle_get_related_context(
-    server: &Server,
-    params: &CallToolParams,
-) -> Result<CallToolResult> {
-    let file_path = require_string_arg(params, "filePath")?;
-
-    // 0. Fetch stored project context
-    let project_id = server.config.project_root.read().unwrap().clone();
-    let project_contexts = server
-        .store
-        .get_project_context(&project_id)
-        .await
-        .unwrap_or_default();
-
-    // 1. Fetch records for the target file
-    let records = server.store.get_all_records().await?;
-    let target_records: Vec<_> = records
-        .iter()
-        .filter(|r| r.metadata_str("path") == file_path)
-        .collect();
-
-    if target_records.is_empty() {
-        return Ok(CallToolResult::text(format!(
-            "No indexed context found for {}",
-            file_path
-        )));
-    }
-
-    let mut out = format!("<context>\n  <file path=\"{}\">\n", file_path);
-    let mut symbols = HashSet::new();
-    let mut relations = HashSet::new();
-
-    for r in &target_records {
-        let meta = r.metadata_json();
-        if let Some(s) = meta["symbols"].as_array() {
-            for sym in s {
-                if let Some(st) = sym.as_str() {
-                    symbols.insert(st.to_string());
-                }
-            }
-        }
-        if let Some(rel) = meta["relationships"].as_array() {
-            for rpath in rel {
-                if let Some(rt) = rpath.as_str() {
-                    relations.insert(rt.to_string());
-                }
-            }
-        }
-        out.push_str(&format!(
-            "    <code_chunk>\n{}\n    </code_chunk>\n",
-            r.content
-        ));
-    }
-    out.push_str("  </file>\n");
-
-    // 2. Resolve and Fetch Dependencies
-    if !relations.is_empty() {
-        out.push_str("  <dependencies>\n");
-        for rel in relations {
-            let dep_records: Vec<_> = records
-                .iter()
-                .filter(|r| r.metadata_str("path").contains(&rel))
-                .collect();
-            if !dep_records.is_empty() {
-                out.push_str(&format!(
-                    "    <file path=\"{}\" resolved_from=\"{}\">\n",
-                    rel, rel
-                ));
-                for dr in dep_records {
-                    out.push_str(&format!(
-                        "      <code_chunk>\n{}\n      </code_chunk>\n",
-                        dr.content
-                    ));
-                }
-                out.push_str("    </file>\n");
-            }
-        }
-        out.push_str("  </dependencies>\n");
-    }
-
-    // 3. Usage Samples for Symbols
-    if !symbols.is_empty() {
-        out.push_str("  <usage_samples>\n");
-        for sym in symbols {
-            let mut found = 0;
-            for r in &records {
-                if r.metadata_str("path") == file_path {
-                    continue;
-                }
-                if r.content.contains(&sym) {
-                    out.push_str(&format!(
-                        "    <sample symbol=\"{}\" used_in=\"{}\">\n{}\n    </sample>\n",
-                        sym,
-                        r.metadata_str("path"),
-                        r.content
-                    ));
-                    found += 1;
-                }
-                if found >= 2 {
-                    break;
-                }
-            }
-        }
-        out.push_str("  </usage_samples>\n");
-    }
-
-    if !project_contexts.is_empty() {
-        out.push_str("  <project_instructions>\n");
-        for ctx in project_contexts {
-            out.push_str(&format!("    <instruction>\n{}\n    </instruction>\n", ctx));
-        }
-        out.push_str("  </project_instructions>\n");
-    }
-
-    out.push_str("</context>");
-    Ok(CallToolResult::text(out))
-}
-
 async fn handle_find_duplicate_code(
     server: &Server,
     params: &CallToolParams,
 ) -> Result<CallToolResult> {
     let target_path = require_string_arg(params, "target_path")?;
-    let records = server.store.get_all_records().await?;
-    let mut found = false;
-    let mut out = format!("## Duplicate Code Analysis for {}\n\n", target_path);
+    let records = server.store.get_records_by_path(&target_path).await?;
 
-    for r in records {
-        if r.metadata_str("path") == target_path {
-            let vector = r.vector.clone();
-            let matches = server
-                .store
-                .hybrid_search(vector, &r.content, 3, None)
-                .await?;
-            for m in matches {
-                if m.metadata_str("path") != target_path {
-                    out.push_str(&format!(
-                        "- Possible duplicate in `{}`\n",
-                        m.metadata_str("path")
-                    ));
-                    found = true;
-                }
-            }
-        }
+    if records.is_empty() {
+        return Ok(CallToolResult::text(format!(
+            "No indexed content found for: {target_path}"
+        )));
     }
 
+    // Combine all chunk content and embed once instead of N separate searches.
+    let combined: String = records.iter().map(|r| r.content.as_str()).collect::<Vec<_>>().join("\n");
+    let vector = server.embedder.embed_query(&combined)?;
+    let matches = server.store.hybrid_search(vector, &combined, 10, None).await?;
+
+    let mut out = format!("## Duplicate Code Analysis for {target_path}\n\n");
+    let mut found = false;
+    for m in matches {
+        if m.metadata_str("path") != target_path {
+            out.push_str(&format!("- Possible duplicate in `{}`\n", m.metadata_str("path")));
+            found = true;
+        }
+    }
     if !found {
         out.push_str("No duplicates found.");
     }
@@ -444,11 +329,13 @@ async fn handle_get_codebase_skeleton(
     let target_path = optional_string_arg(params, "target_path").unwrap_or_else(|| ".".into());
     let max_depth = optional_f64_arg(params, "max_depth").unwrap_or(3.0) as usize;
     let max_items = optional_f64_arg(params, "max_items").unwrap_or(1000.0) as usize;
+    let include_pattern = optional_string_arg(params, "include_pattern");
+    let exclude_pattern = optional_string_arg(params, "exclude_pattern");
 
     let abs_path = if std::path::Path::new(&target_path).is_absolute() {
-        std::path::PathBuf::from(target_path)
+        std::path::PathBuf::from(&target_path)
     } else {
-        std::path::Path::new(&root).join(target_path)
+        std::path::Path::new(&root).join(&target_path)
     };
 
     if !abs_path.exists() {
@@ -456,51 +343,57 @@ async fn handle_get_codebase_skeleton(
     }
 
     let mut out = format!("Directory Tree: {:?} (Depth: {})\n", abs_path, max_depth);
-    let mut item_count = 0;
 
-    fn walk_dir(
-        path: &std::path::Path,
-        depth: usize,
-        max_depth: usize,
-        item_count: &mut usize,
-        max_items: usize,
-        out: &mut String,
-    ) {
-        if depth > max_depth || *item_count >= max_items {
-            return;
+    // Build a map of path -> depth using WalkBuilder (respects .gitignore / .vector-ignore).
+    let mut walker_builder = ignore::WalkBuilder::new(&abs_path);
+    walker_builder
+        .standard_filters(true)
+        .hidden(true)
+        .add_custom_ignore_filename(".vector-ignore")
+        .max_depth(Some(max_depth + 1));
+
+    let walker = walker_builder.build();
+
+    let mut entries: Vec<(std::path::PathBuf, usize)> = Vec::new();
+    for entry in walker.flatten() {
+        let depth = entry.depth();
+        if depth == 0 {
+            continue; // skip root itself
         }
-        if let Ok(entries) = std::fs::read_dir(path) {
-            let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-            entries.sort_by_key(|e| e.file_name());
-            for entry in entries {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name == "node_modules" || name == ".git" || name == "target" {
-                    continue;
-                }
-                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                out.push_str(&format!("{}├── {}\n", "│   ".repeat(depth), name));
-                *item_count += 1;
-                if is_dir && depth < max_depth && *item_count < max_items {
-                    walk_dir(
-                        &entry.path(),
-                        depth + 1,
-                        max_depth,
-                        item_count,
-                        max_items,
-                        out,
-                    );
-                }
+        let path = entry.path().to_path_buf();
+
+        // Apply optional include/exclude glob patterns.
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        if let Some(ref pat) = exclude_pattern {
+            if name.contains(pat.as_str()) {
+                continue;
             }
         }
+        if let Some(ref pat) = include_pattern {
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            if !is_dir && !name.contains(pat.as_str()) {
+                continue;
+            }
+        }
+
+        entries.push((path, depth - 1));
+        if entries.len() >= max_items {
+            break;
+        }
     }
-    walk_dir(
-        &abs_path,
-        0,
-        max_depth,
-        &mut item_count,
-        max_items,
-        &mut out,
-    );
+
+    for (path, depth) in &entries {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        out.push_str(&format!("{}├── {}\n", "│   ".repeat(*depth), name));
+    }
+
     Ok(CallToolResult::text(out))
 }
 
@@ -509,141 +402,205 @@ async fn handle_check_dependency_health(
     params: &CallToolParams,
 ) -> Result<CallToolResult> {
     let dir_path = require_string_arg(params, "directory_path")?;
-    let abs_path =
-        std::path::Path::new(&*server.config.project_root.read().unwrap()).join(&dir_path);
-    let mut declared_deps = HashSet::new();
-    let mut project_type = "unknown";
+    let root = server.config.project_root.read().unwrap().clone();
+    let abs_path = if std::path::Path::new(&dir_path).is_absolute() {
+        std::path::PathBuf::from(&dir_path)
+    } else {
+        std::path::Path::new(&root).join(&dir_path)
+    };
 
-    // 1. Detect project type and load declared dependencies
-    if abs_path.join("package.json").exists() {
-        project_type = "npm";
-        if let Ok(content) = std::fs::read_to_string(abs_path.join("package.json"))
-            && let Ok(v) = serde_json::from_str::<Value>(&content)
-        {
-            if let Some(deps) = v["dependencies"].as_object() {
-                for d in deps.keys() {
-                    declared_deps.insert(d.clone());
-                }
-            }
-            if let Some(dev) = v["devDependencies"].as_object() {
-                for d in dev.keys() {
-                    declared_deps.insert(d.clone());
-                }
-            }
-        }
-    } else if abs_path.join("go.mod").exists() {
-        project_type = "go";
-        if let Ok(content) = std::fs::read_to_string(abs_path.join("go.mod")) {
-            for line in content.lines() {
-                let trimmed = line.trim();
-                if trimmed.starts_with("require ") {
-                    let parts: Vec<&str> = trimmed.split_whitespace().collect();
-                    if parts.len() >= 2 {
-                        declared_deps.insert(parts[1].to_string());
+    // 1. Detect project type and parse manifest
+    let (project_type, declared_deps) = {
+        let npm_manifest = abs_path.join("package.json");
+        let go_manifest = abs_path.join("go.mod");
+        let py_manifest = abs_path.join("requirements.txt");
+
+        if npm_manifest.exists() {
+            let mut deps = HashSet::new();
+            if let Ok(content) = std::fs::read_to_string(&npm_manifest)
+                && let Ok(v) = serde_json::from_str::<Value>(&content)
+            {
+                for key in ["dependencies", "devDependencies"] {
+                    if let Some(obj) = v[key].as_object() {
+                        deps.extend(obj.keys().cloned());
                     }
                 }
             }
-        }
-    } else if abs_path.join("requirements.txt").exists() {
-        project_type = "python";
-        if let Ok(content) = std::fs::read_to_string(abs_path.join("requirements.txt")) {
-            let re = regex::Regex::new(r"^([a-zA-Z0-9_\-]+)")?;
-            for line in content.lines() {
-                let trimmed = line.trim();
-                if !trimmed.is_empty()
-                    && !trimmed.starts_with('#')
-                    && let Some(cap) = re.captures(trimmed)
-                {
-                    declared_deps.insert(cap[1].to_string());
+            ("npm", deps)
+        } else if go_manifest.exists() {
+            let mut deps = HashSet::new();
+            if let Ok(content) = std::fs::read_to_string(&go_manifest) {
+                for line in content.lines() {
+                    let t = line.trim();
+                    if t.is_empty() || t.starts_with("//") {
+                        continue;
+                    }
+                    let parts: Vec<&str> = t.split_whitespace().collect();
+                    if parts.len() >= 2 && parts[0] != "module" && parts[0] != "go" {
+                        deps.insert(parts[0].to_string());
+                    }
                 }
             }
+            ("go", deps)
+        } else if py_manifest.exists() {
+            let mut deps = HashSet::new();
+            if let Ok(content) = std::fs::read_to_string(&py_manifest) {
+                for line in content.lines() {
+                    let t = line.trim();
+                    if t.is_empty() || t.starts_with('#') {
+                        continue;
+                    }
+                    deps.insert(t.split("==").next().unwrap_or(t).to_string());
+                }
+            }
+            ("python", deps)
+        } else {
+            return Ok(CallToolResult::error(
+                "No supported manifest found (package.json, go.mod, requirements.txt)",
+            ));
         }
-    }
+    };
 
-    if project_type == "unknown" {
-        return Ok(CallToolResult::error(
-            "Could not identify project type (no package.json, go.mod, or requirements.txt)",
-        ));
-    }
-
-    // 2. Scan for used dependencies in indexed records
+    // 2. Scan indexed records for imports in this directory
     let records = server.store.get_all_records().await?;
-    let mut used_deps = HashSet::new();
-    let dir_str = dir_path.replace('\\', "/");
+    let rel_dir = dir_path.replace('\\', "/");
+    let mut missing_deps: HashMap<String, Vec<String>> = HashMap::new();
 
     for r in records {
-        let meta: Value = serde_json::from_str(&r.metadata).unwrap_or(Value::Null);
-        let path = meta["path"].as_str().unwrap_or("");
-        if !path.contains(&dir_str) {
+        let meta = r.metadata_json();
+        let file_path = meta["path"].as_str().unwrap_or("").to_string();
+        if !rel_dir.is_empty() && !file_path.contains(&rel_dir) {
             continue;
         }
+        let rels: Vec<String> = meta["relationships"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
 
-        if let Some(rels) = meta["relationships"].as_array() {
-            for rel in rels {
-                if let Some(import_path) = rel.as_str() {
-                    if project_type == "npm" {
-                        if !import_path.starts_with('.') && !import_path.starts_with('/') {
-                            let parts: Vec<&str> = import_path.split('/').collect();
-                            if !parts.is_empty() {
-                                let pkg = if parts[0].starts_with('@') && parts.len() > 1 {
-                                    format!("{}/{}", parts[0], parts[1])
-                                } else {
-                                    parts[0].to_string()
-                                };
-                                used_deps.insert(pkg);
-                            }
+        for dep in rels {
+            let pkg = match project_type {
+                "npm" => {
+                    if dep.starts_with('.') || dep.starts_with('/') {
+                        continue;
+                    }
+                    // Skip monorepo-local packages that resolve to a local path
+                    if resolve_monorepo_import(&dep, &root).is_some() {
+                        continue;
+                    }
+                    // Skip Node.js builtins and non-module strings (named imports, etc.)
+                    // A valid npm package import contains only lowercase, digits, hyphens, @, /
+                    // Named imports like "ApiError", "Request" contain uppercase — skip them.
+                    if dep
+                        .chars()
+                        .next()
+                        .map(|c| c.is_uppercase())
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    // Skip Node.js built-in modules
+                    if matches!(
+                        dep.as_str(),
+                        "fs" | "path"
+                            | "http"
+                            | "https"
+                            | "crypto"
+                            | "os"
+                            | "url"
+                            | "util"
+                            | "stream"
+                            | "events"
+                            | "buffer"
+                            | "child_process"
+                            | "async_hooks"
+                            | "net"
+                            | "tls"
+                            | "dns"
+                            | "readline"
+                            | "vm"
+                            | "worker_threads"
+                            | "zlib"
+                            | "console"
+                            | "constants"
+                            | "module"
+                            | "process"
+                            | "punycode"
+                            | "querystring"
+                            | "string_decoder"
+                            | "timers"
+                            | "tty"
+                            | "v8"
+                    ) {
+                        continue;
+                    }
+                    if dep
+                        .chars()
+                        .next()
+                        .map(|c| c.is_lowercase())
+                        .unwrap_or(false)
+                        && !dep.contains("/")
+                        && !dep.contains(".")
+                        && !["react", "next", "lucide-react"].contains(&dep.as_str())
+                    {
+                        // It looks like a single-word named import (e.g., "useState") but lowercase
+                        // npm packages usually have more structure or are explicitly in the manifest.
+                        // If it's not in declared_deps, we'll check if it looks like a package.
+                        // For now, let's be more strict.
+                        if !declared_deps.contains(&dep) {
+                            continue;
                         }
-                    } else if project_type == "go" {
-                        // Skip stdlib (heuristic: no dot in first path component)
-                        if import_path.contains('.')
-                            && !import_path.contains(&*server.config.project_root.read().unwrap())
-                        {
-                            used_deps.insert(import_path.to_string());
-                        }
-                    } else if project_type == "python" && !import_path.starts_with('.') {
-                        used_deps.insert(import_path.to_string());
+                    }
+                    let parts: Vec<&str> = dep.splitn(3, '/').collect();
+                    if dep.starts_with('@') && parts.len() > 1 {
+                        format!("{}/{}", parts[0], parts[1])
+                    } else {
+                        parts[0].to_string()
                     }
                 }
+                "go" => {
+                    if !dep.contains('.') || dep.starts_with(&root) {
+                        continue;
+                    }
+                    dep.clone()
+                }
+                "python" => {
+                    if dep.starts_with('.') {
+                        continue;
+                    }
+                    dep.clone()
+                }
+                _ => continue,
+            };
+            if !declared_deps.contains(&pkg) {
+                missing_deps.entry(pkg).or_default().push(file_path.clone());
             }
         }
     }
 
-    // 3. Compare and report
-    let missing: Vec<_> = used_deps
-        .iter()
-        .filter(|d| !declared_deps.contains(*d))
-        .collect();
-    let unused: Vec<_> = declared_deps
-        .iter()
-        .filter(|d| !used_deps.contains(*d) && !d.contains("types") && !d.contains("eslint"))
-        .collect();
+    if missing_deps.is_empty() {
+        return Ok(CallToolResult::text(format!(
+            "✅ Dependency Health Check ({project_type}): All external imports are correctly declared."
+        )));
+    }
 
-    let mut out = format!("## Dependency Health Report ({})\n\n", project_type);
-    out.push_str(&format!("- Directory: `{}`\n", dir_path));
-    out.push_str(&format!("- Declared: {}\n", declared_deps.len()));
-    out.push_str(&format!("- Actually Used: {}\n\n", used_deps.len()));
-
-    if !missing.is_empty() {
-        out.push_str("### ⚠️ Missing in Manifest (Used but not declared)\n");
-        for m in &missing {
-            out.push_str(&format!("- `{}`\n", m));
+    let mut out = format!(
+        "## ⚠️ Dependency Health Report ({project_type})\n\nThe following external dependencies are imported but missing from your manifest:\n\n"
+    );
+    let mut sorted_deps: Vec<_> = missing_deps.iter().collect();
+    sorted_deps.sort_by_key(|(k, _)| k.as_str());
+    for (dep, files) in sorted_deps {
+        let mut unique: Vec<_> = files.iter().collect::<HashSet<_>>().into_iter().collect();
+        unique.sort();
+        out.push_str(&format!("### `{dep}`\nImported in:\n"));
+        for f in unique {
+            out.push_str(&format!("- {f}\n"));
         }
         out.push('\n');
     }
-
-    if !unused.is_empty() {
-        out.push_str("### ℹ️ Potentially Unused (Declared but not seen in imports)\n");
-        for u in &unused {
-            out.push_str(&format!("- `{}`\n", u));
-        }
-    }
-
-    if missing.is_empty() && unused.is_empty() {
-        out.push_str(
-            "✅ All declared dependencies are used, and no missing dependencies were found.",
-        );
-    }
-
     Ok(CallToolResult::text(out))
 }
 
@@ -651,41 +608,122 @@ async fn handle_generate_docstring_prompt(
     server: &Server,
     params: &CallToolParams,
 ) -> Result<CallToolResult> {
-    let name = require_string_arg(params, "entity_name")?;
-    let vector = server.embedder.embed_text(&name)?;
-    let records = server.store.hybrid_search(vector, &name, 1, None).await?;
-    if let Some(r) = records.first() {
-        Ok(CallToolResult::text(format!(
-            "Generate documentation for:\n\n{}",
-            r.content
-        )))
-    } else {
-        Ok(CallToolResult::error("Entity not found"))
-    }
+    let file_path = require_string_arg(params, "file_path")?;
+    let entity_name = require_string_arg(params, "entity_name")?;
+    let language = optional_string_arg(params, "language").unwrap_or_else(|| {
+        match std::path::Path::new(&file_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+        {
+            "go" => "Go",
+            "ts" | "tsx" | "js" | "jsx" => "TypeScript/JavaScript",
+            "py" => "Python",
+            "rs" => "Rust",
+            _ => "unknown",
+        }
+        .to_string()
+    });
+
+    let doc_style = match language.to_lowercase().as_str() {
+        "go" => "Godoc comments",
+        "typescript/javascript" | "typescript" | "javascript" => "JSDoc comments",
+        "python" => "Python docstrings (PEP 257 format)",
+        "rust" => "Rust doc comments (/// style)",
+        _ => "professional documentation comment",
+    };
+
+    let records = server.store.get_records_by_path(&file_path).await?;
+    let match_record = records.iter().find(|r| {
+        let meta = r.metadata_json();
+        meta["symbols"]
+            .as_array()
+            .map(|syms| syms.iter().any(|s| s.as_str() == Some(&entity_name)))
+            .unwrap_or(false)
+    });
+
+    let Some(r) = match_record else {
+        return Ok(CallToolResult::error(format!(
+            "Entity '{entity_name}' not found in file '{file_path}'"
+        )));
+    };
+
+    let meta = r.metadata_json();
+    let calls = meta["calls"].to_string();
+    let symbols = meta["symbols"].to_string();
+    let relationships = meta["relationships"].to_string();
+
+    let prompt = format!(
+        "Please write a professional {doc_style} for the following code.\n\
+        Architecture Context:\n\
+        - Entity: {symbols}\n\
+        - Internal Calls made: {calls}\n\
+        - File Imports: {relationships}\n\n\
+        Code:\n{}",
+        r.content
+    );
+    Ok(CallToolResult::text(prompt))
 }
 
 async fn handle_analyze_architecture(
     server: &Server,
-    _params: &CallToolParams,
+    params: &CallToolParams,
 ) -> Result<CallToolResult> {
-    let vector = server.embedder.embed_text("system architecture design")?;
-    let records = server
-        .store
-        .hybrid_search(vector, "architecture", 5, None)
-        .await?;
-    let mut combined = String::new();
+    let monorepo_prefix = optional_string_arg(params, "monorepo_prefix").unwrap_or_default();
+    let records = server.store.get_all_records().await?;
+
+    // adjacency: src_pkg -> set of target_pkgs
+    let mut adj: HashMap<String, HashSet<String>> = HashMap::new();
+
     for r in records {
-        combined.push_str(&r.content);
-        combined.push('\n');
+        let meta = r.metadata_json();
+        let path = meta["path"].as_str().unwrap_or("").to_string();
+        if path.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = path.split('/').collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let src_pkg = if parts.len() > 2 && (parts[0] == "apps" || parts[0] == "packages") {
+            format!("{}/{}", parts[0], parts[1])
+        } else {
+            parts[0].to_string()
+        };
+
+        let rels: Vec<String> = meta["relationships"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        for rel in rels {
+            if monorepo_prefix.is_empty() || rel.starts_with(&monorepo_prefix) {
+                adj.entry(src_pkg.clone()).or_default().insert(rel);
+            }
+        }
     }
-    let summary = server
-        .summarizer
-        .summarize_chunk(&combined, Arc::clone(&server.config))
-        .await?;
-    Ok(CallToolResult::text(format!(
-        "## Architecture Overview\n\n{}",
-        summary
-    )))
+
+    if adj.is_empty() {
+        return Ok(CallToolResult::text(
+            "No inter-package dependencies found in the indexed codebase.",
+        ));
+    }
+
+    let mut out = String::from("graph TD\n");
+    let mut sources: Vec<_> = adj.keys().collect();
+    sources.sort();
+    for src in sources {
+        let mut targets: Vec<_> = adj[src].iter().collect();
+        targets.sort();
+        for tgt in targets {
+            out.push_str(&format!("    \"{src}\" --> \"{tgt}\"\n"));
+        }
+    }
+    Ok(CallToolResult::text(out))
 }
 
 async fn handle_find_dead_code(server: &Server, params: &CallToolParams) -> Result<CallToolResult> {
@@ -742,35 +780,39 @@ async fn handle_find_dead_code(server: &Server, params: &CallToolParams) -> Resu
     Ok(CallToolResult::text(out))
 }
 
-fn handle_filesystem_grep(server: &Server, params: &CallToolParams) -> Result<CallToolResult> {
+async fn handle_filesystem_grep(
+    server: &Server,
+    params: &CallToolParams,
+) -> Result<CallToolResult> {
     let query = require_string_arg(params, "query")?.to_lowercase();
     let root = server.config.project_root.read().unwrap().clone();
+
+    // Collect file paths in a blocking task to avoid blocking the async runtime.
+    let paths = tokio::task::spawn_blocking(move || {
+        let walker = ignore::WalkBuilder::new(&root)
+            .standard_filters(true)
+            .hidden(true)
+            .add_custom_ignore_filename(".vector-ignore")
+            .build();
+        walker
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|ft| ft.is_file()).unwrap_or(false))
+            .map(|e| e.path().to_path_buf())
+            .collect::<Vec<_>>()
+    })
+    .await?;
+
     let mut results = Vec::new();
-
-    let walker = ignore::WalkBuilder::new(&root)
-        .standard_filters(true)
-        .hidden(true)
-        .add_custom_ignore_filename(".vector-ignore")
-        .build();
-
-    for entry in walker.filter_map(|e| e.ok()) {
-        if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-            continue;
-        }
-        if let Ok(content) = std::fs::read_to_string(entry.path()) {
+    'outer: for path in paths {
+        if let Ok(content) = tokio::fs::read_to_string(&path).await {
             for (i, line) in content.lines().enumerate() {
                 if line.to_lowercase().contains(&query) {
-                    results.push(format!(
-                        "{}:{}: {}",
-                        entry.path().display(),
-                        i + 1,
-                        line.trim()
-                    ));
+                    results.push(format!("{}:{}: {}", path.display(), i + 1, line.trim()));
+                    if results.len() >= 100 {
+                        break 'outer;
+                    }
                 }
             }
-        }
-        if results.len() > 50 {
-            break;
         }
     }
     Ok(CallToolResult::text(results.join("\n")))
@@ -935,21 +977,35 @@ async fn handle_find_missing_tests(
     _params: &CallToolParams,
 ) -> Result<CallToolResult> {
     let records = server.store.get_all_records().await?;
-    let mut exports = HashMap::new();
-    let mut usages = HashSet::new();
+    let mut exports: HashMap<String, String> = HashMap::new();
+    let mut tested_symbols: HashSet<String> = HashSet::new();
 
     for r in records {
         let path = r.metadata_str("path");
-        if path.contains("test") {
-            for word in r.content.split_whitespace() {
-                usages.insert(word.to_string());
+        if path.contains("test") || path.contains("spec") {
+            // Extract symbols from test files (functions/classes being tested).
+            let meta = r.metadata_json();
+            if let Some(syms) = meta["symbols"].as_array() {
+                for s in syms {
+                    if let Some(st) = s.as_str() {
+                        tested_symbols.insert(st.to_string());
+                    }
+                }
+            }
+            // Also extract calls — test files call the functions they test.
+            if let Some(calls) = meta["calls"].as_array() {
+                for c in calls {
+                    if let Some(st) = c.as_str() {
+                        tested_symbols.insert(st.to_string());
+                    }
+                }
             }
         } else {
             let meta = r.metadata_json();
             if let Some(syms) = meta["symbols"].as_array() {
                 for s in syms {
                     if let Some(st) = s.as_str() {
-                        exports.insert(st.to_string(), path.to_string());
+                        exports.insert(st.to_string(), path.clone());
                     }
                 }
             }
@@ -958,14 +1014,14 @@ async fn handle_find_missing_tests(
 
     let mut missing = Vec::new();
     for (name, path) in exports {
-        if !usages.contains(&name) {
+        if !tested_symbols.contains(&name) {
             missing.push((name, path));
         }
     }
     if missing.is_empty() {
-        return Ok(CallToolResult::text("All exports tested."));
+        return Ok(CallToolResult::text("✅ All exported symbols appear in test files."));
     }
-    let mut out = String::from("## Missing Tests\n\n");
+    let mut out = String::from("## ⚠️ Potentially Untested Exports\n\n");
     for (n, p) in missing {
         out.push_str(&format!("- `{}` in `{}`\n", n, p));
     }
@@ -976,18 +1032,47 @@ async fn handle_list_api_endpoints(
     server: &Server,
     _params: &CallToolParams,
 ) -> Result<CallToolResult> {
-    let keywords = ["HandleFunc", "app.GET", "app.POST", "Route("];
-    let mut out = String::from("## API Endpoints\n\n");
+    let keywords = [
+        "HandleFunc",
+        "mux.Handle",
+        "app.GET",
+        "app.POST",
+        "router.Register",
+        "Route(",
+        "@app.route",
+    ];
+
+    let mut unique: HashMap<String, crate::db::Record> = HashMap::new();
     for kw in keywords {
-        let vector = server.embedder.embed_text(kw)?;
-        let records = server.store.hybrid_search(vector, kw, 5, None).await?;
-        for r in records {
-            out.push_str(&format!(
-                "- `{}`: `{}`\n",
-                r.metadata_str("path"),
-                r.content.lines().next().unwrap_or("")
-            ));
+        let matches = server.store.lexical_search(kw, 20, None).await?;
+        for m in matches {
+            let meta = m.metadata_json();
+            let key = format!(
+                "{}:{}",
+                meta["path"].as_str().unwrap_or(""),
+                meta["start_line"].as_u64().unwrap_or(0)
+            );
+            unique.insert(key, m);
         }
+    }
+
+    if unique.is_empty() {
+        return Ok(CallToolResult::text("No API routing patterns detected."));
+    }
+
+    let mut keys: Vec<_> = unique.keys().cloned().collect();
+    keys.sort();
+
+    let mut out = String::from("## 🌐 Detected API Endpoints / Routes\n\n");
+    for k in keys {
+        let r = &unique[&k];
+        let meta = r.metadata_json();
+        out.push_str(&format!(
+            "### {} (Line {})\n```\n{}\n```\n\n",
+            meta["path"].as_str().unwrap_or("?"),
+            meta["start_line"].as_u64().unwrap_or(0),
+            r.content.trim()
+        ));
     }
     Ok(CallToolResult::text(out))
 }
@@ -997,10 +1082,12 @@ async fn handle_get_code_history(
     params: &CallToolParams,
 ) -> Result<CallToolResult> {
     let path = require_string_arg(params, "file_path")?;
-    let output = std::process::Command::new("git")
+    let root = server.config.project_root.read().unwrap().clone();
+    let output = tokio::process::Command::new("git")
         .args(["log", "-n", "5", "--pretty=format:%h - %s", "--", &path])
-        .current_dir(&*server.config.project_root.read().unwrap())
-        .output()?;
+        .current_dir(&root)
+        .output()
+        .await?;
     Ok(CallToolResult::text(
         String::from_utf8_lossy(&output.stdout).to_string(),
     ))
@@ -1062,29 +1149,18 @@ async fn handle_reindex_all(
     ))
 }
 async fn handle_check_llm_connectivity(server: &Server) -> Result<CallToolResult> {
-    let client = crate::llm::gemini::GeminiClient::new(&server.config);
-    match client.list_models().await {
-        Ok(models) => {
-            let mut out = String::from(
-                "### ✅ LLM Connectivity Status\n\n**Status**: Connected Successfully\n",
-            );
-            out.push_str(&format!(
-                "**Configured Default**: `{}`\n\n",
-                server.config.default_gemini_model
-            ));
-            out.push_str("**Available Models**:\n");
-            for m in models {
-                out.push_str(&format!(
-                    "- `{}` ({}): {}\n",
-                    m.name, m.display_name, m.description
-                ));
-            }
-            Ok(CallToolResult::text(out))
+    // Gemini removed — report local embedder status instead.
+    let model = &server.config.model_name;
+    let reranker = &server.config.reranker_model_name;
+    let has_reranker = server.embedder.rerank_session.is_some();
+    Ok(CallToolResult::text(format!(
+        "### ✅ Local LLM Status\n\n- **Embedder**: `{model}`\n- **Reranker**: `{reranker}` (loaded: {has_reranker})\n- **Local summarizer**: {}\n",
+        if server.config.feature_toggles.enable_local_llm {
+            "enabled"
+        } else {
+            "disabled"
         }
-        Err(e) => Ok(CallToolResult::text(format!(
-            "### ❌ LLM Connectivity Status\n\n**Status**: API Error\n**Error**: {e}\n\n**Troubleshooting**:\n1. Verify your GEMINI_API_KEY is correct.\n2. Ensure your key has permissions for the Generative Language API."
-        ))),
-    }
+    )))
 }
 
 async fn handle_distill_knowledge(
@@ -1119,30 +1195,16 @@ async fn handle_distill_knowledge(
         )));
     }
 
-    let system_prompt = "You are a Senior Software Architect. Your task is to analyze the provided source code and \"distill\" it into a set of architectural patterns, coding standards, and business rules.\nFormat the output as a high-quality Markdown Knowledge Item (KI) including:\n1. Overview: What is this component/module for?\n2. Key Architectural Decisions: Why was it built this way?\n3. Implementation Rules: Mandatory patterns for anyone modifying this code.\n4. Security/Compliance: PHI handling, encryption rules, etc. (if applicable).\nKeep it concise and actionable.";
-    let user_prompt = format!(
-        "Analyze these files from path '{}':\n\n{}",
-        path_prefix, relevant_content
-    );
-
-    let client = crate::llm::gemini::GeminiClient::new(&server.config);
-    let distilled = client
-        .generate_completion(
-            &server.config.default_gemini_model,
-            system_prompt,
-            &user_prompt,
-        )
-        .await?;
-
-    // Store distilled knowledge
+    // Store the raw indexed content as a knowledge item — no external LLM needed.
     let project_id = server.config.project_root.read().unwrap().clone();
+    let distilled = relevant_content.trim().to_string();
     server
         .store
         .store_project_context(&project_id, &distilled)
         .await?;
 
     Ok(CallToolResult::text(format!(
-        "### ✅ Knowledge Distilled & Indexed\n\n{distilled}"
+        "### ✅ Knowledge Indexed\n\n{distilled}"
     )))
 }
 
@@ -1153,38 +1215,200 @@ async fn handle_verify_proposed_change(
     let proposed_change = require_string_arg(params, "proposed_change")?;
     let project_id = server.config.project_root.read().unwrap().clone();
 
-    // Retrieve distilled knowledge (KIs)
     let contexts = server.store.get_project_context(&project_id).await?;
-    let ki_context = if contexts.is_empty() {
-        "No Architectural Decisions or Knowledge Items found for this project.".to_string()
-    } else {
-        contexts.join("\n\n---\n\n")
-    };
+    if contexts.is_empty() {
+        return Ok(CallToolResult::text(
+            "No Knowledge Items found for this project. Use `store_context` to add architectural rules first.\n\nProposed change:\n".to_string() + &proposed_change
+        ));
+    }
 
-    let system_prompt = "You are a Senior Software Engineer performing a code review. Your task is to verify if a proposed change complies with the existing architectural decisions and knowledge items provided below.\n\nReply with a structured verification report identifying potential violations or confirming compliance.";
-    let user_prompt = format!(
-        "### Existing Knowledge Items:\n{}\n\n### Proposed Change:\n{}",
-        ki_context, proposed_change
-    );
-
-    let client = crate::llm::gemini::GeminiClient::new(&server.config);
-    let review = client
-        .generate_completion(
-            &server.config.default_gemini_model,
-            system_prompt,
-            &user_prompt,
-        )
-        .await?;
-
+    // Return the KIs alongside the proposed change for the agent to reason about.
+    let ki_context = contexts.join("\n\n---\n\n");
     Ok(CallToolResult::text(format!(
-        "### 🔎 Proposed Change Verification\n\n{review}\n\n---\n*Verified against indexed Knowledge Items using {}.*",
-        server.config.default_gemini_model
+        "### 🛡️ Knowledge Items for Review\n\n{ki_context}\n\n---\n\n### Proposed Change\n\n{proposed_change}\n\n*Agent: compare the proposed change against the Knowledge Items above and report any violations.*"
     )))
 }
 
 // ---------------------------------------------------------------------------
 // Task 1: Action-based super-tools
 // ---------------------------------------------------------------------------
+
+/// Resolve a monorepo package alias (e.g. `@org/shared`) to a local path by
+/// reading `package.json` workspaces and `tsconfig.json` `paths` from the project root.
+fn resolve_monorepo_import(import: &str, project_root: &str) -> Option<String> {
+    // 1. Try tsconfig.json paths
+    let tsconfig_path = std::path::Path::new(project_root).join("tsconfig.json");
+    if let Ok(content) = std::fs::read_to_string(&tsconfig_path) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(paths) = v["compilerOptions"]["paths"].as_object() {
+                for (alias, targets) in paths {
+                    // alias may be "@org/pkg" or "@org/pkg/*"
+                    let alias_base = alias.trim_end_matches("/*");
+                    let import_base = import.trim_end_matches("/*");
+                    if import_base == alias_base || import.starts_with(alias_base) {
+                        if let Some(first) = targets.as_array().and_then(|a| a.first()) {
+                            if let Some(target) = first.as_str() {
+                                let resolved =
+                                    target.trim_end_matches("/*").trim_start_matches("./");
+                                let suffix = import.strip_prefix(alias_base).unwrap_or("");
+                                let full = format!("{}/{}{}", project_root, resolved, suffix);
+                                return Some(full);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Try package.json workspaces — scan for a package whose "name" matches
+    let pkg_json = std::path::Path::new(project_root).join("package.json");
+    if let Ok(content) = std::fs::read_to_string(&pkg_json) {
+        if let Ok(root_pkg) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(workspaces) = root_pkg["workspaces"].as_array() {
+                for ws in workspaces {
+                    let pattern = ws.as_str().unwrap_or("").trim_end_matches("/*");
+                    let ws_dir = std::path::Path::new(project_root).join(pattern);
+                    if let Ok(entries) = std::fs::read_dir(&ws_dir) {
+                        for entry in entries.flatten() {
+                            let child_pkg = entry.path().join("package.json");
+                            if let Ok(c) = std::fs::read_to_string(&child_pkg) {
+                                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&c) {
+                                    if v["name"].as_str() == Some(import) {
+                                        return Some(entry.path().to_string_lossy().to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Recursive related context: file chunks + dependency chunks + usage samples.
+async fn handle_get_related_context(server: &Server, file_path: &str) -> Result<CallToolResult> {
+    let records = server.store.get_records_by_path(file_path).await?;
+    if records.is_empty() {
+        return Ok(CallToolResult::text(format!(
+            "No context found for file: {file_path}"
+        )));
+    }
+
+    let project_root = server.config.project_root.read().unwrap().clone();
+
+    // Collect symbols and relationships from all chunks of the target file
+    let mut all_symbols: HashSet<String> = HashSet::new();
+    let mut unique_deps: HashMap<String, String> = HashMap::new(); // import_str -> resolved path
+
+    for r in &records {
+        let meta = r.metadata_json();
+        if let Some(rels) = meta["relationships"].as_array() {
+            for rel in rels.iter().filter_map(|v| v.as_str()) {
+                if rel.starts_with("./") || rel.starts_with("../") {
+                    let resolved = std::path::Path::new(
+                        std::path::Path::new(file_path)
+                            .parent()
+                            .unwrap_or(std::path::Path::new("")),
+                    )
+                    .join(rel)
+                    .to_string_lossy()
+                    .to_string();
+                    unique_deps.insert(rel.to_string(), resolved);
+                } else if let Some(local) = resolve_monorepo_import(rel, &project_root) {
+                    unique_deps.insert(rel.to_string(), local);
+                } else {
+                    unique_deps.insert(rel.to_string(), rel.to_string());
+                }
+            }
+        }
+        if let Some(syms) = meta["symbols"].as_array() {
+            for s in syms.iter().filter_map(|v| v.as_str()) {
+                all_symbols.insert(s.to_string());
+            }
+        }
+    }
+
+    let mut out = String::from("<context>\n");
+
+    // 1. Target file chunks
+    let dep_list: Vec<_> = unique_deps.keys().cloned().collect();
+    let sym_list: Vec<_> = all_symbols.iter().cloned().collect();
+    out.push_str(&format!(
+        "  <file path=\"{file_path}\">\n    <metadata>\n      <dependencies>{}</dependencies>\n      <symbols>{}</symbols>\n    </metadata>\n",
+        serde_json::to_string(&dep_list).unwrap_or_default(),
+        serde_json::to_string(&sym_list).unwrap_or_default(),
+    ));
+    for r in &records {
+        out.push_str(&format!(
+            "    <code_chunk>\n{}\n    </code_chunk>\n",
+            r.content
+        ));
+    }
+    out.push_str("  </file>\n");
+
+    // 2. Dependency chunks (fetch indexed chunks for each import)
+    if !unique_deps.is_empty() {
+        let all_records = server.store.get_all_records().await?;
+        let mut path_map: HashMap<String, Vec<&crate::db::Record>> = HashMap::new();
+        for r in &all_records {
+            path_map.entry(r.metadata_str("path")).or_default().push(r);
+        }
+
+        for (import_str, resolved) in &unique_deps {
+            let chunks: Vec<_> = path_map
+                .iter()
+                .filter(|(p, _)| p.contains(resolved.as_str()) || p.contains(import_str.as_str()))
+                .flat_map(|(_, v)| v.iter().copied())
+                .collect();
+
+            out.push_str(&format!(
+                "  <file path=\"{resolved}\" resolved_from=\"{import_str}\">\n"
+            ));
+            if chunks.is_empty() {
+                out.push_str("    <error>No indexed chunks found.</error>\n");
+            } else {
+                for chunk in chunks {
+                    out.push_str(&format!(
+                        "    <code_chunk>\n{}\n    </code_chunk>\n",
+                        chunk.content
+                    ));
+                }
+            }
+            out.push_str("  </file>\n");
+        }
+    }
+
+    // 3. Usage samples: find where symbols from this file are used elsewhere
+    if !all_symbols.is_empty() {
+        out.push_str("  <usage_samples>\n");
+        let mut found_any = false;
+        for sym in &all_symbols {
+            let usages = server.store.lexical_search(sym, 5, None).await?;
+            for u in usages {
+                if u.metadata_str("path") == file_path {
+                    continue;
+                }
+                out.push_str(&format!(
+                    "    <sample symbol=\"{sym}\" used_in=\"{}\">\n{}\n    </sample>\n",
+                    u.metadata_str("path"),
+                    u.content
+                ));
+                found_any = true;
+            }
+        }
+        if !found_any {
+            out.push_str("    <info>No external usage samples found.</info>\n");
+        }
+        out.push_str("  </usage_samples>\n");
+    }
+
+    out.push_str("</context>");
+    Ok(CallToolResult::text(out))
+}
 
 /// `search_workspace` — unified vector / regex / graph / index_status dispatcher.
 async fn handle_search_workspace(
@@ -1199,7 +1423,6 @@ async fn handle_search_workspace(
 
     match action.as_str() {
         "vector" | "" => {
-            // Semantic search
             if query.is_empty() {
                 return Ok(CallToolResult::error("query is required for vector search"));
             }
@@ -1209,11 +1432,24 @@ async fn handle_search_workspace(
                 .hybrid_search(vector, &query, limit * 3, cross_reference.as_deref())
                 .await?;
 
-            // Path filter
             if let Some(ref pf) = path_filter {
                 results.retain(|r| r.metadata_str("path").contains(pf.as_str()));
             }
-            results.truncate(limit);
+
+            // Rerank if cross-encoder is available
+            if server.embedder.rerank_session.is_some() && results.len() > 1 {
+                let docs: Vec<String> = results.iter().map(|r| r.content.clone()).collect();
+                if let Ok(scores) = server.embedder.rerank(&query, docs) {
+                    let mut scored: Vec<_> = results.into_iter().zip(scores).collect();
+                    scored
+                        .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                    results = scored.into_iter().map(|(r, _)| r).take(limit).collect();
+                } else {
+                    results.truncate(limit);
+                }
+            } else {
+                results.truncate(limit);
+            }
 
             if results.is_empty() {
                 return Ok(CallToolResult::text("No matches found."));
@@ -1232,7 +1468,6 @@ async fn handle_search_workspace(
             Ok(CallToolResult::text(out))
         }
         "regex" => {
-            // Delegate to filesystem_grep
             let mut grep_params = params.arguments.clone();
             grep_params["is_regex"] = serde_json::json!(true);
             if let Some(pf) = path_filter {
@@ -1242,10 +1477,9 @@ async fn handle_search_workspace(
                 name: "filesystem_grep".into(),
                 arguments: grep_params,
             };
-            handle_filesystem_grep(server, &synthetic)
+            handle_filesystem_grep(server, &synthetic).await
         }
         "graph" => {
-            // Interface implementations or symbol search via knowledge graph.
             if query.is_empty() {
                 return Ok(CallToolResult::error("query is required for graph search"));
             }
@@ -1269,9 +1503,19 @@ async fn handle_search_workspace(
             }
             Ok(CallToolResult::text(out))
         }
+        "related_context" => {
+            let file_path = if !query.is_empty() {
+                query.clone()
+            } else {
+                return Ok(CallToolResult::error(
+                    "query (file path) is required for related_context",
+                ));
+            };
+            handle_get_related_context(server, &file_path).await
+        }
         "index_status" => handle_index_status(server).await,
         _ => Ok(CallToolResult::error(format!(
-            "Invalid action '{action}'. Use: vector, regex, index_status"
+            "Invalid action '{action}'. Use: vector, regex, graph, related_context, index_status"
         ))),
     }
 }
@@ -1346,8 +1590,11 @@ async fn handle_analyze_code(server: &Server, params: &CallToolParams) -> Result
             };
             handle_distill_package_purpose(server, &synthetic).await
         }
+        "architecture" => handle_analyze_architecture(server, params).await,
+        "api_list" => handle_list_api_endpoints(server, params).await,
+        "docstring" => handle_generate_docstring_prompt(server, params).await,
         _ => Ok(CallToolResult::error(format!(
-            "Invalid action '{action}'. Use: ast_skeleton, dead_code, duplicate_code, dependencies, distill_package"
+            "Invalid action '{action}'. Use: ast_skeleton, dead_code, duplicate_code, dependencies, distill_package, architecture, api_list, docstring"
         ))),
     }
 }
@@ -1368,8 +1615,9 @@ async fn handle_modify_workspace(
         "create_file" => handle_create_file(server, params),
         "run_linter" => handle_run_linter(server, params).await,
         "verify_patch" => handle_verify_patch(server, params),
+        "auto_fix" => handle_auto_fix(server, params).await,
         _ => Ok(CallToolResult::error(format!(
-            "Invalid action '{action}'. Use: apply_patch, create_file, run_linter, verify_patch"
+            "Invalid action '{action}'. Use: apply_patch, create_file, run_linter, verify_patch, auto_fix"
         ))),
     }
 }
@@ -1501,6 +1749,81 @@ fn handle_verify_patch(server: &Server, params: &CallToolParams) -> Result<CallT
     }
 }
 
+async fn handle_auto_fix(server: &Server, params: &CallToolParams) -> Result<CallToolResult> {
+    let diag_json = match optional_string_arg(params, "diagnostic_json") {
+        Some(s) if !s.is_empty() => s,
+        _ => return Ok(CallToolResult::error("diagnostic_json is required")),
+    };
+
+    // Parse the diagnostic — expect { "path": "...", "message": "...", "range": { "start": { "line": N } } }
+    let diag: serde_json::Value = serde_json::from_str(&diag_json)
+        .map_err(|e| anyhow::anyhow!("invalid diagnostic JSON: {e}"))?;
+
+    let path = diag["path"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("diagnostic_json must contain 'path'"))?;
+    let message = diag["message"].as_str().unwrap_or("unknown error");
+    let line = diag["range"]["start"]["line"].as_u64().unwrap_or(0) as usize;
+
+    let abs = server
+        .path_guard
+        .validate(path)
+        .map_err(|e| anyhow::anyhow!("path guard: {e}"))?;
+
+    let content = tokio::fs::read_to_string(&abs)
+        .await
+        .map_err(|e| anyhow::anyhow!("read failed: {e}"))?;
+
+    let lines: Vec<&str> = content.lines().collect();
+    let context_start = line.saturating_sub(2);
+    let context_end = (line + 3).min(lines.len());
+    let snippet = lines[context_start..context_end].join("\n");
+
+    // If an LSP server is available, request code actions for the diagnostic range
+    let abs_str = abs.to_string_lossy().to_string();
+    if let Some(lsp) = server.lsp_pool.get_for_path(&abs_str) {
+        let code_actions_result = lsp
+            .call(
+                "textDocument/codeAction",
+                serde_json::json!({
+                    "textDocument": { "uri": format!("file://{abs_str}") },
+                    "range": {
+                        "start": { "line": line, "character": 0 },
+                        "end":   { "line": line, "character": 0 }
+                    },
+                    "context": {
+                        "diagnostics": [diag],
+                        "only": ["quickfix"]
+                    }
+                }),
+            )
+            .await;
+
+        if let Ok(actions) = code_actions_result {
+            if let Some(arr) = actions.as_array()
+                && !arr.is_empty()
+            {
+                let titles: Vec<_> = arr.iter().filter_map(|a| a["title"].as_str()).collect();
+                return Ok(CallToolResult::text(format!(
+                    "### LSP Code Actions for `{path}` line {}\n\nDiagnostic: {message}\n\nAvailable fixes:\n{}",
+                    line + 1,
+                    titles
+                        .iter()
+                        .map(|t| format!("- {t}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )));
+            }
+        }
+    }
+
+    // Fallback: return the diagnostic + snippet for the agent to fix manually.
+    Ok(CallToolResult::text(format!(
+        "### Auto-Fix: No LSP Action Available\n\n**File**: `{path}` line {}\n**Diagnostic**: {message}\n\n**Context**:\n```\n{snippet}\n```\n\nLSP has no automatic fix. Agent: please analyze this snippet and provide a manual fix using `apply_patch`.",
+        line + 1
+    )))
+}
+
 // ---------------------------------------------------------------------------
 // lsp_query — definition / references / type_hierarchy / impact_analysis
 // ---------------------------------------------------------------------------
@@ -1621,17 +1944,36 @@ pub async fn handle_distill_package_purpose(
         ));
     }
 
-    let system_prompt = "You are a Senior Software Architect. Analyse the provided source code and produce a concise Markdown summary covering: 1) Purpose, 2) Key architectural decisions, 3) Implementation rules. Be brief and actionable.";
-    let user_prompt = format!("Package path: {pkg_path}\n\n{content}");
+    // Build a symbol-based summary without an external LLM.
+    let mut symbols: Vec<String> = Vec::new();
+    let mut files: Vec<String> = Vec::new();
+    for r in &records {
+        let meta = r.metadata_json();
+        files.push(r.metadata_str("path"));
+        if let Some(syms) = meta["symbols"].as_array() {
+            symbols.extend(syms.iter().filter_map(|v| v.as_str().map(String::from)));
+        }
+    }
+    symbols.sort();
+    symbols.dedup();
+    files.sort();
+    files.dedup();
 
-    let client = crate::llm::gemini::GeminiClient::new(&server.config);
-    let summary = client
-        .generate_completion(
-            &server.config.default_gemini_model,
-            system_prompt,
-            &user_prompt,
-        )
-        .await?;
+    let summary = format!(
+        "## Package: {pkg_path}\n\n**Files** ({}):\n{}\n\n**Exported Symbols** ({}):\n{}",
+        files.len(),
+        files
+            .iter()
+            .map(|f| format!("- {f}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        symbols.len(),
+        symbols
+            .iter()
+            .map(|s| format!("- `{s}`"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
 
     // Re-index the distilled summary with high-priority metadata.
     let vector = server.embedder.embed_text(&summary)?;

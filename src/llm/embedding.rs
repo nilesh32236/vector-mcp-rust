@@ -283,8 +283,15 @@ impl Embedder {
             let enc = tokenizer
                 .encode((query.to_string(), doc.clone()), true)
                 .map_err(|e| anyhow::anyhow!("Rerank tokenization failed: {e}"))?;
-            all_ids.extend(enc.get_ids().iter().map(|&x| x as i64));
-            all_mask.extend(enc.get_attention_mask().iter().map(|&x| x as i64));
+            // Truncate or pad each sequence to exactly MAX_SEQ_LEN so the
+            // flat Vec has a consistent stride for Array2::from_shape_vec.
+            let ids = enc.get_ids();
+            let mask = enc.get_attention_mask();
+            let seq_len = ids.len().min(MAX_SEQ_LEN);
+            for j in 0..MAX_SEQ_LEN {
+                all_ids.push(if j < seq_len { ids[j] as i64 } else { 0 });
+                all_mask.push(if j < seq_len { mask[j] as i64 } else { 0 });
+            }
         }
 
         let input_ids = Array2::from_shape_vec((batch_size, MAX_SEQ_LEN), all_ids)?;

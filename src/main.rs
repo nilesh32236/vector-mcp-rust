@@ -32,18 +32,17 @@ use crate::llm::embedding::Embedder;
 use crate::llm::summarizer::Summarizer;
 
 // ---------------------------------------------------------------------------
-// Logging
+// Logging & Telemetry
 // ---------------------------------------------------------------------------
 
-/// Initialise structured logging.
-///
-/// Writes JSON log lines to `log_path` (default `~/.local/share/vector-mcp-rust/mcp.log`).
-/// **stderr is intentionally left clean** — the MCP protocol uses stderr for
-/// JSON-RPC framing, so mixing log output there would corrupt the stream for
-/// clients like Claude Desktop or Cursor.
-///
-/// Set `RUST_LOG` to control the log level (default: `info`).
-fn setup_logging(log_path: &std::path::Path) -> tracing_appender::non_blocking::WorkerGuard {
+/// Initialise structured logging and OpenTelemetry.
+fn setup_logging(
+    log_path: &std::path::Path,
+) -> Result<tracing_appender::non_blocking::WorkerGuard> {
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_otlp::WithExportConfig;
+    use opentelemetry_sdk::Resource;
+    use opentelemetry_sdk::trace::SdkTracerProvider;
     use tracing_subscriber::prelude::*;
 
     // Ensure the log directory exists.
@@ -66,15 +65,36 @@ fn setup_logging(log_path: &std::path::Path) -> tracing_appender::non_blocking::
         .json()
         .with_writer(non_blocking_file);
 
-    // Also log to stderr so journalctl -u vector-mcp-rust -f works
     let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
 
-    tracing_subscriber::registry()
+    let registry = tracing_subscriber::registry()
         .with(env_filter)
         .with(file_layer)
-        .with(stderr_layer)
-        .init();
-    guard
+        .with(stderr_layer);
+
+    if std::env::var("ENABLE_OTEL").is_ok() {
+        let exporter = opentelemetry_otlp::SpanExporter::builder()
+            .with_tonic()
+            .with_endpoint("http://localhost:4317")
+            .build()?;
+
+        let provider = SdkTracerProvider::builder()
+            .with_batch_exporter(exporter)
+            .with_resource(
+                Resource::builder()
+                    .with_service_name("vector-mcp-rust")
+                    .build(),
+            )
+            .build();
+
+        let tracer = provider.tracer("vector-mcp-rust");
+        let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
+        registry.with(telemetry).init();
+    } else {
+        registry.init();
+    }
+
+    Ok(guard)
 }
 
 // ---------------------------------------------------------------------------
@@ -98,7 +118,7 @@ async fn start_background_tasks(
     embedder: Arc<Embedder>,
     summarizer: Arc<Summarizer>,
     progress: Arc<std::sync::RwLock<crate::indexer::scanner::ProgressState>>,
-) -> Result<()> {
+) -> Result<Option<notify::RecommendedWatcher>> {
     // Initial scan.
     let (c, s, e, su, p) = (
         Arc::clone(&config),
@@ -111,8 +131,8 @@ async fn start_background_tasks(
         let _ = crate::indexer::scanner::scan_project(c, s, e, su, p, None).await;
     });
 
-    // File watcher.
-    indexer::watcher::start_watcher(
+    // File watcher — caller must hold the returned watcher alive.
+    let watcher = indexer::watcher::start_watcher(
         Arc::clone(&config),
         Arc::clone(&store),
         Arc::clone(&embedder),
@@ -121,7 +141,7 @@ async fn start_background_tasks(
     .await
     .context("Starting background watcher")?;
 
-    Ok(())
+    Ok(watcher)
 }
 
 // ---------------------------------------------------------------------------
@@ -134,7 +154,7 @@ async fn main() -> Result<()> {
     let cfg = config::Config::load()?;
 
     // 2. Structured logging → file (stderr stays clean for MCP JSON-RPC).
-    let _log_guard = setup_logging(&cfg.log_path);
+    let _log_guard = setup_logging(&cfg.log_path)?;
 
     info!(
         project_root = %*cfg.project_root.read().unwrap(),
@@ -211,8 +231,8 @@ async fn run_master(cfg: Config, socket_path: String) -> Result<()> {
         });
     }
 
-    // Initial scan + file watcher.
-    start_background_tasks(
+    // Initial scan + file watcher — hold the watcher alive for the process lifetime.
+    let _watcher = start_background_tasks(
         Arc::clone(&config),
         Arc::clone(&store),
         Arc::clone(&embedder),
@@ -221,7 +241,7 @@ async fn run_master(cfg: Config, socket_path: String) -> Result<()> {
     )
     .await?;
 
-    // Watcher reload channel.
+    // Watcher reload channel — hold each new watcher alive by storing it.
     let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel::<String>(10);
     {
         let cfg3 = Arc::clone(&config);
@@ -229,14 +249,17 @@ async fn run_master(cfg: Config, socket_path: String) -> Result<()> {
         let emb3 = Arc::clone(&embedder);
         let sum3 = Arc::clone(&summarizer);
         tokio::spawn(async move {
+            let mut _active_watcher: Option<notify::RecommendedWatcher> = None;
             while reload_rx.recv().await.is_some() {
-                let _ = indexer::watcher::start_watcher(
+                _active_watcher = indexer::watcher::start_watcher(
                     Arc::clone(&cfg3),
                     Arc::clone(&store3),
                     Arc::clone(&emb3),
                     Arc::clone(&sum3),
                 )
-                .await;
+                .await
+                .ok()
+                .flatten();
             }
         });
     }
@@ -276,8 +299,8 @@ async fn run_slave(cfg: Config, socket_path: String) -> Result<()> {
     let db_uri = config.db_path.display().to_string();
     let store = Arc::new(db::connect_store(&db_uri, config.dimension).await?);
 
-    // Embedder: load locally (slaves may run on the same machine).
-    // If you want fully remote embedding, swap this for RemoteEmbedder.
+    // NOTE: Embedder is loaded locally until the Server struct is refactored to
+    // accept a trait object. RemoteEmbedder exists in daemon::slave for that future work.
     let embedder = Arc::new(Embedder::new(&config)?);
     let summarizer = Arc::new(Summarizer::new(&config)?);
 

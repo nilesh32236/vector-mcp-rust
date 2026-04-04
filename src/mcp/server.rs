@@ -173,7 +173,7 @@ impl Server {
         };
 
         info!(method = %request.method, "Processed MCP message");
-        info!(response = %serde_json::to_string(&response).unwrap_or_default(), "Outgoing response");
+        debug!(response = %serde_json::to_string(&response).unwrap_or_default(), "Outgoing response");
         response
     }
 

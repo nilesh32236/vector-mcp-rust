@@ -37,9 +37,10 @@ fn tool_search_workspace() -> ToolInfo {
         name: "search_workspace".into(),
         description: concat!(
             "Unified codebase search. ",
-            "action='vector': semantic similarity search. ",
+            "action='vector': semantic similarity search with optional cross-encoder reranking. ",
             "action='regex': exact text / regex grep across files. ",
             "action='graph': knowledge-graph traversal (interface implementations, symbol usage). ",
+            "action='related_context': fetch file chunks + dependency chunks + usage samples for a file path (pass path as 'query'). ",
             "action='index_status': check background indexing progress."
         )
         .into(),
@@ -118,7 +119,10 @@ fn tool_analyze_code() -> ToolInfo {
             "action='dead_code': find exported symbols never imported or called. ",
             "action='duplicate_code': detect semantically similar code blocks. ",
             "action='dependencies': validate package.json / go.mod / requirements.txt. ",
-            "action='distill_package': summarise a package and re-index with 2x priority."
+            "action='distill_package': summarise a package and re-index with 2x priority. ",
+            "action='architecture': generate a Mermaid.js dependency graph of packages. ",
+            "action='api_list': discover API route definitions (GET/POST/HandleFunc). ",
+            "action='docstring': generate a rich LLM prompt for documenting a code entity."
         )
         .into(),
         input_schema: ToolInputSchema {
@@ -126,7 +130,7 @@ fn tool_analyze_code() -> ToolInfo {
             properties: json!({
                 "action": {
                     "type": "string",
-                    "description": "ast_skeleton | dead_code | duplicate_code | dependencies | distill_package"
+                    "description": "ast_skeleton | dead_code | duplicate_code | dependencies | distill_package | architecture | api_list | docstring"
                 },
                 "path": {
                     "type": "string",
@@ -135,6 +139,22 @@ fn tool_analyze_code() -> ToolInfo {
                 "is_library": {
                     "type": "boolean",
                     "description": "dead_code only: set true for library packages to skip public exports"
+                },
+                "monorepo_prefix": {
+                    "type": "string",
+                    "description": "architecture only: filter edges to packages starting with this prefix"
+                },
+                "file_path": {
+                    "type": "string",
+                    "description": "docstring only: path to the file containing the entity"
+                },
+                "entity_name": {
+                    "type": "string",
+                    "description": "docstring only: name of the function/class/symbol to document"
+                },
+                "language": {
+                    "type": "string",
+                    "description": "docstring only: override language detection (Go, TypeScript, Python, Rust)"
                 }
             }),
             required: vec![],
@@ -151,7 +171,8 @@ fn tool_modify_workspace() -> ToolInfo {
             "action='apply_patch': search-and-replace with LSP diagnostic verification. ",
             "action='create_file': create a new file with content. ",
             "action='run_linter': run a formatter (gofmt | rustfmt | prettier). ",
-            "action='verify_patch': dry-run — check if a patch is applicable without writing."
+            "action='verify_patch': dry-run — check if a patch is applicable without writing. ",
+            "action='auto_fix': automatically fix diagnostics using the provided diagnostic JSON."
         )
         .into(),
         input_schema: ToolInputSchema {
@@ -159,13 +180,14 @@ fn tool_modify_workspace() -> ToolInfo {
             properties: json!({
                 "action": {
                     "type": "string",
-                    "description": "apply_patch | create_file | run_linter | verify_patch"
+                    "description": "apply_patch | create_file | run_linter | verify_patch | auto_fix"
                 },
-                "path":    { "type": "string", "description": "Target file path" },
-                "content": { "type": "string", "description": "File content for create_file" },
-                "search":  { "type": "string", "description": "Exact text block to find (apply_patch / verify_patch)" },
-                "replace": { "type": "string", "description": "Replacement text (apply_patch)" },
-                "tool":    { "type": "string", "description": "Formatter name: gofmt | rustfmt | prettier" }
+                "path":            { "type": "string", "description": "Target file path" },
+                "content":         { "type": "string", "description": "File content for create_file" },
+                "search":          { "type": "string", "description": "Exact text block to find (apply_patch / verify_patch)" },
+                "replace":         { "type": "string", "description": "Replacement text (apply_patch)" },
+                "tool":            { "type": "string", "description": "Formatter name: gofmt | rustfmt | prettier" },
+                "diagnostic_json": { "type": "string", "description": "JSON-encoded diagnostics array for auto_fix" }
             }),
             required: vec![],
         },

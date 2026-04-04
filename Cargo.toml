@@ -2,6 +2,7 @@
 name = "vector-mcp-rust"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.87"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -44,3 +45,11 @@ tiktoken-rs = "0.9.1"
 reqwest = { version = "0.12", features = ["blocking", "json"] }
 sha2 = "0.10"
 hex = "0.4"
+tantivy = "0.24.2"
+opentelemetry = "0.31.0"
+opentelemetry_sdk = { version = "0.31.0", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.31.1", features = ["grpc-tonic"] }
+tracing-opentelemetry = "0.32.1"
+opentelemetry-semantic-conventions = "0.31.0"
+tonic = "0.14.5"
+prost = "0.14.3"
