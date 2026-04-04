@@ -25,9 +25,9 @@ pub struct FeatureToggles {
 ///
 /// All fields are resolved once at startup via [`Config::load`] and then
 /// shared immutably (wrapped in `Arc`) with every subsystem.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
-    pub project_root: String,
+    pub project_root: std::sync::RwLock<String>,
     pub data_dir: PathBuf,
     pub db_path: PathBuf,
     pub models_dir: PathBuf,
@@ -133,7 +133,7 @@ impl Config {
             .to_string();
 
         Ok(Self {
-            project_root,
+            project_root: std::sync::RwLock::new(project_root),
             data_dir,
             db_path,
             models_dir,

@@ -88,6 +88,7 @@ fn resolve_language(ext: &str) -> Option<LangSpec> {
         ".tsx" => (tree_sitter_typescript::LANGUAGE_TSX.into(), JS_TS_QUERIES),
         ".php" => (tree_sitter_php::LANGUAGE_PHP.into(), PHP_QUERIES),
         ".rs" => (tree_sitter_rust::LANGUAGE.into(), RUST_QUERIES),
+        ".py" => (tree_sitter_python::LANGUAGE.into(), PYTHON_QUERIES),
         _ => return None,
     };
 
@@ -130,6 +131,20 @@ const RUST_QUERIES: &[&str] = &[
     "(enum_item name: (type_identifier) @name) @entity",
     "(trait_item name: (type_identifier) @name) @entity",
     "(impl_item type: (type_identifier) @name) @entity",
+];
+
+/// Python S-expression queries — mirrors Go's `chunker.go` PYTHON_QUERIES block.
+///
+/// Captures top-level and class-level function definitions, class declarations,
+/// and decorated functions (e.g. `@staticmethod`, `@property`).
+const PYTHON_QUERIES: &[&str] = &[
+    // Top-level function definitions
+    "(function_definition name: (identifier) @name) @entity",
+    // Class definitions
+    "(class_definition name: (identifier) @name) @entity",
+    // Decorated definitions (e.g. @staticmethod, @classmethod, @property)
+    "(decorated_definition definition: (function_definition name: (identifier) @name)) @entity",
+    "(decorated_definition definition: (class_definition name: (identifier) @name)) @entity",
 ];
 
 // ---------------------------------------------------------------------------

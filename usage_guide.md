@@ -1,76 +1,77 @@
 # vector-mcp-rust: User Guide & Verification 🚀
 
-This guide explains how to verify your server and connect it to AI agents like Claude Desktop.
+This guide explains how to build your server, configure it, and connect it to AI agents like Claude Desktop.
 
-## 1. Manual Verification (Immediate)
+## 1. Building the Server
 
-### A. Test SSE Connection (URL)
-Run the server and then use `curl` to verify the SSE handshake:
-
-```bash
-# Terminal 1: Start the server
-cargo run --release
-
-# Terminal 2: Test the SSE endpoint
-curl -N http://localhost:47821/sse
-```
-
-**Expected Result**: You should see an `event: endpoint` with a data string like `/message?session_id=...`. This confirms the HTTP server is alive and session-aware.
-
-### B. Test a Tool Call (via Stdio)
-You can manually pipe a JSON-RPC request into the server to test tool execution:
+The server is written in Rust and requires `cargo`. It compiles to a single, statically-linked binary optimized for CPU.
 
 ```bash
-echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | cargo run --release --quiet
+cd vector-mcp-rust
+cargo build --release
 ```
 
-**Expected Result**: A JSON response containing the list of 16+ tools.
+The compiled binary will be located at `target/release/vector-mcp-rust`.
 
----
+## 2. Configuration
 
-## 2. Connecting to AI Agents
+Create a `.env` file in your project root or set the environment variables globally:
 
-### A. Claude Desktop (Stdio)
-To use `vector-mcp-rust` as a tool provider in Claude Desktop, add it to your configuration:
+```env
+# Path to store the LanceDB vector database
+MCP_DB_PATH=~/.local/share/vector-mcp-rust/db
 
-**Location**:
-- Linux: `~/.config/Claude/claude_desktop_config.json`
-- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
+# Port for the HTTP API and SSE connection
+API_PORT=47821
 
-**Configuration**:
+# Enable/Disable features
+ENABLE_LIVE_INDEXING=true
+ENABLE_LOCAL_LLM=true
+
+# (Optional) API key for Gemini if you want to use cloud distillation
+# instead of the local GGUF model for large package summaries.
+GEMINI_API_KEY=your_key_here
+```
+
+## 3. Running as a Standalone Server
+
+You can run the server directly in your terminal. It will default to the current directory as the project root.
+
+```bash
+./target/release/vector-mcp-rust
+```
+
+When you start the server for the first time, it will automatically download the embedding model (ONNX) and the summarization model (GGUF) to your local cache. **This may take a few minutes depending on your internet connection.**
+
+## 4. Connecting to Claude Desktop
+
+To use this server with Claude Desktop, you need to configure it as an MCP tool provider.
+
+Open your Claude Desktop config file:
+- **Mac**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Linux**: `~/.config/Claude/claude_desktop_config.json`
+
+Add the following configuration:
+
 ```json
 {
   "mcpServers": {
     "vector-mcp": {
-      "command": "/bin/bash",
-      "args": ["-c", "cd /home/nilesh/Documents/vector-mcp/vector-mcp-rust && cargo run --release --quiet"]
+      "command": "/absolute/path/to/your/vector-mcp-rust/target/release/vector-mcp-rust",
+      "env": {
+        "API_PORT": "47821",
+        "RUST_LOG": "info"
+      }
     }
   }
 }
 ```
 
-### B. Agents supporting SSE (URL)
-If your agent supports HTTP/SSE (like many custom web-based agents), point it to:
-- **URL**: `http://localhost:47821/sse`
+Restart Claude Desktop.
 
----
+## 5. Troubleshooting
 
-## 3. Official Verification (MCP Inspector)
-The recommended way to test any MCP server is the [MCP Inspector](https://github.com/modelcontextprotocol/inspector).
-
-### Stdio Test:
-```bash
-npx @modelcontextprotocol/inspector /home/nilesh/Documents/vector-mcp/vector-mcp-rust/target/release/vector-mcp-rust
-```
-
-### SSE Test:
-```bash
-npx @modelcontextprotocol/inspector http://localhost:47821/sse
-```
-
----
-
-## 4. Troubleshooting
-- **Build Lock**: If `cargo` hangs, run `pkill -f vector-mcp-rust` to clear stale builds.
-- **Port Conflict**: If `47821` is taken, set `API_PORT=5000` in your `.env` file or shell.
-- **Models**: The first run will be slow as it downloads the embedding model (~100MB).
+-   **"Method not found" / Timeout**: Ensure the binary path in `claude_desktop_config.json` is absolute and correct.
+-   **High Memory Usage**: The server spawns LSP child processes (like `tsserver`) to verify patches. These will automatically shut down after 10 minutes of inactivity.
+-   **Port Conflicts**: If port `47821` is in use, change `API_PORT` in your `.env` or Claude config.
+-   **Logs**: Check `~/.local/share/vector-mcp-rust/mcp.log` for detailed JSON-formatted logs without interrupting the MCP JSON-RPC stream.

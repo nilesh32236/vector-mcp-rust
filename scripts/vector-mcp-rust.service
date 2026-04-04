@@ -1,0 +1,20 @@
+[Unit]
+Description=Vector MCP Rust Master Daemon
+After=network.target
+
+[Service]
+Type=simple
+User=nilesh
+Group=nilesh
+WorkingDirectory=/home/nilesh/Documents/vector-mcp/vector-mcp-rust
+EnvironmentFile=/home/nilesh/Documents/vector-mcp/vector-mcp-rust/.env
+Environment=RUST_LOG=info
+Environment=HF_HOME=/home/nilesh/Documents/vector-mcp/vector-mcp-rust/.data/hf_cache
+Environment=HF_ENDPOINT=https://huggingface.co
+ExecStart=/home/nilesh/Documents/vector-mcp/vector-mcp-rust/target/release/vector-mcp-rust
+Restart=always
+RestartSec=10
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

@@ -1,10 +1,11 @@
 //! SSE transport for MCP.
 
 use axum::{
-    Router,
+    Json, Router,
     extract::{Host, Query, State},
-    http::StatusCode,
-    response::{Sse, sse::Event},
+    http::{Request, StatusCode, header},
+    middleware::{self, Next},
+    response::{IntoResponse, Sse, sse::Event},
     routing::{get, post},
 };
 use dashmap::DashMap;
@@ -16,7 +17,7 @@ use std::task::{Context, Poll};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 use tower_http::cors::CorsLayer;
-use tracing::{info, warn};
+use tracing::info;
 use uuid::Uuid;
 
 use super::server::Server;
@@ -28,8 +29,11 @@ use super::server::Server;
 type SessionSender = mpsc::UnboundedSender<Event>;
 
 pub struct SseManager {
+    /// session_id -> SSE event sender (populated when GET /sse opens the stream)
     sessions: DashMap<String, SessionSender>,
     server: Arc<Server>,
+    /// Most recently active session (fallback for clients that don't send mcp-session-id)
+    last_session: Arc<std::sync::RwLock<Option<String>>>,
 }
 
 impl SseManager {
@@ -37,6 +41,7 @@ impl SseManager {
         Self {
             sessions: DashMap::new(),
             server,
+            last_session: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 }
@@ -66,6 +71,10 @@ impl<S> Drop for SessionCleanupStream<S> {
     fn drop(&mut self) {
         info!(session = %self.session_id, "SSE session disconnected, cleaning up");
         self.manager.sessions.remove(&self.session_id);
+        self.manager
+            .server
+            .progress_senders
+            .remove(&self.session_id);
     }
 }
 
@@ -73,71 +82,167 @@ impl<S> Drop for SessionCleanupStream<S> {
 // Handlers
 // ---------------------------------------------------------------------------
 
-#[derive(serde::Deserialize)]
-struct MessageQuery {
-    session_id: String,
+/// POST /sse or POST /message — Receive JSON-RPC messages.
+///
+/// MCP 2025 streamable-HTTP flow:
+///   1. Client POSTs `initialize` → server creates session, returns response + `mcp-session-id` header.
+///   2. Client GETs `/sse?session_id=<id>` → opens the SSE stream for server-push.
+///   3. All subsequent POSTs carry `mcp-session-id` header or `session_id` query param.
+async fn message_handler(
+    State(manager): State<Arc<SseManager>>,
+    Query(params): Query<HashMap<String, String>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let body_str = String::from_utf8_lossy(&body).to_string();
+
+    // Extract session ID from header or query param
+    let provided_sid = headers
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .or_else(|| params.get("session_id").cloned());
+
+    let method = serde_json::from_str::<serde_json::Value>(&body_str)
+        .ok()
+        .and_then(|v| v["method"].as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
+
+    // `initialize` creates a new session
+    if method == "initialize" {
+        let sid = Uuid::new_v4().to_string();
+        // Pre-register a placeholder progress sender (replaced when GET /sse opens the stream)
+        let (val_tx, _) = mpsc::unbounded_channel::<serde_json::Value>();
+        manager.server.progress_senders.insert(sid.clone(), val_tx);
+        if let Ok(mut last) = manager.last_session.write() {
+            *last = Some(sid.clone());
+        }
+        let response = manager
+            .server
+            .process_message_with_session(&body_str, Some(&sid))
+            .await;
+        return (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/json".to_string()),
+                (header::HeaderName::from_static("mcp-session-id"), sid),
+            ],
+            Json(response),
+        )
+            .into_response();
+    }
+
+    // All other requests require a valid session ID — fall back to last known session
+    let sid = provided_sid
+        .or_else(|| manager.last_session.read().ok().and_then(|g| g.clone()))
+        .unwrap_or_default();
+
+    let server = Arc::clone(&manager.server);
+
+    // Synchronous methods: respond directly in the HTTP body
+    if matches!(
+        method.as_str(),
+        "tools/list" | "tools/call" | "notifications/initialized" | "initialized"
+    ) {
+        let response = server
+            .process_message_with_session(&body_str, Some(&sid))
+            .await;
+        return (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/json".to_string()),
+                (header::HeaderName::from_static("mcp-session-id"), sid),
+            ],
+            Json(response),
+        )
+            .into_response();
+    }
+
+    // Async methods: push response over SSE stream
+    let sender = manager.sessions.get(&sid).map(|s| s.clone());
+    let sid_for_task = sid.clone();
+    tokio::spawn(async move {
+        let response = server
+            .process_message_with_session(&body_str, Some(&sid_for_task))
+            .await;
+        if !response.is_null() {
+            if let Some(tx) = sender {
+                let event = Event::default()
+                    .event("message")
+                    .data(serde_json::to_string(&response).unwrap_or_default());
+                let _ = tx.send(event);
+            }
+        }
+    });
+
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/json".to_string()),
+            (header::HeaderName::from_static("mcp-session-id"), sid),
+        ],
+        Json(serde_json::json!({})),
+    )
+        .into_response()
 }
 
-/// GET /sse — Start the SSE connection.
+/// GET /sse?session_id=<id> — Open the SSE stream for an existing session.
 async fn sse_handler(
     Host(host): Host,
     State(manager): State<Arc<SseManager>>,
-) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
-    let session_id = Uuid::new_v4().to_string();
-    let (tx, rx) = mpsc::unbounded_channel();
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let session_id = match params.get("session_id").cloned() {
+        Some(sid) => sid,
+        // Legacy clients that open SSE before initialize: create a new session
+        None => Uuid::new_v4().to_string(),
+    };
 
+    let (tx, rx) = mpsc::unbounded_channel::<Event>();
     manager.sessions.insert(session_id.clone(), tx.clone());
+    if let Ok(mut last) = manager.last_session.write() {
+        *last = Some(session_id.clone());
+    }
 
-    info!(session = %session_id, "new SSE session");
+    // Wire up progress notifications for this session
+    let (val_tx, mut val_rx) = mpsc::unbounded_channel::<serde_json::Value>();
+    let event_tx = tx.clone();
+    tokio::spawn(async move {
+        while let Some(v) = val_rx.recv().await {
+            let data = serde_json::to_string(&v).unwrap_or_default();
+            if event_tx
+                .send(Event::default().event("message").data(data))
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    manager
+        .server
+        .progress_senders
+        .insert(session_id.clone(), val_tx);
 
-    // Send the endpoint event as per MCP spec.
-    // The client will use this URL to POST messages.
-    // Use an absolute URL as some clients are sensitive to relative paths.
-    // Dynamically build the absolute URL based on the incoming Host header.
+    info!(session = %session_id, "SSE stream opened");
+
+    // Send the endpoint URL so legacy SSE clients know where to POST
     let endpoint_url = format!("http://{}/message?session_id={}", host, session_id);
     let _ = tx.send(Event::default().event("endpoint").data(endpoint_url));
 
-    let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx).map(Ok);
-    let session_cleanup = SessionCleanupStream {
+    let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(rx)
+        .map(Ok::<Event, std::convert::Infallible>);
+    let cleanup = SessionCleanupStream {
         inner: Box::pin(stream),
         session_id: session_id.clone(),
         manager: Arc::clone(&manager),
     };
 
-    Sse::new(session_cleanup)
-}
-
-/// POST /message — Receive JSON-RPC messages.
-async fn message_handler(
-    State(manager): State<Arc<SseManager>>,
-    Query(query): Query<MessageQuery>,
-    body: String,
-) -> StatusCode {
-    let sender = manager.sessions.get(&query.session_id).map(|s| s.clone());
-
-    let tx = match sender {
-        Some(t) => t,
-        None => {
-            warn!(session = %query.session_id, "message posted to invalid session");
-            return StatusCode::NOT_FOUND;
-        }
-    };
-
-    let server = Arc::clone(&manager.server);
-    let session_id = query.session_id.clone();
-
-    // Process the message asynchronously and send the response back via SSE.
-    tokio::spawn(async move {
-        let response = server.process_message(&body).await;
-        let response_json = serde_json::to_string(&response).unwrap_or_default();
-
-        let event = Event::default().event("message").data(response_json);
-        if tx.send(event).is_err() {
-            warn!(session = %session_id, "failed to send response to SSE stream (client disconnected)");
-        }
-    });
-
-    StatusCode::ACCEPTED
+    let mut response = Sse::new(cleanup).into_response();
+    response.headers_mut().insert(
+        header::HeaderName::from_static("mcp-session-id"),
+        header::HeaderValue::from_str(&session_id).unwrap(),
+    );
+    response
 }
 
 // ---------------------------------------------------------------------------
@@ -147,11 +252,23 @@ async fn message_handler(
 pub async fn start_sse_server(server: Arc<Server>, port: u16) -> anyhow::Result<()> {
     let manager = Arc::new(SseManager::new(server));
 
-    // Handle both /sse and /message with a unified approach to avoid 405 Method Not Allowed.
-    // Some clients might POST to /sse or GET /message depending on implementation details.
     let app = Router::new()
-        .route("/sse", get(sse_handler).post(message_handler_permissive))
-        .route("/message", post(message_handler).get(not_found_handler))
+        .route(
+            "/sse",
+            get(sse_handler)
+                .post(message_handler)
+                .delete(delete_session_handler),
+        )
+        .route("/message", post(message_handler))
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(oauth_not_required),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource/sse",
+            get(oauth_not_required),
+        )
+        .layer(middleware::from_fn(logging_middleware))
         .layer(
             CorsLayer::new()
                 .allow_origin(tower_http::cors::Any)
@@ -160,31 +277,31 @@ pub async fn start_sse_server(server: Arc<Server>, port: u16) -> anyhow::Result<
         )
         .with_state(manager);
 
-    let addr = format!("0.0.0.0:{}", port);
+    let addr = format!("[::]:{}", port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-
     info!("SSE server listening on http://{}", addr);
     axum::serve(listener, app).await?;
-
     Ok(())
 }
 
-/// A version of message_handler that can handle session_id from query or body if needed.
-async fn message_handler_permissive(
-    state: State<Arc<SseManager>>,
-    query: Query<HashMap<String, String>>,
-    body: String,
-) -> StatusCode {
-    let session_id = query.get("session_id").cloned();
-    match session_id {
-        Some(sid) => message_handler(state, Query(MessageQuery { session_id: sid }), body).await,
-        None => {
-            warn!("POST to SSE without session_id");
-            StatusCode::METHOD_NOT_ALLOWED
-        }
-    }
+async fn delete_session_handler() -> StatusCode {
+    StatusCode::NO_CONTENT
 }
 
-async fn not_found_handler() -> StatusCode {
-    StatusCode::NOT_FOUND
+/// MCP 2025: respond to OAuth discovery with 200 + no auth required
+async fn oauth_not_required() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        r#"{"resource":"vector-mcp-rust","authorization_servers":[]}"#,
+    )
+}
+
+async fn logging_middleware(req: Request<axum::body::Body>, next: Next) -> impl IntoResponse {
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    info!(method = %method, uri = %uri, "Incoming request");
+    let response = next.run(req).await;
+    info!(method = %method, uri = %uri, status = %response.status(), "Response sent");
+    response
 }
