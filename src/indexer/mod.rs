@@ -3,9 +3,6 @@ pub mod scanner;
 pub mod watcher;
 
 use anyhow::{Context, Result};
-use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, StringArray};
-use arrow_schema::{DataType, Field, Schema};
-use lance_arrow::FixedSizeListArrayExt;
 use serde_json::json;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -15,6 +12,42 @@ use crate::config::Config;
 use crate::db::{Record, Store};
 use crate::llm::embedding::Embedder;
 use crate::llm::summarizer::Summarizer;
+
+pub fn get_directory_tree(path: &std::path::Path, max_depth: usize) -> Result<String> {
+    let mut out = String::new();
+    let mut item_count = 0;
+    let max_items = 1000;
+
+    let walker = ignore::WalkBuilder::new(path)
+        .standard_filters(true)
+        .add_custom_ignore_filename(".vector-ignore")
+        .max_depth(Some(max_depth))
+        .hidden(true)
+        .build();
+
+    for result in walker {
+        if item_count >= max_items {
+            break;
+        }
+        if let Ok(entry) = result {
+            if entry.depth() == 0 {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy();
+            let depth = entry.depth();
+            
+            // Skip common noise
+            if name == "node_modules" || name == ".git" || name == "target" || name == ".next" || name == ".data" {
+                continue;
+            }
+
+            item_count += 1;
+            out.push_str(&format!("{}├── {}\n", "│   ".repeat(depth - 1), name));
+        }
+    }
+
+    Ok(out)
+}
 
 /// Indexes a single file, replacing any existing vectors for that path.
 pub async fn index_file(
@@ -31,15 +64,14 @@ pub async fn index_file(
     let current_hash = compute_hash(&raw_bytes);
 
     // Check if the file already exists in the DB and has the same hash.
-    if let Ok(existing_records) = store.get_records_by_path(path).await {
-        if !existing_records.is_empty() {
+    if let Ok(existing_records) = store.get_records_by_path(path).await
+        && !existing_records.is_empty() {
             let existing_hash = existing_records[0].content_hash();
             if existing_hash == current_hash {
                 tracing::debug!("Skipping indexing for {}: content hash unchanged", path);
                 return Ok(());
             }
         }
-    }
 
     let extension = std::path::Path::new(path)
         .extension()
@@ -118,60 +150,10 @@ pub async fn index_file(
         });
     }
 
-    let batch = records_to_batch(records, config.dimension)?;
     store.delete_by_path(path).await?;
-    store.code_vectors.add(batch).execute().await?;
+    store.upsert_records(records).await?;
 
     Ok(())
-}
-
-fn records_to_batch(records: Vec<Record>, dimension: usize) -> Result<RecordBatch> {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Utf8, false),
-        Field::new("content", DataType::Utf8, false),
-        Field::new(
-            "vector",
-            DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, true)),
-                dimension as i32,
-            ),
-            false,
-        ),
-        Field::new("metadata", DataType::Utf8, true),
-    ]));
-
-    let ids = StringArray::from(records.iter().map(|r| r.id.as_str()).collect::<Vec<_>>());
-    let contents = StringArray::from(
-        records
-            .iter()
-            .map(|r| r.content.as_str())
-            .collect::<Vec<_>>(),
-    );
-    let metadatas = StringArray::from(
-        records
-            .iter()
-            .map(|r| r.metadata.as_str())
-            .collect::<Vec<_>>(),
-    );
-
-    let mut flattened_vectors = Vec::new();
-    for r in &records {
-        flattened_vectors.extend_from_slice(&r.vector);
-    }
-
-    let vector_values = Float32Array::from(flattened_vectors);
-    let vectors = FixedSizeListArray::try_new_from_values(vector_values, dimension as i32)?;
-
-    RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(ids),
-            Arc::new(contents),
-            Arc::new(vectors),
-            Arc::new(metadatas),
-        ],
-    )
-    .context("Creating RecordBatch for indexing")
 }
 
 fn compute_hash(bytes: &[u8]) -> String {

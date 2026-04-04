@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::llm::util::download_direct;
 use anyhow::{Context, Result};
 use candle_core::quantized::gguf_file;
 use candle_core::{Device, Tensor};
@@ -23,25 +24,26 @@ impl Summarizer {
         }
 
         // 1. Download/Cache model from Hugging Face
-        let api = Api::new().context("Failed to create HF API client")?;
-
-        // Check for local model in models_dir first as requested by the user
         let local_model = config.models_dir.join("qwen2.5-0.5b-instruct-q4_k_m.gguf");
         let model_path = if local_model.exists() {
             tracing::info!("Found local model at {:?}", local_model);
             local_model
         } else {
-            tracing::info!("Local model not found in models_dir, downloading from Hugging Face...");
-            let repo = api.model("Qwen/Qwen2.5-0.5B-Instruct-GGUF".to_string());
-            let downloaded_path = repo
-                .get("qwen2.5-0.5b-instruct-q4_k_m.gguf")
-                .context("Failed to download model from Hugging Face")?;
-
-            // Store it in models_dir for future use
-            std::fs::copy(&downloaded_path, &local_model)
-                .context("Failed to copy downloaded model to models_dir")?;
-
-            tracing::info!("Downloaded and stored model at {:?}", local_model);
+            tracing::info!("Local model not found in models_dir, provisioning...");
+            std::fs::create_dir_all(&config.models_dir)?;
+            
+            // Try direct download first for reliability
+            let qwen_gguf_url = "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf";
+            if let Err(e) = download_direct(qwen_gguf_url, &local_model) {
+                tracing::warn!("Direct download of Qwen GGUF failed: {}. Falling back to HF Hub...", e);
+                let api = Api::new().context("Failed to create HF API client")?;
+                let repo = api.model("Qwen/Qwen2.5-0.5B-Instruct-GGUF".to_string());
+                let downloaded_path = repo
+                    .get("qwen2.5-0.5b-instruct-q4_k_m.gguf")
+                    .context("Failed to download model from Hugging Face")?;
+                std::fs::copy(&downloaded_path, &local_model)?;
+            }
+            
             local_model
         };
 
@@ -54,25 +56,24 @@ impl Summarizer {
 
         // 3. Load Tokenizer
         let local_tokenizer = config.models_dir.join("qwen-tokenizer.json");
-        tracing::info!("Checking for local tokenizer at: {:?}", local_tokenizer);
-
         let tokenizer_path = if local_tokenizer.exists() {
             tracing::info!("Found local tokenizer at {:?}", local_tokenizer);
             local_tokenizer
         } else {
-            tracing::info!(
-                "Local tokenizer not found in models_dir, downloading from Hugging Face..."
-            );
-            let token_repo = api.model("Qwen/Qwen2.5-0.5B-Instruct".to_string());
-            let downloaded_path = token_repo
-                .get("tokenizer.json")
-                .context("Failed to download tokenizer from Hugging Face")?;
-
-            // Store it in models_dir for future use with a distinct name to avoid conflicts
-            std::fs::copy(&downloaded_path, &local_tokenizer)
-                .context("Failed to copy downloaded tokenizer to models_dir")?;
-
-            tracing::info!("Downloaded and stored tokenizer at {:?}", local_tokenizer);
+            tracing::info!("Local tokenizer not found in models_dir, provisioning...");
+            
+            let qwen_tokenizer_url = "https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct/resolve/main/tokenizer.json";
+            if let Err(e) = download_direct(qwen_tokenizer_url, &local_tokenizer) {
+                tracing::warn!("Direct download of Qwen tokenizer failed: {}. Falling back to HF Hub...", e);
+                let api = Api::new().context("Failed to create HF API client")?;
+                let token_repo = api.model("Qwen/Qwen2.5-0.5B-Instruct".to_string());
+                let downloaded_path = token_repo
+                    .get("tokenizer.json")
+                    .or_else(|_| token_repo.get("onnx/tokenizer.json"))
+                    .context("Failed to download tokenizer from Hugging Face")?;
+                std::fs::copy(&downloaded_path, &local_tokenizer)?;
+            }
+            
             local_tokenizer
         };
 

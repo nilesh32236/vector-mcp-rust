@@ -1,8 +1,10 @@
+#![allow(dead_code)]
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use crate::config::Config;
 
 #[derive(Debug, Serialize)]
+#[allow(dead_code)]
 pub struct GeminiMessage {
     pub role: String,
     pub parts: Vec<GeminiPart>,
@@ -117,12 +119,10 @@ impl GeminiClient {
 
         let result: GeminiGenerateResponse = response.json().await.context("Failed to parse Gemini response")?;
         
-        let text = result.candidates
-            .get(0)
+        let text = result.candidates.first()
             .context("No candidates in Gemini response")?
             .content
-            .parts
-            .get(0)
+            .parts.first()
             .context("No parts in Gemini candidate content")?
             .text
             .clone();

@@ -11,6 +11,9 @@ use crate::config::Config;
 use crate::db::Store;
 use crate::llm::embedding::Embedder;
 use crate::llm::summarizer::Summarizer;
+use crate::lsp::LspPool;
+use crate::security::pathguard::PathGuard;
+use crate::security::ratelimit::RateLimiter;
 
 use super::handlers;
 use super::protocol::{
@@ -32,6 +35,11 @@ pub struct Server {
     pub summarizer: Arc<Summarizer>,
     pub reload_watcher_tx: tokio::sync::mpsc::Sender<String>,
     pub indexing_progress: Arc<dashmap::DashMap<String, serde_json::Value>>,
+    /// session_id → SSE sender for `$/progress` notifications.
+    pub progress_senders: Arc<dashmap::DashMap<String, tokio::sync::mpsc::UnboundedSender<serde_json::Value>>>,
+    pub path_guard: Arc<PathGuard>,
+    pub rate_limiter: Arc<RateLimiter>,
+    pub lsp_pool: Arc<LspPool>,
 }
 
 impl Server {
@@ -43,6 +51,9 @@ impl Server {
         reload_watcher_tx: tokio::sync::mpsc::Sender<String>,
     ) -> Self {
         let indexing_progress = Arc::new(dashmap::DashMap::new());
+        let root = config.project_root.read().unwrap().clone();
+        let path_guard = PathGuard::new(&root)
+            .unwrap_or_else(|_| PathGuard::new(std::env::temp_dir()).unwrap());
         Self {
             store,
             config,
@@ -50,6 +61,10 @@ impl Server {
             summarizer,
             reload_watcher_tx,
             indexing_progress,
+            progress_senders: Arc::new(dashmap::DashMap::new()),
+            path_guard: Arc::new(path_guard),
+            rate_limiter: Arc::new(RateLimiter::new(30.0, 60.0)),
+            lsp_pool: Arc::new(LspPool::new(root)),
         }
     }
 
@@ -104,7 +119,15 @@ impl Server {
 
     /// Parse one JSON-RPC line and produce the response object.
     pub async fn process_message(&self, line: &str) -> serde_json::Value {
-        // 1. Parse JSON
+        self.process_message_with_session(line, None).await
+    }
+
+    /// Parse one JSON-RPC line, optionally associated with an SSE session.
+    pub async fn process_message_with_session(
+        &self,
+        line: &str,
+        session_id: Option<&str>,
+    ) -> serde_json::Value {
         let request: JsonRpcRequest = match serde_json::from_str(line) {
             Ok(r) => r,
             Err(e) => {
@@ -115,14 +138,13 @@ impl Server {
             }
         };
 
-        // 2. Route by method
         let id = request.id.clone();
-        match request.method.as_str() {
+        let response = match request.method.as_str() {
             "initialize" => {
                 let result = self.handle_initialize();
                 to_json_rpc_value(&JsonRpcResponse::new(id.clone(), json_value(&result)), id)
             }
-            "initialized" => to_json_rpc_value(&JsonRpcResponse::new(id.clone(), json!({})), id),
+            "initialized" | "notifications/initialized" => serde_json::Value::Null,
             "tools/list" => {
                 let tools = tools::tool_definitions();
                 to_json_rpc_value(
@@ -130,7 +152,10 @@ impl Server {
                     id,
                 )
             }
-            "tools/call" => self.handle_tools_call(id, &request.params).await,
+            "tools/call" => {
+                self.handle_tools_call(id, &request.params, session_id)
+                    .await
+            }
             "notifications/cancelled" | "notifications/progress" => {
                 to_json_rpc_value(&JsonRpcResponse::new(id.clone(), json!({})), id)
             }
@@ -142,7 +167,11 @@ impl Server {
                 );
                 to_json_rpc_value(&resp, id)
             }
-        }
+        };
+
+        info!(method = %request.method, "Processed MCP message");
+        info!(response = %serde_json::to_string(&response).unwrap_or_default(), "Outgoing response");
+        response
     }
 
     /// `initialize` — handshake.
@@ -166,7 +195,19 @@ impl Server {
         &self,
         id: Option<serde_json::Value>,
         raw_params: &serde_json::Value,
+        session_id: Option<&str>,
     ) -> serde_json::Value {
+        // --- Rate Limiting ---
+        let key = session_id.unwrap_or("stdio");
+        if !self.rate_limiter.allow(key) {
+            let resp = JsonRpcErrorResponse::new(
+                id.clone(),
+                -32001, // Custom code for rate limiting
+                "Rate limit exceeded (30 requests/min). Please slow down tool calls.".to_string(),
+            );
+            return to_json_rpc_value(&resp, id);
+        }
+
         let params: CallToolParams = match serde_json::from_value(raw_params.clone()) {
             Ok(p) => p,
             Err(e) => {
@@ -179,7 +220,7 @@ impl Server {
             }
         };
 
-        let result: CallToolResult = match handlers::dispatch(self, &params).await {
+        let result: CallToolResult = match handlers::dispatch(self, &params, session_id).await {
             Ok(r) => r,
             Err(e) => {
                 error!(tool = %params.name, err = %e, "handler error");
@@ -193,6 +234,23 @@ impl Server {
         };
 
         to_json_rpc_value(&JsonRpcResponse::new(id.clone(), json_value(&result)), id)
+    }
+
+    /// Emit a `$/progress` JSON-RPC notification to the SSE session (fire-and-forget).
+    #[allow(dead_code)]
+    pub fn emit_progress(&self, session_id: &str, token: &str, progress: u64, total: u64) {
+        if let Some(tx) = self.progress_senders.get(session_id) {
+            let notification = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "$/progress",
+                "params": {
+                    "progressToken": token,
+                    "progress": progress,
+                    "total": total,
+                }
+            });
+            let _ = tx.send(notification);
+        }
     }
 }
 
