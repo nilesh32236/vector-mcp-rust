@@ -28,6 +28,7 @@ use crate::security::ratelimit::RateLimiter;
 pub struct ApiState {
     pub store: Arc<Store>,
     pub embedder: Arc<Embedder>,
+    #[allow(dead_code)]
     pub summarizer: Arc<Summarizer>,
     pub config: Arc<Config>,
     pub index_tx: tokio::sync::mpsc::Sender<String>,

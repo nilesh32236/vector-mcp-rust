@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 use crate::config::Config;
-use crate::llm::models::{ModelConfig, get_model_registry};
+use crate::llm::models::get_model_registry;
 use crate::llm::util::download_direct;
 use anyhow::{Context, Result};
 use hf_hub::api::sync::Api;
@@ -9,7 +9,7 @@ use ort::session::Session;
 use ort::value::Value;
 use std::sync::Mutex;
 use tokenizers::Tokenizer;
-use tracing::{info, warn};
+use tracing::info;
 
 const MAX_SEQ_LEN: usize = 512;
 

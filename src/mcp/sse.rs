@@ -165,13 +165,13 @@ async fn message_handler(
         let response = server
             .process_message_with_session(&body_str, Some(&sid_for_task))
             .await;
-        if !response.is_null() {
-            if let Some(tx) = sender {
-                let event = Event::default()
-                    .event("message")
-                    .data(serde_json::to_string(&response).unwrap_or_default());
-                let _ = tx.send(event);
-            }
+        if !response.is_null()
+            && let Some(tx) = sender
+        {
+            let event = Event::default()
+                .event("message")
+                .data(serde_json::to_string(&response).unwrap_or_default());
+            let _ = tx.send(event);
         }
     });
 
