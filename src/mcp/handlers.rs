@@ -1103,7 +1103,14 @@ async fn handle_get_code_history(
 
     let root = server.config.project_root.read().unwrap().clone();
     let output = tokio::process::Command::new("git")
-        .args(["log", "-n", "5", "--pretty=format:%h - %s", "--", abs.to_str().unwrap_or(&path)])
+        .args([
+            "log",
+            "-n",
+            "5",
+            "--pretty=format:%h - %s",
+            "--",
+            abs.to_str().unwrap_or(&path),
+        ])
         .current_dir(&root)
         .output()
         .await?;
