@@ -205,15 +205,25 @@ async fn handle_find_duplicate_code(
     }
 
     // Combine all chunk content and embed once instead of N separate searches.
-    let combined: String = records.iter().map(|r| r.content.as_str()).collect::<Vec<_>>().join("\n");
+    let combined: String = records
+        .iter()
+        .map(|r| r.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
     let vector = server.embedder.embed_query(&combined)?;
-    let matches = server.store.hybrid_search(vector, &combined, 10, None).await?;
+    let matches = server
+        .store
+        .hybrid_search(vector, &combined, 10, None)
+        .await?;
 
     let mut out = format!("## Duplicate Code Analysis for {target_path}\n\n");
     let mut found = false;
     for m in matches {
         if m.metadata_str("path") != target_path {
-            out.push_str(&format!("- Possible duplicate in `{}`\n", m.metadata_str("path")));
+            out.push_str(&format!(
+                "- Possible duplicate in `{}`\n",
+                m.metadata_str("path")
+            ));
             found = true;
         }
     }
@@ -1019,7 +1029,9 @@ async fn handle_find_missing_tests(
         }
     }
     if missing.is_empty() {
-        return Ok(CallToolResult::text("✅ All exported symbols appear in test files."));
+        return Ok(CallToolResult::text(
+            "✅ All exported symbols appear in test files.",
+        ));
     }
     let mut out = String::from("## ⚠️ Potentially Untested Exports\n\n");
     for (n, p) in missing {
@@ -1082,9 +1094,16 @@ async fn handle_get_code_history(
     params: &CallToolParams,
 ) -> Result<CallToolResult> {
     let path = require_string_arg(params, "file_path")?;
+
+    // Security enhancement: Prevent path traversal by using path_guard
+    let abs = server
+        .path_guard
+        .validate(&path)
+        .map_err(|e| anyhow::anyhow!("path guard: {e}"))?;
+
     let root = server.config.project_root.read().unwrap().clone();
     let output = tokio::process::Command::new("git")
-        .args(["log", "-n", "5", "--pretty=format:%h - %s", "--", &path])
+        .args(["log", "-n", "5", "--pretty=format:%h - %s", "--", abs.to_str().unwrap_or(&path)])
         .current_dir(&root)
         .output()
         .await?;
