@@ -53,6 +53,3 @@ tracing-opentelemetry = "0.32.1"
 opentelemetry-semantic-conventions = "0.31.0"
 tonic = "0.14.5"
 prost = "0.14.3"
-
-[dev-dependencies]
-tempfile = "3"

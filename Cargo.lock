@@ -6788,7 +6788,6 @@ dependencies = [
  "serde_json",
  "sha2",
  "tantivy",
- "tempfile",
  "tiktoken-rs",
  "tokenizers",
  "tokio",

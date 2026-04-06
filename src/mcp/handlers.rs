@@ -10,7 +10,6 @@ use std::sync::Arc;
 
 use super::protocol::{CallToolParams, CallToolResult};
 use super::server::Server;
-use crate::security::pathguard::PathOp;
 
 /// Route a `tools/call` to the appropriate handler by tool name.
 ///
@@ -1099,7 +1098,7 @@ async fn handle_get_code_history(
     // Security enhancement: Prevent path traversal by using path_guard
     let abs = server
         .path_guard
-        .validate(&path, PathOp::Read)
+        .validate(&path)
         .map_err(|e| anyhow::anyhow!("path guard: {e}"))?;
 
     let root = server.config.project_root.read().unwrap().clone();
@@ -1115,15 +1114,6 @@ async fn handle_get_code_history(
         .current_dir(&root)
         .output()
         .await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let code = output.status.code().unwrap_or(-1);
-        return Ok(CallToolResult::error(format!(
-            "git log failed (exit {code}): {stderr}"
-        )));
-    }
-
     Ok(CallToolResult::text(
         String::from_utf8_lossy(&output.stdout).to_string(),
     ))
@@ -1670,7 +1660,7 @@ async fn handle_apply_patch(server: &Server, params: &CallToolParams) -> Result<
 
     let abs = server
         .path_guard
-        .validate(&path, PathOp::Read)
+        .validate(&path)
         .map_err(|e| anyhow::anyhow!("path guard: {e}"))?;
 
     let abs_str = abs.to_string_lossy().to_string();
@@ -1721,7 +1711,7 @@ fn handle_create_file(server: &Server, params: &CallToolParams) -> Result<CallTo
 
     let abs = server
         .path_guard
-        .validate(&path, PathOp::Create)
+        .validate(&path)
         .map_err(|e| anyhow::anyhow!("path guard: {e}"))?;
 
     if let Some(parent) = abs.parent() {
@@ -1739,7 +1729,7 @@ async fn handle_run_linter(server: &Server, params: &CallToolParams) -> Result<C
 
     let abs = server
         .path_guard
-        .validate(&path, PathOp::Read)
+        .validate(&path)
         .map_err(|e| anyhow::anyhow!("path guard: {e}"))?;
 
     let (cmd, args): (&str, Vec<&str>) = match tool.as_str() {
@@ -1769,7 +1759,7 @@ fn handle_verify_patch(server: &Server, params: &CallToolParams) -> Result<CallT
 
     let abs = server
         .path_guard
-        .validate(&path, PathOp::Read)
+        .validate(&path)
         .map_err(|e| anyhow::anyhow!("path guard: {e}"))?;
 
     let content = std::fs::read_to_string(&abs).map_err(|e| anyhow::anyhow!("read failed: {e}"))?;
@@ -1803,7 +1793,7 @@ async fn handle_auto_fix(server: &Server, params: &CallToolParams) -> Result<Cal
 
     let abs = server
         .path_guard
-        .validate(path, PathOp::Read)
+        .validate(path)
         .map_err(|e| anyhow::anyhow!("path guard: {e}"))?;
 
     let content = tokio::fs::read_to_string(&abs)
