@@ -513,10 +513,12 @@ const OVERLAP: usize = 500;
 // By pre-computing character byte offsets and newline indices, we can slice strings
 // by characters in O(1) time and find line numbers in O(log(newlines)) using partition_point.
 fn fast_chunk(text: &str, file_path: &str) -> Vec<Chunk> {
-    assert!(
-        CHUNK_SIZE > OVERLAP,
-        "CHUNK_SIZE must be strictly greater than OVERLAP to ensure progress"
-    );
+    const {
+        assert!(
+            CHUNK_SIZE > OVERLAP,
+            "CHUNK_SIZE must be strictly greater than OVERLAP to ensure progress"
+        );
+    }
 
     if text.is_empty() {
         return Vec::new();
