@@ -473,7 +473,11 @@ async fn handle_check_dependency_health(
 
     // 2. Scan indexed records for imports in this directory
     let records = server.store.get_all_records().await?;
-    let rel_dir = dir_path.replace('\\', "/");
+    let rel_dir = abs_path
+        .strip_prefix(&root)
+        .unwrap_or(&abs_path)
+        .to_string_lossy()
+        .replace('\\', "/");
     let mut missing_deps: HashMap<String, Vec<String>> = HashMap::new();
 
     for r in records {
