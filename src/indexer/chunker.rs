@@ -513,6 +513,11 @@ const OVERLAP: usize = 500;
 // By pre-computing character byte offsets and newline indices, we can slice strings
 // by characters in O(1) time and find line numbers in O(log(newlines)) using partition_point.
 fn fast_chunk(text: &str, file_path: &str) -> Vec<Chunk> {
+    assert!(
+        CHUNK_SIZE > OVERLAP,
+        "CHUNK_SIZE must be strictly greater than OVERLAP to ensure progress"
+    );
+
     if text.is_empty() {
         return Vec::new();
     }
@@ -621,5 +626,42 @@ mod tests {
         let go_code = "import \"net/http\"";
         let go_rels = parse_relationships(go_code, ".go");
         assert!(go_rels.contains(&"net/http".to_string()));
+    }
+
+    #[test]
+    fn test_fast_chunk_lines() {
+        // Multi-byte unicode + newlines.
+        let text = "Line 1\nLine 2 🤖\nLine 3";
+        let chunks = fast_chunk(text, "test.txt");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].start_line, 1);
+        assert_eq!(chunks[0].end_line, 3);
+
+        let text_trailing = "A\nB\nC\n";
+        let chunks_t = fast_chunk(text_trailing, "test_t.txt");
+        assert_eq!(chunks_t.len(), 1);
+        assert_eq!(chunks_t[0].start_line, 1);
+        assert_eq!(chunks_t[0].end_line, 4); // "A\nB\nC\n" has 3 newlines, partition points calculate relative line correctly
+
+        let text_no_trailing = "A\nB\nC";
+        let chunks_nt = fast_chunk(text_no_trailing, "test_nt.txt");
+        assert_eq!(chunks_nt.len(), 1);
+        assert_eq!(chunks_nt[0].start_line, 1);
+        assert_eq!(chunks_nt[0].end_line, 3);
+
+        // Exact cut on newlines
+        // Create a string that is 3001 characters long.
+        // It has 3000 'A' characters followed by a newline.
+        // The chunk size is 3000. So the first chunk will be exactly the 'A's.
+        // The second chunk will contain the newline.
+        let mut exact_cut_text = "A".repeat(3000);
+        exact_cut_text.push('\n');
+
+        let chunks_exact = fast_chunk(&exact_cut_text, "test_exact.txt");
+        assert_eq!(chunks_exact.len(), 2);
+        assert_eq!(chunks_exact[0].start_line, 1);
+        assert_eq!(chunks_exact[0].end_line, 1);
+        assert_eq!(chunks_exact[1].start_line, 1);
+        assert_eq!(chunks_exact[1].end_line, 2);
     }
 }
