@@ -55,7 +55,7 @@ impl PathGuard {
                     anyhow::anyhow!("invalid target parent: {}", joined.display())
                 })?;
 
-                // If parent doesn't exist (deep create), create_dir_all happens later but 
+                // If parent doesn't exist (deep create), create_dir_all happens later but
                 // we should at least validate the closest existing ancestor starts with base.
                 let mut current = parent;
                 while !current.exists() && current != self.base {

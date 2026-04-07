@@ -508,27 +508,44 @@ fn parse_relationships(text: &str, ext: &str) -> Vec<String> {
 const CHUNK_SIZE: usize = 3000;
 const OVERLAP: usize = 500;
 
+// ⚡ Bolt Performance Optimization:
+// Replaced O(N^2) char iteration and allocation with O(N) byte-indexed mapping.
+// By pre-computing character byte offsets and newline indices, we can slice strings
+// by characters in O(1) time and find line numbers in O(log(newlines)) using partition_point.
 fn fast_chunk(text: &str, file_path: &str) -> Vec<Chunk> {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.is_empty() {
+    if text.is_empty() {
         return Vec::new();
     }
 
-    let mut chunks = Vec::new();
-    let mut i = 0;
+    let mut char_indices = Vec::with_capacity(text.len().min(8192));
+    let mut newlines = Vec::new();
 
-    while i < chars.len() {
-        let end = (i + CHUNK_SIZE).min(chars.len());
-        let content: String = chars[i..end].iter().collect();
-        let prefix: String = chars[..i].iter().collect();
-        let start_line = prefix.matches('\n').count() + 1;
-        let end_line = start_line + content.matches('\n').count();
+    for (i, c) in text.char_indices() {
+        char_indices.push(i);
+        if c == '\n' {
+            newlines.push(char_indices.len() - 1);
+        }
+    }
+    char_indices.push(text.len());
+
+    let mut chunks = Vec::new();
+    let mut char_idx = 0;
+
+    while char_idx < char_indices.len() - 1 {
+        let end_char_idx = (char_idx + CHUNK_SIZE).min(char_indices.len() - 1);
+
+        let start_byte = char_indices[char_idx];
+        let end_byte = char_indices[end_char_idx];
+
+        let content = text[start_byte..end_byte].to_string();
+        let start_line = newlines.partition_point(|&idx| idx < char_idx) + 1;
+        let end_line = newlines.partition_point(|&idx| idx < end_char_idx) + 1;
 
         chunks.push(Chunk {
-            content: content.clone(),
             contextual_string: format!(
                 "File: {file_path}. Entity: Global. Type: chunk. Calls: None. Code:\n{content}"
             ),
+            content,
             symbols: Vec::new(),
             relationships: Vec::new(),
             node_type: "chunk".to_owned(),
@@ -538,11 +555,11 @@ fn fast_chunk(text: &str, file_path: &str) -> Vec<Chunk> {
             end_line,
         });
 
-        if end == chars.len() {
+        if end_char_idx == char_indices.len() - 1 {
             break;
         }
 
-        i += CHUNK_SIZE - OVERLAP;
+        char_idx += CHUNK_SIZE - OVERLAP;
     }
 
     chunks
