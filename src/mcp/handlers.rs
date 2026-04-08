@@ -343,10 +343,7 @@ async fn handle_get_codebase_skeleton(
     let exclude_pattern = optional_string_arg(params, "exclude_pattern");
 
     // Security enhancement: Prevent path traversal by using path_guard
-    let abs_path = match server
-        .path_guard
-        .validate(&target_path, crate::security::pathguard::PathOp::Read)
-    {
+    let abs_path = match server.path_guard.validate(&target_path, PathOp::Read) {
         Ok(p) => p,
         Err(e) => return Ok(CallToolResult::error(format!("Invalid path: {e}"))),
     };
@@ -411,18 +408,11 @@ async fn handle_check_dependency_health(
     params: &CallToolParams,
 ) -> Result<CallToolResult> {
     let dir_path = require_string_arg(params, "directory_path")?;
-
+    let root = server.config.project_root.read().unwrap().clone();
     // Security enhancement: Prevent path traversal by using path_guard
-    let abs_path = match server
-        .path_guard
-        .validate(&dir_path, crate::security::pathguard::PathOp::Read)
-    {
+    let abs_path = match server.path_guard.validate(&dir_path, PathOp::Read) {
         Ok(p) => p,
-        Err(e) => {
-            return Ok(CallToolResult::error(format!(
-                "Invalid directory path: {e}"
-            )));
-        }
+        Err(e) => return Ok(CallToolResult::error(format!("Invalid path: {e}"))),
     };
 
     // 1. Detect project type and parse manifest
@@ -479,14 +469,17 @@ async fn handle_check_dependency_health(
 
     // 2. Scan indexed records for imports in this directory
     let records = server.store.get_all_records().await?;
-    let rel_dir = dir_path.replace('\\', "/");
-    let root = server.config.project_root.read().unwrap().clone();
+    let rel_dir = abs_path
+        .strip_prefix(&root)
+        .unwrap_or(&abs_path)
+        .to_string_lossy()
+        .replace('\\', "/");
     let mut missing_deps: HashMap<String, Vec<String>> = HashMap::new();
 
     for r in records {
         let meta = r.metadata_json();
         let file_path = meta["path"].as_str().unwrap_or("").to_string();
-        if !rel_dir.is_empty() && !file_path.contains(&rel_dir) {
+        if !rel_dir.is_empty() && !file_path.starts_with(&rel_dir) {
             continue;
         }
         let rels: Vec<String> = meta["relationships"]

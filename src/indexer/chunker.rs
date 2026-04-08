@@ -508,27 +508,51 @@ fn parse_relationships(text: &str, ext: &str) -> Vec<String> {
 const CHUNK_SIZE: usize = 3000;
 const OVERLAP: usize = 500;
 
+// ⚡ Bolt Performance Optimization:
+// Replaced O(N^2) char iteration and allocation with O(N) byte-indexed mapping.
+// By pre-computing character byte offsets and newline indices, we can slice strings
+// by characters in O(1) time and find line numbers in O(log(newlines)) using partition_point.
 fn fast_chunk(text: &str, file_path: &str) -> Vec<Chunk> {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.is_empty() {
+    const {
+        assert!(
+            CHUNK_SIZE > OVERLAP,
+            "CHUNK_SIZE must be strictly greater than OVERLAP to ensure progress"
+        );
+    }
+
+    if text.is_empty() {
         return Vec::new();
     }
 
-    let mut chunks = Vec::new();
-    let mut i = 0;
+    let mut char_indices = Vec::with_capacity(text.len().min(8192));
+    let mut newlines = Vec::new();
 
-    while i < chars.len() {
-        let end = (i + CHUNK_SIZE).min(chars.len());
-        let content: String = chars[i..end].iter().collect();
-        let prefix: String = chars[..i].iter().collect();
-        let start_line = prefix.matches('\n').count() + 1;
-        let end_line = start_line + content.matches('\n').count();
+    for (i, c) in text.char_indices() {
+        char_indices.push(i);
+        if c == '\n' {
+            newlines.push(char_indices.len() - 1);
+        }
+    }
+    char_indices.push(text.len());
+
+    let mut chunks = Vec::new();
+    let mut char_idx = 0;
+
+    while char_idx < char_indices.len() - 1 {
+        let end_char_idx = (char_idx + CHUNK_SIZE).min(char_indices.len() - 1);
+
+        let start_byte = char_indices[char_idx];
+        let end_byte = char_indices[end_char_idx];
+
+        let content = text[start_byte..end_byte].to_string();
+        let start_line = newlines.partition_point(|&idx| idx < char_idx) + 1;
+        let end_line = newlines.partition_point(|&idx| idx < end_char_idx) + 1;
 
         chunks.push(Chunk {
-            content: content.clone(),
             contextual_string: format!(
                 "File: {file_path}. Entity: Global. Type: chunk. Calls: None. Code:\n{content}"
             ),
+            content,
             symbols: Vec::new(),
             relationships: Vec::new(),
             node_type: "chunk".to_owned(),
@@ -538,11 +562,11 @@ fn fast_chunk(text: &str, file_path: &str) -> Vec<Chunk> {
             end_line,
         });
 
-        if end == chars.len() {
+        if end_char_idx == char_indices.len() - 1 {
             break;
         }
 
-        i += CHUNK_SIZE - OVERLAP;
+        char_idx += CHUNK_SIZE - OVERLAP;
     }
 
     chunks
@@ -604,5 +628,42 @@ mod tests {
         let go_code = "import \"net/http\"";
         let go_rels = parse_relationships(go_code, ".go");
         assert!(go_rels.contains(&"net/http".to_string()));
+    }
+
+    #[test]
+    fn test_fast_chunk_lines() {
+        // Multi-byte unicode + newlines.
+        let text = "Line 1\nLine 2 🤖\nLine 3";
+        let chunks = fast_chunk(text, "test.txt");
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].start_line, 1);
+        assert_eq!(chunks[0].end_line, 3);
+
+        let text_trailing = "A\nB\nC\n";
+        let chunks_t = fast_chunk(text_trailing, "test_t.txt");
+        assert_eq!(chunks_t.len(), 1);
+        assert_eq!(chunks_t[0].start_line, 1);
+        assert_eq!(chunks_t[0].end_line, 4); // "A\nB\nC\n" has 3 newlines, partition points calculate relative line correctly
+
+        let text_no_trailing = "A\nB\nC";
+        let chunks_nt = fast_chunk(text_no_trailing, "test_nt.txt");
+        assert_eq!(chunks_nt.len(), 1);
+        assert_eq!(chunks_nt[0].start_line, 1);
+        assert_eq!(chunks_nt[0].end_line, 3);
+
+        // Exact cut on newlines
+        // Create a string that is 3001 characters long.
+        // It has 3000 'A' characters followed by a newline.
+        // The chunk size is 3000. So the first chunk will be exactly the 'A's.
+        // The second chunk will contain the newline.
+        let mut exact_cut_text = "A".repeat(3000);
+        exact_cut_text.push('\n');
+
+        let chunks_exact = fast_chunk(&exact_cut_text, "test_exact.txt");
+        assert_eq!(chunks_exact.len(), 2);
+        assert_eq!(chunks_exact[0].start_line, 1);
+        assert_eq!(chunks_exact[0].end_line, 1);
+        assert_eq!(chunks_exact[1].start_line, 1);
+        assert_eq!(chunks_exact[1].end_line, 2);
     }
 }
