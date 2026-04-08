@@ -483,7 +483,7 @@ async fn handle_check_dependency_health(
     for r in records {
         let meta = r.metadata_json();
         let file_path = meta["path"].as_str().unwrap_or("").to_string();
-        if !rel_dir.is_empty() && !file_path.contains(&rel_dir) {
+        if !rel_dir.is_empty() && !file_path.starts_with(&rel_dir) {
             continue;
         }
         let rels: Vec<String> = meta["relationships"]
