@@ -348,10 +348,6 @@ async fn handle_get_codebase_skeleton(
         Err(e) => return Ok(CallToolResult::error(format!("Invalid path: {e}"))),
     };
 
-    if !abs_path.exists() {
-        return Ok(CallToolResult::error("Invalid path"));
-    }
-
     let mut out = format!("Directory Tree: {:?} (Depth: {})\n", abs_path, max_depth);
 
     // Build a map of path -> depth using WalkBuilder (respects .gitignore / .vector-ignore).
