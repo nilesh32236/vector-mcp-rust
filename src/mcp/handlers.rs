@@ -336,17 +336,16 @@ async fn handle_get_codebase_skeleton(
     server: &Server,
     params: &CallToolParams,
 ) -> Result<CallToolResult> {
-    let root = server.config.project_root.read().unwrap().clone();
     let target_path = optional_string_arg(params, "target_path").unwrap_or_else(|| ".".into());
     let max_depth = optional_f64_arg(params, "max_depth").unwrap_or(3.0) as usize;
     let max_items = optional_f64_arg(params, "max_items").unwrap_or(1000.0) as usize;
     let include_pattern = optional_string_arg(params, "include_pattern");
     let exclude_pattern = optional_string_arg(params, "exclude_pattern");
 
-    let abs_path = if std::path::Path::new(&target_path).is_absolute() {
-        std::path::PathBuf::from(&target_path)
-    } else {
-        std::path::Path::new(&root).join(&target_path)
+    // Security enhancement: Prevent path traversal by using path_guard
+    let abs_path = match server.path_guard.validate(&target_path, PathOp::Read) {
+        Ok(p) => p,
+        Err(e) => return Ok(CallToolResult::error(format!("Invalid path: {e}"))),
     };
 
     if !abs_path.exists() {
@@ -414,10 +413,10 @@ async fn handle_check_dependency_health(
 ) -> Result<CallToolResult> {
     let dir_path = require_string_arg(params, "directory_path")?;
     let root = server.config.project_root.read().unwrap().clone();
-    let abs_path = if std::path::Path::new(&dir_path).is_absolute() {
-        std::path::PathBuf::from(&dir_path)
-    } else {
-        std::path::Path::new(&root).join(&dir_path)
+    // Security enhancement: Prevent path traversal by using path_guard
+    let abs_path = match server.path_guard.validate(&dir_path, PathOp::Read) {
+        Ok(p) => p,
+        Err(e) => return Ok(CallToolResult::error(format!("Invalid path: {e}"))),
     };
 
     // 1. Detect project type and parse manifest
@@ -474,13 +473,17 @@ async fn handle_check_dependency_health(
 
     // 2. Scan indexed records for imports in this directory
     let records = server.store.get_all_records().await?;
-    let rel_dir = dir_path.replace('\\', "/");
+    let rel_dir = abs_path
+        .strip_prefix(&root)
+        .unwrap_or(&abs_path)
+        .to_string_lossy()
+        .replace('\\', "/");
     let mut missing_deps: HashMap<String, Vec<String>> = HashMap::new();
 
     for r in records {
         let meta = r.metadata_json();
         let file_path = meta["path"].as_str().unwrap_or("").to_string();
-        if !rel_dir.is_empty() && !file_path.contains(&rel_dir) {
+        if !rel_dir.is_empty() && !file_path.starts_with(&rel_dir) {
             continue;
         }
         let rels: Vec<String> = meta["relationships"]
