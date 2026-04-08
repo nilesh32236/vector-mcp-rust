@@ -516,12 +516,21 @@ fn fast_chunk(text: &str, file_path: &str) -> Vec<Chunk> {
 
     let mut chunks = Vec::new();
     let mut i = 0;
+    let mut current_line = 1;
+    let mut last_i = 0;
 
     while i < chars.len() {
         let end = (i + CHUNK_SIZE).min(chars.len());
+
+        for c in &chars[last_i..i] {
+            if *c == '\n' {
+                current_line += 1;
+            }
+        }
+        last_i = i;
+
         let content: String = chars[i..end].iter().collect();
-        let prefix: String = chars[..i].iter().collect();
-        let start_line = prefix.matches('\n').count() + 1;
+        let start_line = current_line;
         let end_line = start_line + content.matches('\n').count();
 
         chunks.push(Chunk {
