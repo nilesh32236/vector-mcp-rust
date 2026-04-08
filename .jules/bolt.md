@@ -5,4 +5,4 @@
 
 ## 2026-04-08 - [Avoid intermediate heap allocations when collecting Map/Set keys]
 **Learning:** `serde_json::to_string()` accepts and serializes arrays of string references `Vec<&String>` just as easily as arrays of owned strings `Vec<String>`. By using `.collect()` directly on `unique.keys()` or `set.iter()` instead of chaining `.cloned()`, we skip allocating memory entirely for a new set of Strings when generating JSON arrays or extracting sorted key lists.
-**Action:** When extracting lists of keys from HashMaps or elements from HashSets for sorting, referencing, or serializing in a vector, use references (`Vec<&String>`) and `sort_unstable()` instead of deep cloning `.cloned().collect()` and `sort()`.
+**Action:** Prefer collecting `Vec<&String>` and `sort_unstable()` only for same-scope, short-lived operations (e.g., immediate serialization with `serde_json::to_string()`, as with `unique.keys()` or `set.iter()`), but retain `.cloned().collect()` and `sort()` (or `sort_unstable()`) when the keys must be moved, returned, or sent across threads — borrowed references cannot outlive the backing collection.

@@ -1374,8 +1374,10 @@ async fn handle_get_related_context(server: &Server, file_path: &str) -> Result<
     let mut out = String::from("<context>\n");
 
     // ⚡ Bolt Performance Optimization:
-    // Avoid cloning strings. `serde_json::to_string` handles references (like Vec<&String>)
-    // perfectly well, so heap allocations are eliminated here.
+    // Use references instead of cloning individual Strings into dep_list/sym_list.
+    // This minimizes copies — we still allocate when building dep_list/sym_list
+    // and when serde_json::to_string serializes them, but we avoid per-element
+    // String clones that would otherwise occur with .cloned().collect().
     // 1. Target file chunks
     let dep_list: Vec<_> = unique_deps.keys().collect();
     let sym_list: Vec<_> = all_symbols.iter().collect();
