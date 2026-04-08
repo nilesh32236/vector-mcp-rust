@@ -1072,12 +1072,16 @@ async fn handle_list_api_endpoints(
         return Ok(CallToolResult::text("No API routing patterns detected."));
     }
 
-    let mut keys: Vec<_> = unique.keys().cloned().collect();
-    keys.sort();
+    // ⚡ Bolt Performance Optimization:
+    // Avoid allocating and cloning strings into a new vector.
+    // We can just collect references to the keys and use sort_unstable
+    // which is faster and allocates less memory.
+    let mut keys: Vec<_> = unique.keys().collect();
+    keys.sort_unstable();
 
     let mut out = String::from("## 🌐 Detected API Endpoints / Routes\n\n");
     for k in keys {
-        let r = &unique[&k];
+        let r = &unique[k];
         let meta = r.metadata_json();
         out.push_str(&format!(
             "### {} (Line {})\n```\n{}\n```\n\n",
@@ -1369,9 +1373,12 @@ async fn handle_get_related_context(server: &Server, file_path: &str) -> Result<
 
     let mut out = String::from("<context>\n");
 
+    // ⚡ Bolt Performance Optimization:
+    // Avoid cloning strings. `serde_json::to_string` handles references (like Vec<&String>)
+    // perfectly well, so heap allocations are eliminated here.
     // 1. Target file chunks
-    let dep_list: Vec<_> = unique_deps.keys().cloned().collect();
-    let sym_list: Vec<_> = all_symbols.iter().cloned().collect();
+    let dep_list: Vec<_> = unique_deps.keys().collect();
+    let sym_list: Vec<_> = all_symbols.iter().collect();
     out.push_str(&format!(
         "  <file path=\"{file_path}\">\n    <metadata>\n      <dependencies>{}</dependencies>\n      <symbols>{}</symbols>\n    </metadata>\n",
         serde_json::to_string(&dep_list).unwrap_or_default(),
