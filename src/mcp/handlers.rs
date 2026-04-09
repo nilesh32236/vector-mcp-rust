@@ -93,6 +93,13 @@ async fn handle_trigger_project_index(
     session_id: Option<&str>,
 ) -> Result<CallToolResult> {
     let path = require_string_arg(params, "project_path")?;
+    // Security enhancement: Prevent path traversal by using path_guard
+    let abs = server
+        .path_guard
+        .validate(&path, PathOp::Read)
+        .map_err(|e| anyhow::anyhow!("path guard: {e}"))?;
+    let path = abs.to_string_lossy().to_string();
+
     let store = Arc::clone(&server.store);
     let config = Arc::clone(&server.config);
     let embedder = Arc::clone(&server.embedder);
@@ -158,6 +165,12 @@ async fn handle_set_project_root(
     params: &CallToolParams,
 ) -> Result<CallToolResult> {
     let path = require_string_arg(params, "project_path")?;
+    // Security enhancement: Prevent path traversal by using path_guard
+    let abs = server
+        .path_guard
+        .validate(&path, PathOp::Read)
+        .map_err(|e| anyhow::anyhow!("path guard: {e}"))?;
+    let path = abs.to_string_lossy().to_string();
 
     {
         let mut root = server.config.project_root.write().unwrap();
@@ -1881,6 +1894,13 @@ pub async fn handle_lsp_query(server: &Server, params: &CallToolParams) -> Resul
     if path.is_empty() {
         return Ok(CallToolResult::error("path is required"));
     }
+
+    // Security enhancement: Prevent path traversal by using path_guard
+    let abs = server
+        .path_guard
+        .validate(&path, PathOp::Read)
+        .map_err(|e| anyhow::anyhow!("path guard: {e}"))?;
+    let path = abs.to_string_lossy().to_string();
 
     let ext = std::path::Path::new(&path)
         .extension()
