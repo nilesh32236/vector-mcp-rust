@@ -1107,14 +1107,8 @@ async fn handle_get_code_history(
 
     let root = server.config.project_root.read().unwrap().clone();
     let output = tokio::process::Command::new("git")
-        .args([
-            "log",
-            "-n",
-            "5",
-            "--pretty=format:%h - %s",
-            "--",
-            abs.to_str().unwrap_or(&path),
-        ])
+        .args(["log", "-n", "5", "--pretty=format:%h - %s", "--"])
+        .arg(&abs)
         .current_dir(&root)
         .output()
         .await?;
@@ -1750,18 +1744,29 @@ async fn handle_run_linter(server: &Server, params: &CallToolParams) -> Result<C
         .validate(&path, PathOp::Read)
         .map_err(|e| anyhow::anyhow!("path guard: {e}"))?;
 
-    let (cmd, args): (&str, Vec<&str>) = match tool.as_str() {
-        "go fmt" | "gofmt" => ("gofmt", vec!["-w", abs.to_str().unwrap_or("")]),
-        "rustfmt" => ("rustfmt", vec![abs.to_str().unwrap_or("")]),
-        "prettier" => ("prettier", vec!["--write", abs.to_str().unwrap_or("")]),
+    let mut command = match tool.as_str() {
+        "go fmt" | "gofmt" => {
+            let mut c = tokio::process::Command::new("gofmt");
+            c.arg("-w").arg("--").arg(&abs);
+            c
+        }
+        "rustfmt" => {
+            let mut c = tokio::process::Command::new("rustfmt");
+            c.arg("--").arg(&abs);
+            c
+        }
+        "prettier" => {
+            let mut c = tokio::process::Command::new("prettier");
+            c.arg("--write").arg("--").arg(&abs);
+            c
+        }
         other => return Ok(CallToolResult::error(format!("Unsupported tool: {other}"))),
     };
 
-    let output = tokio::process::Command::new(cmd)
-        .args(&args)
+    let output = command
         .output()
         .await
-        .map_err(|e| anyhow::anyhow!("{cmd} not found: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("tool execution failed: {e}"))?;
 
     if output.status.success() {
         Ok(CallToolResult::text(format!("{tool} applied to {path}")))
