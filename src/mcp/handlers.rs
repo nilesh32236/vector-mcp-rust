@@ -1107,13 +1107,7 @@ async fn handle_get_code_history(
 
     let root = server.config.project_root.read().unwrap().clone();
     let output = tokio::process::Command::new("git")
-        .args([
-            "log",
-            "-n",
-            "5",
-            "--pretty=format:%h - %s",
-            "--",
-        ])
+        .args(["log", "-n", "5", "--pretty=format:%h - %s", "--"])
         .arg(&abs) // Security: Pass PathBuf directly to avoid unsafe UTF-8 conversions
         .current_dir(&root)
         .output()
