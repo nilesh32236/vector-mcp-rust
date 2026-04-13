@@ -1,5 +1,4 @@
-## 2026-04-06 - [Path Traversal in MCP File Handlers]
-
-**Vulnerability:** User-supplied file paths in `handle_get_codebase_skeleton` and `handle_check_dependency_health` were concatenated with the project root or allowed as absolute paths, enabling path traversal beyond the project directory.
-**Learning:** Even when the project root is defined, directly joining user input or conditionally allowing absolute paths can bypass directory restrictions.
-**Prevention:** Always use `server.path_guard.validate(&path, PathOp::Read)` (or `PathOp::Create`) to resolve and validate user-supplied file paths against the base directory.
+## 2025-04-13 - [Sentinel: Fix Argument Injection Risks in External Tool Commands]
+**Vulnerability:** External formatters (gofmt, rustfmt, prettier) and git were called with paths given as standard string arguments directly without ending the options list. If a file named `-e` was processed, it might be evaluated as an option by the external command, leading to argument injection. Additionally, when invalid UTF-8 paths are passed, `.to_str().unwrap_or("")` creates an empty string which is dangerous.
+**Learning:** Argument injection in external tool executions using `tokio::process::Command` happens when user-supplied file names or data might start with hyphens. Moreover, `OsStr` should always be passed to `Command::arg` rather than strings to safely handle paths and prevent silent fallbacks to empty strings.
+**Prevention:** Always use `--` to indicate the end of options before passing file paths to CLI tools. Further, always pass `.as_os_str()` to external commands instead of using string conversions.
