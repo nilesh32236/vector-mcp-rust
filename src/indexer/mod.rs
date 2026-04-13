@@ -47,7 +47,8 @@ pub fn get_directory_tree(path: &std::path::Path, max_depth: usize) -> Result<St
             }
 
             item_count += 1;
-            out.push_str(&format!("{}├── {}\n", "│   ".repeat(depth - 1), name));
+            use std::fmt::Write;
+            let _ = writeln!(&mut out, "{}├── {}", "│   ".repeat(depth - 1), name);
         }
     }
 
