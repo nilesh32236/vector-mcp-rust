@@ -397,7 +397,8 @@ async fn handle_get_codebase_skeleton(
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        out.push_str(&format!("{}├── {}\n", "│   ".repeat(*depth), name));
+        use std::fmt::Write;
+        let _ = writeln!(&mut out, "{}├── {}", "│   ".repeat(*depth), name);
     }
 
     Ok(CallToolResult::text(out))
