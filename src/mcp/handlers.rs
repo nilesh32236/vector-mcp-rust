@@ -1107,14 +1107,9 @@ async fn handle_get_code_history(
 
     let root = server.config.project_root.read().unwrap().clone();
     let output = tokio::process::Command::new("git")
-        .args([
-            "log",
-            "-n",
-            "5",
-            "--pretty=format:%h - %s",
-            "--",
-            abs.to_str().unwrap_or(&path),
-        ])
+        .args(["log", "-n", "5", "--pretty=format:%h - %s", "--"])
+        // SECURITY: Pass PathBuf directly to handle invalid UTF-8, `--` prevents argument injection
+        .arg(&abs)
         .current_dir(&root)
         .output()
         .await?;
@@ -1750,15 +1745,18 @@ async fn handle_run_linter(server: &Server, params: &CallToolParams) -> Result<C
         .validate(&path, PathOp::Read)
         .map_err(|e| anyhow::anyhow!("path guard: {e}"))?;
 
+    // SECURITY: Use `--` to separate options from positional arguments (preventing argument injection)
+    // and pass PathBuf directly to avoid unsafe UTF-8 conversions.
     let (cmd, args): (&str, Vec<&str>) = match tool.as_str() {
-        "go fmt" | "gofmt" => ("gofmt", vec!["-w", abs.to_str().unwrap_or("")]),
-        "rustfmt" => ("rustfmt", vec![abs.to_str().unwrap_or("")]),
-        "prettier" => ("prettier", vec!["--write", abs.to_str().unwrap_or("")]),
+        "go fmt" | "gofmt" => ("gofmt", vec!["-w", "--"]),
+        "rustfmt" => ("rustfmt", vec!["--"]),
+        "prettier" => ("prettier", vec!["--write", "--"]),
         other => return Ok(CallToolResult::error(format!("Unsupported tool: {other}"))),
     };
 
     let output = tokio::process::Command::new(cmd)
         .args(&args)
+        .arg(&abs)
         .output()
         .await
         .map_err(|e| anyhow::anyhow!("{cmd} not found: {e}"))?;
