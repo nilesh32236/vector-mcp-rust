@@ -103,6 +103,15 @@ impl LexicalIndex {
         Ok(())
     }
 
+    /// ⚡ Bolt Performance Optimization:
+    /// Remove a document without committing immediately to avoid N+1 IO bottlenecks.
+    /// Call `commit()` manually after processing a batch.
+    fn remove_no_commit(&self, doc_id: &str) -> Result<()> {
+        let writer = self.writer.write().unwrap();
+        writer.delete_term(Term::from_field_text(self.fields.id, doc_id));
+        Ok(())
+    }
+
     fn search(&self, query_str: &str, top_k: usize) -> Vec<(String, f32)> {
         let searcher = self.reader.searcher();
         let query_parser = QueryParser::for_index(&self.index, vec![self.fields.text]);
@@ -309,8 +318,9 @@ impl Store {
             .map(|_| ())?;
 
         for r in to_delete {
-            let _ = self.lexical.remove(&r.id);
+            let _ = self.lexical.remove_no_commit(&r.id);
         }
+        let _ = self.lexical.commit();
 
         Ok(())
     }
