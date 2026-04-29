@@ -353,7 +353,7 @@ async fn start_servers(
         });
 
         info!(mcp_port, api_port, "vector-mcp-rust ready ✓");
- 
+
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 info!("Ctrl-C received — shutting down");

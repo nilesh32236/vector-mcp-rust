@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use super::protocol::{CallToolParams, CallToolResult};
 use super::server::Server;
+use crate::llm::embedding::Embedder;
 use crate::security::pathguard::PathOp;
 
 /// Route a `tools/call` to the appropriate handler by tool name.
@@ -77,6 +78,18 @@ fn optional_string_array_arg(params: &CallToolParams, key: &str) -> Option<Vec<S
             })
         }
     })
+}
+
+async fn embed_query_blocking(embedder: Arc<Embedder>, query: String) -> Result<Vec<f32>> {
+    tokio::task::spawn_blocking(move || embedder.embed_query(&query))
+        .await
+        .map_err(|e| anyhow::anyhow!("Embedding task failed: {e}"))?
+}
+
+async fn embed_text_blocking(embedder: Arc<Embedder>, text: String) -> Result<Vec<f32>> {
+    tokio::task::spawn_blocking(move || embedder.embed_text(&text))
+        .await
+        .map_err(|e| anyhow::anyhow!("Embedding task failed: {e}"))?
 }
 
 // ---------------------------------------------------------------------------
@@ -211,7 +224,7 @@ async fn handle_find_duplicate_code(
         .map(|r| r.content.as_str())
         .collect::<Vec<_>>()
         .join("\n");
-    let vector = server.embedder.embed_query(&combined)?;
+    let vector = embed_query_blocking(Arc::clone(&server.embedder), combined.clone()).await?;
     let matches = server
         .store
         .hybrid_search(vector, &combined, 10, None)
@@ -835,7 +848,7 @@ async fn handle_search_codebase(
     let query = require_string_arg(params, "query")?;
     let top_k = optional_f64_arg(params, "topK").unwrap_or(10.0) as usize;
 
-    let vector = server.embedder.embed_text(&query)?;
+    let vector = embed_text_blocking(Arc::clone(&server.embedder), query.clone()).await?;
 
     // 1. Fetch more results than needed for reranking (e.g. top_k * 3)
     let records = server
@@ -948,7 +961,7 @@ async fn handle_get_summarized_context(
     params: &CallToolParams,
 ) -> Result<CallToolResult> {
     let query = require_string_arg(params, "query")?;
-    let vector = server.embedder.embed_text(&query)?;
+    let vector = embed_text_blocking(Arc::clone(&server.embedder), query.clone()).await?;
     let records = server.store.hybrid_search(vector, &query, 5, None).await?;
     let mut text = String::new();
     for r in records {
@@ -957,7 +970,7 @@ async fn handle_get_summarized_context(
     }
     let summary = server
         .summarizer
-        .summarize_chunk(&text, Arc::clone(&server.config))
+        .summarize_chunk(&text, None, Arc::clone(&server.config))
         .await?;
     Ok(CallToolResult::text(format!("### Summary\n\n{}", summary)))
 }
@@ -967,7 +980,7 @@ async fn handle_verify_implementation_gap(
     params: &CallToolParams,
 ) -> Result<CallToolResult> {
     let query = require_string_arg(params, "query")?;
-    let vector = server.embedder.embed_text(&query)?;
+    let vector = embed_text_blocking(Arc::clone(&server.embedder), query.clone()).await?;
     let records = server.store.hybrid_search(vector, &query, 10, None).await?;
     let mut out = format!("## Implementation Gap Analysis for '{}'\n\n", query);
     for r in records {
@@ -1470,7 +1483,7 @@ async fn handle_search_workspace(
             if query.is_empty() {
                 return Ok(CallToolResult::error("query is required for vector search"));
             }
-            let vector = server.embedder.embed_query(&query)?;
+            let vector = embed_query_blocking(Arc::clone(&server.embedder), query.clone()).await?;
             let mut results = server
                 .store
                 .hybrid_search(vector, &query, limit * 3, cross_reference.as_deref())
@@ -1506,6 +1519,36 @@ async fn handle_search_workspace(
                 let end = meta["end_line"].as_u64().unwrap_or(0);
                 out.push_str(&format!(
                     "#### {path} (Lines {start}-{end})\n```\n{}\n```\n\n",
+                    r.content
+                ));
+            }
+            Ok(CallToolResult::text(out))
+        }
+        "turbo" => {
+            if query.is_empty() {
+                return Ok(CallToolResult::error("query is required for turbo search"));
+            }
+            let vector = embed_query_blocking(Arc::clone(&server.embedder), query.clone()).await?;
+            let mut results = server
+                .store
+                .turbo_search(&server.embedder, vector, limit)
+                .await?;
+
+            if let Some(ref pf) = path_filter {
+                results.retain(|(r, _)| r.metadata_str("path").contains(pf.as_str()));
+            }
+
+            if results.is_empty() {
+                return Ok(CallToolResult::text("No matches found."));
+            }
+            let mut out = format!("### Turbo Search Results for '{query}':\n\n");
+            for (r, score) in results {
+                let meta = r.metadata_json();
+                let path = meta["path"].as_str().unwrap_or("?");
+                let start = meta["start_line"].as_u64().unwrap_or(0);
+                let end = meta["end_line"].as_u64().unwrap_or(0);
+                out.push_str(&format!(
+                    "#### {path} (Lines {start}-{end}) [Score: {score:.4}]\n```\n{}\n```\n\n",
                     r.content
                 ));
             }
@@ -2020,7 +2063,7 @@ pub async fn handle_distill_package_purpose(
     );
 
     // Re-index the distilled summary with high-priority metadata.
-    let vector = server.embedder.embed_text(&summary)?;
+    let vector = embed_text_blocking(Arc::clone(&server.embedder), summary.clone()).await?;
     let metadata = serde_json::json!({
         "path": pkg_path,
         "type": "distilled_summary",
@@ -2030,6 +2073,7 @@ pub async fn handle_distill_package_purpose(
     let record = crate::db::Record {
         id: format!("distill-{}", uuid::Uuid::new_v4()),
         content: summary.clone(),
+        quantized_code: server.embedder.quantize(&vector).ok(),
         vector,
         metadata: metadata.to_string(),
     };

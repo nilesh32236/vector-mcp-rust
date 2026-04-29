@@ -57,13 +57,16 @@ prost = "0.14.3"
 turbo-quant = "0.1.0"
 bincode = "1.3.3"
 
+[features]
+cuda = ["ort/cuda"]
+
 [dev-dependencies]
 tempfile = "3"
 
 [profile.release]
 opt-level = 3
-lto = false
-codegen-units = 256
+lto = "thin"
+codegen-units = 1
 panic = "abort"
 debug = false
 

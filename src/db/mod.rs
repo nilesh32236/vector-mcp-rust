@@ -1,15 +1,15 @@
 #![allow(dead_code)]
 pub mod graph;
+use crate::llm::embedding::Embedder;
 use anyhow::{Context, Result, bail};
-use arrow_array::RecordBatch;
+use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use futures::TryStreamExt;
-use lancedb::index::Index as LanceIndex;
-use lancedb::index::vector::IvfPqIndexBuilder;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::{Connection, Table as LanceTable, connect};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashMap};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use tantivy::collector::TopDocs;
@@ -19,8 +19,7 @@ use tantivy::schema::{
     Value as TantivyValue,
 };
 use tantivy::{Index as TantivyIndex, IndexReader, IndexWriter, ReloadPolicy, doc};
-use tracing::{info, warn};
-use crate::llm::embedding::Embedder;
+use tracing::info;
 
 // ---------------------------------------------------------------------------
 // Tantivy Lexical Index
@@ -63,7 +62,20 @@ impl LexicalIndex {
         let writer = if read_only {
             None
         } else {
-            Some(Arc::new(RwLock::new(index.writer(50_000_000)?)))
+            let w = match index.writer(50_000_000) {
+                Ok(w) => w,
+                Err(tantivy::TantivyError::LockFailure(_, _)) => {
+                    // Stale lock from a previous crashed process — delete and retry.
+                    tracing::warn!("Tantivy lock busy, removing stale lockfile and retrying");
+                    let lock_path = path.join(".tantivy-writer.lock");
+                    let _ = std::fs::remove_file(&lock_path);
+                    index
+                        .writer(50_000_000)
+                        .context("Acquiring Tantivy writer after lock removal")?
+                }
+                Err(e) => return Err(e).context("Acquiring Tantivy writer"),
+            };
+            Some(Arc::new(RwLock::new(w)))
         };
 
         Ok(Self {
@@ -75,7 +87,9 @@ impl LexicalIndex {
     }
 
     fn add(&self, doc_id: &str, text: &str) -> Result<()> {
-        let Some(w) = &self.writer else { return Ok(()); };
+        let Some(w) = &self.writer else {
+            return Ok(());
+        };
         let mut writer = w.write().unwrap();
         writer.delete_term(Term::from_field_text(self.fields.id, doc_id));
         writer.add_document(doc!(
@@ -88,7 +102,9 @@ impl LexicalIndex {
 
     /// Add without committing — call `commit()` after a batch.
     fn add_no_commit(&self, doc_id: &str, text: &str) -> Result<()> {
-        let Some(w) = &self.writer else { return Ok(()); };
+        let Some(w) = &self.writer else {
+            return Ok(());
+        };
         let writer = w.write().unwrap();
         writer.delete_term(Term::from_field_text(self.fields.id, doc_id));
         writer.add_document(doc!(
@@ -110,7 +126,9 @@ impl LexicalIndex {
     }
 
     fn remove(&self, doc_id: &str) -> Result<()> {
-        let Some(w) = &self.writer else { return Ok(()); };
+        let Some(w) = &self.writer else {
+            return Ok(());
+        };
         let mut writer = w.write().unwrap();
         writer.delete_term(Term::from_field_text(self.fields.id, doc_id));
         writer.commit()?;
@@ -118,7 +136,9 @@ impl LexicalIndex {
     }
 
     fn remove_no_commit(&self, doc_id: &str) -> Result<()> {
-        let Some(w) = &self.writer else { return Ok(()); };
+        let Some(w) = &self.writer else {
+            return Ok(());
+        };
         let writer = w.write().unwrap();
         writer.delete_term(Term::from_field_text(self.fields.id, doc_id));
         Ok(())
@@ -189,6 +209,7 @@ pub struct Store {
     pub project_context: LanceTable,
     lexical: Arc<LexicalIndex>,
     pub graph: graph::KnowledgeGraph,
+    pub quantized_cache: Arc<dashmap::DashMap<String, Vec<u8>>>,
 }
 
 impl Store {
@@ -237,12 +258,20 @@ impl Store {
             project_context,
             lexical,
             graph: graph::KnowledgeGraph::new(),
+            quantized_cache: Arc::new(dashmap::DashMap::new()),
         };
 
         if store.code_vectors.count_rows(None).await? > 0 {
-            info!("Existing records found. Synchronizing in-memory graph and lexical index...");
+            info!(
+                "Existing records found. Synchronizing in-memory graph, lexical index, and quantized cache..."
+            );
             if let Ok(records) = store.get_all_records().await {
                 store.graph.populate(&records);
+                for r in &records {
+                    if let Some(code) = &r.quantized_code {
+                        store.quantized_cache.insert(r.id.clone(), code.clone());
+                    }
+                }
                 // Rebuild Tantivy if it has no segments (e.g. fresh install or schema change).
                 if store.lexical.is_empty() {
                     info!(
@@ -277,6 +306,30 @@ impl Store {
         Ok(records.pop())
     }
 
+    pub async fn get_records_by_ids(&self, ids: &[String]) -> Result<HashMap<String, Record>> {
+        if ids.is_empty() || self.code_vectors.count_rows(None).await? == 0 {
+            return Ok(HashMap::new());
+        }
+
+        let predicate = ids
+            .iter()
+            .map(|id| format!("id = '{}'", sql_escape(id)))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+
+        let results = self
+            .code_vectors
+            .query()
+            .only_if(predicate)
+            .execute()
+            .await?;
+        let batches = results.try_collect::<Vec<_>>().await?;
+        Ok(batches_to_records(batches)?
+            .into_iter()
+            .map(|r| (r.id.clone(), r))
+            .collect())
+    }
+
     pub async fn update_record_metadata(&self, record_id: &str, new_metadata: &str) -> Result<()> {
         let escaped_id = sql_escape(record_id);
         let escaped_meta = sql_escape(new_metadata);
@@ -297,9 +350,13 @@ impl Store {
         let batch = records_to_batch(&records)?;
 
         for r in &records {
-            let _ = self.lexical.add(&r.id, &bm25_document_text(r));
+            let _ = self.lexical.add_no_commit(&r.id, &bm25_document_text(r));
             self.graph.add_record(r);
+            if let Some(code) = &r.quantized_code {
+                self.quantized_cache.insert(r.id.clone(), code.clone());
+            }
         }
+        let _ = self.lexical.commit();
 
         self.code_vectors.add(vec![batch]).execute().await?;
         Ok(())
@@ -313,6 +370,9 @@ impl Store {
         for r in records {
             let _ = self.lexical.add_no_commit(&r.id, &bm25_document_text(r));
             self.graph.add_record(r);
+            if let Some(code) = &r.quantized_code {
+                self.quantized_cache.insert(r.id.clone(), code.clone());
+            }
         }
         let _ = self.lexical.commit();
         self.code_vectors.add(vec![batch]).execute().await?;
@@ -345,6 +405,7 @@ impl Store {
             .context("Deleting records by path")?;
 
         for r in to_delete {
+            self.quantized_cache.remove(&r.id);
             if commit {
                 let _ = self.lexical.remove(&r.id);
             } else {
@@ -394,9 +455,12 @@ impl Store {
             return Ok(vec![]);
         }
 
+        let ids = hits.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
+        let records = self.get_records_by_ids(&ids).await?;
         let mut matched: Vec<(Record, f32)> = Vec::new();
         for (id, score) in hits {
-            if let Ok(Some(r)) = self.get_record_by_id(&id).await {
+            if let Some(r) = records.get(&id) {
+                let r = r.clone();
                 if let Some(pids) = project_ids {
                     if !pids.is_empty() {
                         let pid = r.metadata_str("project_id");
@@ -421,6 +485,21 @@ impl Store {
         limit: usize,
         project_ids: Option<&[String]>,
     ) -> Result<Vec<Record>> {
+        Ok(self
+            .hybrid_search_scored(vector, query, limit, project_ids)
+            .await?
+            .into_iter()
+            .map(|(record, _)| record)
+            .collect())
+    }
+
+    pub async fn hybrid_search_scored(
+        &self,
+        vector: Vec<f32>,
+        query: &str,
+        limit: usize,
+        project_ids: Option<&[String]>,
+    ) -> Result<Vec<(Record, f32)>> {
         let fetch = limit * 3;
 
         let (vec_res, lex_res) = tokio::join!(
@@ -450,7 +529,7 @@ impl Store {
 
         Ok(ranked
             .into_iter()
-            .filter_map(|(id, _)| record_map.remove(&id))
+            .filter_map(|(id, score)| record_map.remove(&id).map(|r| (r, score as f32)))
             .collect())
     }
 
@@ -460,20 +539,56 @@ impl Store {
         query_vector: Vec<f32>,
         limit: usize,
     ) -> Result<Vec<(Record, f32)>> {
-        let all = self.get_all_records().await?;
-        let mut results = Vec::with_capacity(all.len());
+        #[derive(PartialEq)]
+        struct SearchHit {
+            id: String,
+            score: f32,
+        }
+        impl Eq for SearchHit {}
+        impl Ord for SearchHit {
+            fn cmp(&self, other: &Self) -> Ordering {
+                other
+                    .score
+                    .partial_cmp(&self.score)
+                    .unwrap_or(Ordering::Equal)
+            }
+        }
+        impl PartialOrd for SearchHit {
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
+        }
 
-        for r in all {
-            if let Some(code) = &r.quantized_code {
-                if let Ok(score) = embedder.estimate_similarity(code, &query_vector) {
-                    results.push((r, score));
+        let mut heap = BinaryHeap::with_capacity(limit + 1);
+
+        for entry in self.quantized_cache.iter() {
+            let (id, code) = entry.pair();
+            if let Ok(score) = embedder.estimate_similarity(code, &query_vector) {
+                heap.push(SearchHit {
+                    id: id.clone(),
+                    score,
+                });
+                if heap.len() > limit {
+                    heap.pop();
                 }
             }
         }
 
-        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        results.truncate(limit);
-        Ok(results)
+        let mut ordered_hits = Vec::new();
+        while let Some(hit) = heap.pop() {
+            ordered_hits.push(hit);
+        }
+        let ids = ordered_hits
+            .iter()
+            .map(|hit| hit.id.clone())
+            .collect::<Vec<_>>();
+        let records = self.get_records_by_ids(&ids).await?;
+        let mut final_hits = ordered_hits
+            .into_iter()
+            .filter_map(|hit| records.get(&hit.id).cloned().map(|r| (r, hit.score)))
+            .collect::<Vec<_>>();
+        final_hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+        Ok(final_hits)
     }
 
     // -----------------------------------------------------------------------
@@ -571,7 +686,7 @@ pub async fn connect_store(uri: &str, dimension: usize, read_only: bool) -> Resu
         .execute()
         .await
         .with_context(|| format!("connecting to LanceDB at {final_uri}"))?;
-    
+
     let mut store = Store::open_tables(connection, dimension, &tantivy_path).await?;
     if read_only {
         // Re-open lexical index in read-only mode
@@ -611,7 +726,7 @@ async fn open_or_create_table(
     connection: &Connection,
     name: &str,
     empty_batch: RecordBatch,
-    dimension: usize,
+    _dimension: usize,
 ) -> Result<LanceTable> {
     let table_names = connection.table_names().execute().await?;
     if table_names.contains(&name.to_string()) {
@@ -628,6 +743,8 @@ async fn open_or_create_table(
         .await
         .context("Creating table")?;
 
+    // TODO: move index creation to background task (only when count_rows > 5000)
+    /*
     if dimension > 0 {
         if let Err(e) = table
             .create_index(
@@ -644,6 +761,7 @@ async fn open_or_create_table(
             warn!("IvfPq index creation failed (non-fatal, table may be empty): {e}");
         }
     }
+    */
 
     Ok(table)
 }
@@ -732,11 +850,15 @@ pub fn batches_to_records(batches: Vec<RecordBatch>) -> Result<Vec<Record>> {
             .as_any()
             .downcast_ref::<arrow_array::StringArray>()
             .context("metadata column")?;
-        let quantized_codes = batch
-            .column(4)
-            .as_any()
-            .downcast_ref::<arrow_array::BinaryArray>()
-            .context("quantized_code column")?;
+
+        let quantized_codes = if batch.num_columns() > 4 {
+            batch
+                .column(4)
+                .as_any()
+                .downcast_ref::<arrow_array::BinaryArray>()
+        } else {
+            None
+        };
 
         for i in 0..batch.num_rows() {
             let vec_val = vectors.value(i);
@@ -747,16 +869,20 @@ pub fn batches_to_records(batches: Vec<RecordBatch>) -> Result<Vec<Record>> {
                 .values()
                 .to_vec();
 
+            let q_code = quantized_codes.and_then(|qc| {
+                if qc.is_null(i) {
+                    None
+                } else {
+                    Some(qc.value(i).to_vec())
+                }
+            });
+
             records.push(Record {
                 id: ids.value(i).to_string(),
                 content: contents.value(i).to_string(),
                 vector: vec_f32,
                 metadata: metadatas.value(i).to_string(),
-                quantized_code: if quantized_codes.is_null(i) {
-                    None
-                } else {
-                    Some(quantized_codes.value(i).to_vec())
-                },
+                quantized_code: q_code,
             });
         }
     }

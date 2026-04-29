@@ -98,7 +98,13 @@ pub async fn scan_project(
     let progress_clone = Arc::clone(&progress);
     let discovered_clone = Arc::clone(&discovered);
 
-    let worker_task = path_stream.for_each_concurrent(10, |path_str| {
+    let worker_concurrency = std::env::var("INDEXER_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(2);
+
+    let worker_task = path_stream.for_each_concurrent(worker_concurrency, |path_str| {
         let config = Arc::clone(&config);
         let store = Arc::clone(&store);
         let embedder = Arc::clone(&embedder);
@@ -277,7 +283,7 @@ pub fn spawn_summary_worker(
                     continue;
                 }
                 let summary = match summarizer
-                    .summarize_chunk(&content, Arc::clone(&config))
+                    .summarize_chunk(&content, None, Arc::clone(&config))
                     .await
                 {
                     Ok(s) if !s.is_empty() => s,

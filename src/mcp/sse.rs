@@ -281,8 +281,21 @@ pub async fn start_sse_server(server: Arc<Server>, port: u16) -> anyhow::Result<
         .with_state(manager);
 
     let addr = format!("[::]:{}", port);
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    info!("SSE server listening on http://{}", addr);
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            let fallback = tokio::net::TcpListener::bind("[::]:0").await?;
+            let actual = fallback.local_addr()?;
+            tracing::warn!(
+                configured = port,
+                actual = actual.port(),
+                "MCP port in use, falling back to random free port"
+            );
+            fallback
+        }
+        Err(e) => return Err(e.into()),
+    };
+    info!("SSE server listening on http://{}", listener.local_addr()?);
     axum::serve(listener, app).await?;
     Ok(())
 }

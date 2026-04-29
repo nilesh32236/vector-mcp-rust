@@ -11,7 +11,10 @@ pub async fn download_direct(url: &str, dest: &std::path::Path) -> Result<()> {
             response.status()
         ));
     }
-    let content = response.bytes().await.context("Failed to read response bytes")?;
+    let content = response
+        .bytes()
+        .await
+        .context("Failed to read response bytes")?;
     std::fs::write(dest, content).context("Failed to write destination file")?;
     Ok(())
 }
