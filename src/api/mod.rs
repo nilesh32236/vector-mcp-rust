@@ -12,7 +12,10 @@ use axum::{
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
-use tower_http::cors::CorsLayer;
+use tower_http::{
+    cors::CorsLayer,
+    services::{ServeDir, ServeFile},
+};
 use tracing::info;
 
 use crate::config::Config;
@@ -221,6 +224,50 @@ async fn handle_search(
     Json(resp).into_response()
 }
 
+async fn handle_turbo_search(
+    State(s): State<Arc<ApiState>>,
+    Json(req): Json<SearchRequest>,
+) -> impl IntoResponse {
+    let limit = req.top_k.clamp(1, 100);
+
+    let vector = match s.embedder.embed_query(&req.query) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    let results = match s.store.turbo_search(&s.embedder, vector, limit).await {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    let resp: Vec<SearchResponse> = results
+        .into_iter()
+        .map(|(r, score)| {
+            let path = r.metadata_str("path");
+            SearchResponse {
+                id: r.id,
+                text: r.content,
+                similarity: score,
+                path,
+            }
+        })
+        .collect();
+
+    Json(resp).into_response()
+}
+
 async fn handle_context(
     State(s): State<Arc<ApiState>>,
     Json(req): Json<ContextRequest>,
@@ -276,6 +323,8 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/api/tools/skeleton", get(handle_tools_skeleton))
         .route("/api/search", post(handle_search))
         .route("/api/context", post(handle_context))
+        .route("/api/turbo_search", post(handle_turbo_search))
+        .fallback_service(ServeDir::new("public").fallback(ServeFile::new("public/index.html")))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }

@@ -9,6 +9,7 @@ use ort::session::Session;
 use ort::value::Value;
 use std::sync::Mutex;
 use tokenizers::Tokenizer;
+use turbo_quant::{TurboQuantizer, TurboCode};
 use tracing::info;
 
 const MAX_SEQ_LEN: usize = 512;
@@ -59,10 +60,11 @@ pub struct Embedder {
     matryoshka_dim: Option<usize>,
     pub rerank_session: Option<Mutex<Session>>,
     pub rerank_tokenizer: Option<Tokenizer>,
+    pub quantizer: Option<TurboQuantizer>,
 }
 
 impl Embedder {
-    pub fn new(config: &Config) -> Result<Self> {
+    pub async fn new(config: &Config) -> Result<Self> {
         info!(model = %config.model_name, "Provisioning embedder model...");
 
         let registry = get_model_registry();
@@ -79,8 +81,8 @@ impl Embedder {
 
             if let Some(m_cfg) = model_cfg {
                 // Use Direct Download for known registry models
-                download_direct(m_cfg.onnx_url, &local_onnx_path)?;
-                download_direct(m_cfg.tokenizer_url, &local_tokenizer_path)?;
+                download_direct(m_cfg.onnx_url, &local_onnx_path).await?;
+                download_direct(m_cfg.tokenizer_url, &local_tokenizer_path).await?;
             } else {
                 // Fallback to HF Hub for unknown models
                 let api = Api::new().context("Failed to create HF API client")?;
@@ -132,8 +134,8 @@ impl Embedder {
             if !r_onnx.exists() || !r_tok.exists() {
                 std::fs::create_dir_all(&r_dir)?;
                 if let Some(cfg) = r_cfg {
-                    download_direct(cfg.onnx_url, &r_onnx)?;
-                    download_direct(cfg.tokenizer_url, &r_tok)?;
+                    download_direct(cfg.onnx_url, &r_onnx).await?;
+                    download_direct(cfg.tokenizer_url, &r_tok).await?;
                 } else {
                     let api = Api::new().context("Failed to create HF API client for reranker")?;
                     let r_repo = api.model(config.reranker_model_name.clone());
@@ -155,6 +157,14 @@ impl Embedder {
             rerank_tokenizer = Some(tok);
         }
 
+        // Initialize TurboQuantizer if dimension is suitable (must be even)
+        let quantizer = if config.dimension % 2 == 0 {
+            let projections = config.dimension / 4;
+            TurboQuantizer::new(config.dimension, 8, projections, 42).ok()
+        } else {
+            None
+        };
+
         Ok(Self {
             session: Mutex::new(session),
             tokenizer,
@@ -163,6 +173,7 @@ impl Embedder {
             matryoshka_dim,
             rerank_session,
             rerank_tokenizer,
+            quantizer,
         })
     }
 
@@ -176,6 +187,30 @@ impl Embedder {
 
     pub fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
         self.embed_inner(text, true)
+    }
+
+    pub fn quantize(&self, vector: &[f32]) -> Result<Vec<u8>> {
+        let q = self
+            .quantizer
+            .as_ref()
+            .context("TurboQuantizer not initialized (dimension must be even)")?;
+        let code = q.encode(vector)
+            .map_err(|e| anyhow::anyhow!("Quantization failed: {e}"))?;
+        
+        bincode::serialize(&code).context("Failed to serialize TurboCode")
+    }
+
+    pub fn estimate_similarity(&self, code_bytes: &[u8], query: &[f32]) -> Result<f32> {
+        let q = self
+            .quantizer
+            .as_ref()
+            .context("TurboQuantizer not initialized")?;
+        
+        let code: TurboCode = bincode::deserialize(code_bytes)
+            .context("Failed to deserialize TurboCode")?;
+
+        q.inner_product_estimate(&code, query)
+            .map_err(|e| anyhow::anyhow!("Similarity estimation failed: {e}"))
     }
 
     /// Embed a batch of texts in a single ONNX forward pass.

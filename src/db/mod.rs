@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 pub mod graph;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use futures::TryStreamExt;
@@ -20,6 +20,7 @@ use tantivy::schema::{
 };
 use tantivy::{Index as TantivyIndex, IndexReader, IndexWriter, ReloadPolicy, doc};
 use tracing::{info, warn};
+use crate::llm::embedding::Embedder;
 
 // ---------------------------------------------------------------------------
 // Tantivy Lexical Index
@@ -28,7 +29,7 @@ use tracing::{info, warn};
 pub struct LexicalIndex {
     index: TantivyIndex,
     reader: IndexReader,
-    writer: Arc<RwLock<IndexWriter>>,
+    writer: Option<Arc<RwLock<IndexWriter>>>,
     fields: LexicalFields,
 }
 
@@ -38,7 +39,7 @@ struct LexicalFields {
 }
 
 impl LexicalIndex {
-    fn open_or_create(path: &Path) -> Result<Self> {
+    fn open_or_create(path: &Path, read_only: bool) -> Result<Self> {
         let mut schema_builder = TantivySchema::builder();
         let id = schema_builder.add_text_field("id", STRING | STORED);
         let text = schema_builder.add_text_field("text", TEXT | STORED);
@@ -47,6 +48,9 @@ impl LexicalIndex {
         let index = if path.exists() && path.is_dir() && std::fs::read_dir(path)?.next().is_some() {
             TantivyIndex::open_in_dir(path).context("Opening Tantivy index")?
         } else {
+            if read_only {
+                bail!("Cannot create a new index in read-only mode");
+            }
             std::fs::create_dir_all(path).context("Creating index directory")?;
             TantivyIndex::create_in_dir(path, schema).context("Creating Tantivy index")?
         };
@@ -55,7 +59,12 @@ impl LexicalIndex {
             .reader_builder()
             .reload_policy(ReloadPolicy::OnCommitWithDelay)
             .try_into()?;
-        let writer = Arc::new(RwLock::new(index.writer(50_000_000)?)); // 50MB heap
+
+        let writer = if read_only {
+            None
+        } else {
+            Some(Arc::new(RwLock::new(index.writer(50_000_000)?)))
+        };
 
         Ok(Self {
             index,
@@ -66,7 +75,8 @@ impl LexicalIndex {
     }
 
     fn add(&self, doc_id: &str, text: &str) -> Result<()> {
-        let mut writer = self.writer.write().unwrap();
+        let Some(w) = &self.writer else { return Ok(()); };
+        let mut writer = w.write().unwrap();
         writer.delete_term(Term::from_field_text(self.fields.id, doc_id));
         writer.add_document(doc!(
             self.fields.id => doc_id,
@@ -78,7 +88,8 @@ impl LexicalIndex {
 
     /// Add without committing — call `commit()` after a batch.
     fn add_no_commit(&self, doc_id: &str, text: &str) -> Result<()> {
-        let writer = self.writer.write().unwrap();
+        let Some(w) = &self.writer else { return Ok(()); };
+        let writer = w.write().unwrap();
         writer.delete_term(Term::from_field_text(self.fields.id, doc_id));
         writer.add_document(doc!(
             self.fields.id => doc_id,
@@ -88,7 +99,9 @@ impl LexicalIndex {
     }
 
     fn commit(&self) -> Result<()> {
-        self.writer.write().unwrap().commit()?;
+        if let Some(w) = &self.writer {
+            w.write().unwrap().commit()?;
+        }
         Ok(())
     }
 
@@ -97,9 +110,17 @@ impl LexicalIndex {
     }
 
     fn remove(&self, doc_id: &str) -> Result<()> {
-        let mut writer = self.writer.write().unwrap();
+        let Some(w) = &self.writer else { return Ok(()); };
+        let mut writer = w.write().unwrap();
         writer.delete_term(Term::from_field_text(self.fields.id, doc_id));
         writer.commit()?;
+        Ok(())
+    }
+
+    fn remove_no_commit(&self, doc_id: &str) -> Result<()> {
+        let Some(w) = &self.writer else { return Ok(()); };
+        let writer = w.write().unwrap();
+        writer.delete_term(Term::from_field_text(self.fields.id, doc_id));
         Ok(())
     }
 
@@ -142,6 +163,7 @@ pub struct Record {
     pub vector: Vec<f32>,
     /// JSON blob — matches Go's `map[string]string` serialised with `json.Marshal`.
     pub metadata: String,
+    pub quantized_code: Option<Vec<u8>>,
 }
 
 impl Record {
@@ -190,6 +212,7 @@ impl Store {
                     false,
                 ),
                 ArrowField::new("metadata", DataType::Utf8, true),
+                ArrowField::new("quantized_code", DataType::Binary, true),
             ]))),
             dimension,
         )
@@ -207,7 +230,7 @@ impl Store {
         )
         .await?;
 
-        let lexical = Arc::new(LexicalIndex::open_or_create(index_path)?);
+        let lexical = Arc::new(LexicalIndex::open_or_create(index_path, false)?);
 
         let store = Self {
             code_vectors,
@@ -296,20 +319,37 @@ impl Store {
         Ok(())
     }
 
+    pub fn commit_lexical(&self) -> Result<()> {
+        self.lexical.commit()
+    }
+
     pub async fn delete_by_path(&self, path: &str) -> Result<()> {
+        self.delete_by_path_inner(path, true).await
+    }
+
+    pub async fn delete_by_path_no_commit(&self, path: &str) -> Result<()> {
+        self.delete_by_path_inner(path, false).await
+    }
+
+    async fn delete_by_path_inner(&self, path: &str, commit: bool) -> Result<()> {
         let predicate = format!("metadata LIKE '%\"path\":\"{}\"%'", sql_escape(path));
 
-        // Fetch IDs for Tantivy cleanup, then immediately delete from LanceDB.
-        // Keeping the window between read and delete as small as possible.
         let to_delete = self.get_records_by_path(path).await?;
+        if to_delete.is_empty() {
+            return Ok(());
+        }
+
         self.code_vectors
             .delete(&predicate)
             .await
-            .context("Deleting records by path")
-            .map(|_| ())?;
+            .context("Deleting records by path")?;
 
         for r in to_delete {
-            let _ = self.lexical.remove(&r.id);
+            if commit {
+                let _ = self.lexical.remove(&r.id);
+            } else {
+                let _ = self.lexical.remove_no_commit(&r.id);
+            }
         }
 
         Ok(())
@@ -414,6 +454,28 @@ impl Store {
             .collect())
     }
 
+    pub async fn turbo_search(
+        &self,
+        embedder: &Embedder,
+        query_vector: Vec<f32>,
+        limit: usize,
+    ) -> Result<Vec<(Record, f32)>> {
+        let all = self.get_all_records().await?;
+        let mut results = Vec::with_capacity(all.len());
+
+        for r in all {
+            if let Some(code) = &r.quantized_code {
+                if let Ok(score) = embedder.estimate_similarity(code, &query_vector) {
+                    results.push((r, score));
+                }
+            }
+        }
+
+        results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(limit);
+        Ok(results)
+    }
+
     // -----------------------------------------------------------------------
     // Bulk reads
     // -----------------------------------------------------------------------
@@ -495,7 +557,7 @@ impl Store {
 // Public constructor
 // ---------------------------------------------------------------------------
 
-pub async fn connect_store(uri: &str, dimension: usize) -> Result<Store> {
+pub async fn connect_store(uri: &str, dimension: usize, read_only: bool) -> Result<Store> {
     let final_uri = if uri.starts_with('/') {
         format!("file://{}", uri)
     } else {
@@ -509,7 +571,13 @@ pub async fn connect_store(uri: &str, dimension: usize) -> Result<Store> {
         .execute()
         .await
         .with_context(|| format!("connecting to LanceDB at {final_uri}"))?;
-    Store::open_tables(connection, dimension, &tantivy_path).await
+    
+    let mut store = Store::open_tables(connection, dimension, &tantivy_path).await?;
+    if read_only {
+        // Re-open lexical index in read-only mode
+        store.lexical = Arc::new(LexicalIndex::open_or_create(&tantivy_path, true)?);
+    }
+    Ok(store)
 }
 
 // ---------------------------------------------------------------------------
@@ -598,6 +666,7 @@ fn records_to_batch(records: &[Record]) -> Result<RecordBatch> {
             false,
         ),
         ArrowField::new("metadata", DataType::Utf8, true),
+        ArrowField::new("quantized_code", DataType::Binary, true),
     ]));
 
     let ids = StringArray::from(records.iter().map(|r| r.id.as_str()).collect::<Vec<_>>());
@@ -611,6 +680,12 @@ fn records_to_batch(records: &[Record]) -> Result<RecordBatch> {
         records
             .iter()
             .map(|r| r.metadata.as_str())
+            .collect::<Vec<_>>(),
+    );
+    let quantized_codes = arrow_array::BinaryArray::from(
+        records
+            .iter()
+            .map(|r| r.quantized_code.as_deref())
             .collect::<Vec<_>>(),
     );
 
@@ -628,6 +703,7 @@ fn records_to_batch(records: &[Record]) -> Result<RecordBatch> {
             Arc::new(contents),
             Arc::new(vectors),
             Arc::new(metadatas),
+            Arc::new(quantized_codes),
         ],
     )
     .context("Building RecordBatch")
@@ -656,6 +732,11 @@ pub fn batches_to_records(batches: Vec<RecordBatch>) -> Result<Vec<Record>> {
             .as_any()
             .downcast_ref::<arrow_array::StringArray>()
             .context("metadata column")?;
+        let quantized_codes = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<arrow_array::BinaryArray>()
+            .context("quantized_code column")?;
 
         for i in 0..batch.num_rows() {
             let vec_val = vectors.value(i);
@@ -671,6 +752,11 @@ pub fn batches_to_records(batches: Vec<RecordBatch>) -> Result<Vec<Record>> {
                 content: contents.value(i).to_string(),
                 vector: vec_f32,
                 metadata: metadatas.value(i).to_string(),
+                quantized_code: if quantized_codes.is_null(i) {
+                    None
+                } else {
+                    Some(quantized_codes.value(i).to_vec())
+                },
             });
         }
     }

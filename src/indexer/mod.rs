@@ -192,8 +192,9 @@ pub async fn index_file(
                 i
             ),
             content: chunk.content,
-            vector,
+            vector: vector.clone(),
             metadata: metadata.to_string(),
+            quantized_code: embedder.quantize(&vector).ok(),
         });
     }
 
