@@ -12,7 +12,10 @@ use axum::{
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
-use tower_http::cors::CorsLayer;
+use tower_http::{
+    cors::CorsLayer,
+    services::{ServeDir, ServeFile},
+};
 use tracing::info;
 
 use crate::config::Config;
@@ -72,6 +75,20 @@ struct ContextRequest {
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
+
+async fn embed_query_blocking(embedder: Arc<Embedder>, query: String) -> Result<Vec<f32>, String> {
+    tokio::task::spawn_blocking(move || embedder.embed_query(&query))
+        .await
+        .map_err(|e| format!("Embedding task failed: {e}"))?
+        .map_err(|e| e.to_string())
+}
+
+async fn embed_text_blocking(embedder: Arc<Embedder>, text: String) -> Result<Vec<f32>, String> {
+    tokio::task::spawn_blocking(move || embedder.embed_text(&text))
+        .await
+        .map_err(|e| format!("Embedding task failed: {e}"))?
+        .map_err(|e| e.to_string())
+}
 
 async fn handle_health(State(s): State<Arc<ApiState>>) -> impl IntoResponse {
     let db_ok = s.store.code_vectors.count_rows(None).await.is_ok();
@@ -175,19 +192,24 @@ async fn handle_search(
     Json(req): Json<SearchRequest>,
 ) -> impl IntoResponse {
     let top_k = req.top_k.clamp(1, 100);
+    let query = req.query.clone();
 
-    let vector = match s.embedder.embed_query(&req.query) {
+    let vector = match embed_query_blocking(Arc::clone(&s.embedder), query.clone()).await {
         Ok(v) => v,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
+                Json(serde_json::json!({ "error": e })),
             )
                 .into_response();
         }
     };
 
-    let results = match s.store.hybrid_search(vector, &req.query, top_k, None).await {
+    let results = match s
+        .store
+        .hybrid_search_scored(vector, &query, top_k, None)
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             return (
@@ -200,19 +222,63 @@ async fn handle_search(
 
     let resp: Vec<SearchResponse> = results
         .into_iter()
-        .filter(|r| {
+        .filter(|(r, _)| {
             if req.docs_only {
                 r.metadata_str("category") == "document"
             } else {
                 true
             }
         })
-        .map(|r| {
+        .map(|(r, score)| {
             let path = r.metadata_str("path");
             SearchResponse {
                 id: r.id,
                 text: r.content,
-                similarity: 0.0,
+                similarity: score,
+                path,
+            }
+        })
+        .collect();
+
+    Json(resp).into_response()
+}
+
+async fn handle_turbo_search(
+    State(s): State<Arc<ApiState>>,
+    Json(req): Json<SearchRequest>,
+) -> impl IntoResponse {
+    let limit = req.top_k.clamp(1, 100);
+
+    let vector = match embed_query_blocking(Arc::clone(&s.embedder), req.query).await {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e })),
+            )
+                .into_response();
+        }
+    };
+
+    let results = match s.store.turbo_search(&s.embedder, vector, limit).await {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    let resp: Vec<SearchResponse> = results
+        .into_iter()
+        .map(|(r, score)| {
+            let path = r.metadata_str("path");
+            SearchResponse {
+                id: r.id,
+                text: r.content,
+                similarity: score,
                 path,
             }
         })
@@ -225,12 +291,12 @@ async fn handle_context(
     State(s): State<Arc<ApiState>>,
     Json(req): Json<ContextRequest>,
 ) -> impl IntoResponse {
-    let vector = match s.embedder.embed_text(&req.text) {
+    let vector = match embed_text_blocking(Arc::clone(&s.embedder), req.text.clone()).await {
         Ok(v) => v,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
+                Json(serde_json::json!({ "error": e })),
             )
                 .into_response();
         }
@@ -246,6 +312,7 @@ async fn handle_context(
     let record = crate::db::Record {
         id,
         content: req.text,
+        quantized_code: s.embedder.quantize(&vector).ok(),
         vector,
         metadata: metadata.to_string(),
     };
@@ -276,14 +343,33 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/api/tools/skeleton", get(handle_tools_skeleton))
         .route("/api/search", post(handle_search))
         .route("/api/context", post(handle_context))
+        .route("/api/turbo_search", post(handle_turbo_search))
+        .fallback_service(ServeDir::new("public").fallback(ServeFile::new("public/index.html")))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
 
 pub async fn start_api_server(state: Arc<ApiState>, port: u16) -> anyhow::Result<()> {
     let addr = format!("[::]:{port}");
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    info!("HTTP API server listening on http://{addr}");
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            // Configured port is taken — bind on any free port instead.
+            let fallback = tokio::net::TcpListener::bind("[::]:0").await?;
+            let actual = fallback.local_addr()?;
+            tracing::warn!(
+                configured = port,
+                actual = actual.port(),
+                "API port in use, falling back to random free port"
+            );
+            fallback
+        }
+        Err(e) => return Err(e.into()),
+    };
+    info!(
+        "HTTP API server listening on http://{}",
+        listener.local_addr()?
+    );
     axum::serve(listener, router(state)).await?;
     Ok(())
 }

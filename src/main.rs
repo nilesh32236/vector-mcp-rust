@@ -72,7 +72,10 @@ fn setup_logging(
         .with(file_layer)
         .with(stderr_layer);
 
-    if std::env::var("ENABLE_OTEL").is_ok() {
+    let enable_otel = std::env::var("ENABLE_OTEL")
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false);
+    if enable_otel {
         let exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_tonic()
             .with_endpoint("http://localhost:4317")
@@ -103,11 +106,11 @@ fn setup_logging(
 
 async fn init_components(cfg: &Config) -> Result<(Arc<Store>, Arc<Embedder>, Arc<Summarizer>)> {
     let db_uri = cfg.db_path.display().to_string();
-    let store = db::connect_store(&db_uri, cfg.dimension).await?;
+    let store = db::connect_store(&db_uri, cfg.dimension, false).await?;
     info!("LanceDB connected — tables initialised");
 
-    let embedder = Arc::new(Embedder::new(cfg)?);
-    let summarizer = Arc::new(Summarizer::new(cfg)?);
+    let embedder = Arc::new(Embedder::new(cfg).await?);
+    let summarizer = Arc::new(Summarizer::new(cfg).await?);
 
     Ok((Arc::new(store), embedder, summarizer))
 }
@@ -297,12 +300,12 @@ async fn run_slave(cfg: Config, socket_path: String) -> Result<()> {
     // in-process store connected to the same LanceDB path (read-only queries
     // that aren't performance-critical). Heavy ops go via the daemon.
     let db_uri = config.db_path.display().to_string();
-    let store = Arc::new(db::connect_store(&db_uri, config.dimension).await?);
+    let store = Arc::new(db::connect_store(&db_uri, config.dimension, true).await?);
 
     // NOTE: Embedder is loaded locally until the Server struct is refactored to
     // accept a trait object. RemoteEmbedder exists in daemon::slave for that future work.
-    let embedder = Arc::new(Embedder::new(&config)?);
-    let summarizer = Arc::new(Summarizer::new(&config)?);
+    let embedder = Arc::new(Embedder::new(&config).await?);
+    let summarizer = Arc::new(Summarizer::new(&config).await?);
 
     let (reload_tx, _reload_rx) = tokio::sync::mpsc::channel::<String>(10);
 
@@ -336,8 +339,8 @@ async fn start_servers(
 ) -> Result<()> {
     let port_str = config.api_port.clone();
 
-    if let Ok(port) = port_str.parse::<u16>() {
-        let api_port = port + 1;
+    if let Ok(api_port) = port_str.parse::<u16>() {
+        let mcp_port = api_port - 1;
         let api_state = Arc::new(api::ApiState {
             store: Arc::clone(&store),
             embedder: Arc::clone(&embedder),
@@ -349,13 +352,13 @@ async fn start_servers(
             version: env!("CARGO_PKG_VERSION"),
         });
 
-        info!(mcp_port = port, api_port, "vector-mcp-rust ready ✓");
+        info!(mcp_port, api_port, "vector-mcp-rust ready ✓");
 
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 info!("Ctrl-C received — shutting down");
             }
-            res = mcp::sse::start_sse_server(Arc::clone(&server), port) => {
+            res = mcp::sse::start_sse_server(Arc::clone(&server), mcp_port) => {
                 if let Err(e) = res { tracing::error!(err = %e, "SSE server failed"); }
             }
             res = api::start_api_server(api_state, api_port) => {

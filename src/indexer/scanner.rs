@@ -98,7 +98,13 @@ pub async fn scan_project(
     let progress_clone = Arc::clone(&progress);
     let discovered_clone = Arc::clone(&discovered);
 
-    let worker_task = path_stream.for_each_concurrent(10, |path_str| {
+    let worker_concurrency = std::env::var("INDEXER_CONCURRENCY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(2);
+
+    let worker_task = path_stream.for_each_concurrent(worker_concurrency, |path_str| {
         let config = Arc::clone(&config);
         let store = Arc::clone(&store);
         let embedder = Arc::clone(&embedder);
@@ -106,6 +112,7 @@ pub async fn scan_project(
         let progress = Arc::clone(&progress_clone);
         let record_tx = record_tx_clone.clone();
         let discovered = Arc::clone(&discovered_clone);
+        let indexed = Arc::clone(&indexed);
         async move {
             let n = discovered.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
             {
@@ -127,14 +134,15 @@ pub async fn scan_project(
                     if !records.is_empty() {
                         let _ = record_tx.send((path_str, records)).await;
                     }
+                    // Increment indexed count immediately for better UI feedback
+                    let c = indexed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    let mut p = progress.write().unwrap();
+                    p.indexed_files = c;
                 }
                 Err(e) => {
                     warn!("Failed to index {}: {:?}", path_str, e);
-                    progress
-                        .write()
-                        .unwrap()
-                        .errors
-                        .push(format!("{}: {}", path_str, e));
+                    let mut p = progress.write().unwrap();
+                    p.errors.push(format!("{}: {}", path_str, e));
                 }
             }
         }
@@ -142,11 +150,6 @@ pub async fn scan_project(
 
     // Accumulator task: drain the record channel and flush in batches.
     let store_clone = Arc::clone(&store);
-    let progress_acc = Arc::clone(&progress);
-    let indexed_acc = Arc::clone(&indexed);
-    let token_clone = token.clone();
-    let total_ref = Arc::clone(&discovered);
-    let progress_tx_clone = progress_tx.clone();
 
     let accumulator_task = async move {
         let mut batch: Vec<crate::db::Record> = Vec::with_capacity(BATCH_INSERT_THRESHOLD);
@@ -156,7 +159,7 @@ pub async fn scan_project(
         while let Some((path, records)) = record_rx.recv().await {
             // Only delete stale records once per path per scan run.
             if !deleted_paths.contains(&path) {
-                if let Err(e) = store_clone.delete_by_path(&path).await {
+                if let Err(e) = store_clone.delete_by_path_no_commit(&path).await {
                     warn!("Failed to delete stale records for {}: {:?}", path, e);
                 }
                 deleted_paths.insert(path.clone());
@@ -168,26 +171,6 @@ pub async fn scan_project(
                 if let Err(e) = store_clone.insert_batch(&batch).await {
                     warn!("Batch insert failed: {:?}", e);
                 }
-                let c = indexed_acc.fetch_add(
-                    paths_in_batch.len() as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                ) + paths_in_batch.len() as u64;
-                let total = total_ref.load(std::sync::atomic::Ordering::Relaxed);
-                progress_acc.write().unwrap().indexed_files = c;
-
-                if let Some(tx) = &progress_tx_clone
-                    && c.is_multiple_of(10)
-                {
-                    let _ = tx
-                        .send(ScanProgress {
-                            progress_token: token_clone.clone(),
-                            progress: c,
-                            total,
-                            current_file: paths_in_batch.last().cloned().unwrap_or_default(),
-                            status: "indexing",
-                        })
-                        .await;
-                }
                 batch.clear();
                 paths_in_batch.clear();
             }
@@ -198,12 +181,9 @@ pub async fn scan_project(
             if let Err(e) = store_clone.insert_batch(&batch).await {
                 warn!("Final batch insert failed: {:?}", e);
             }
-            let c = indexed_acc.fetch_add(
-                paths_in_batch.len() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            ) + paths_in_batch.len() as u64;
-            progress_acc.write().unwrap().indexed_files = c;
         }
+        // Final Tantivy commit after all bulk operations.
+        let _ = store_clone.commit_lexical();
     };
 
     // Drop the extra sender so the accumulator can detect when all workers are done.
@@ -218,13 +198,14 @@ pub async fn scan_project(
 
     {
         let mut p = progress.write().unwrap();
-        p.status = "complete".into();
+        p.status = "Analyzing Relationships".into();
         p.indexed_files = final_count;
         p.total_files = total;
     }
 
     // Refresh knowledge graph once after all inserts.
     if let Ok(all) = store.get_all_records().await {
+        store.graph.populate(&all);
         // Enqueue records that need summarization (function_score > 0.5, no summary yet).
         for r in &all {
             let meta = r.metadata_json();
@@ -240,6 +221,11 @@ pub async fn scan_project(
         }
     }
 
+    {
+        let mut p = progress.write().unwrap();
+        p.status = "Ready".into();
+    }
+
     if let Some(tx) = &progress_tx {
         let _ = tx
             .send(ScanProgress {
@@ -247,7 +233,7 @@ pub async fn scan_project(
                 progress: final_count,
                 total,
                 current_file: String::new(),
-                status: "complete",
+                status: "Ready",
             })
             .await;
     }
@@ -297,7 +283,7 @@ pub fn spawn_summary_worker(
                     continue;
                 }
                 let summary = match summarizer
-                    .summarize_chunk(&content, Arc::clone(&config))
+                    .summarize_chunk(&content, None, Arc::clone(&config))
                     .await
                 {
                     Ok(s) if !s.is_empty() => s,
@@ -312,6 +298,8 @@ pub fn spawn_summary_worker(
                         .update_record_metadata(&record_id, &meta.to_string())
                         .await;
                 }
+                // Yield to the executor to keep the API responsive
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
         }
     });

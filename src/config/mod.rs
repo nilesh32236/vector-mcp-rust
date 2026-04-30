@@ -133,6 +133,16 @@ impl Config {
             .display()
             .to_string();
 
+        let dimension = env::var("EMBEDDING_DIM")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .or_else(|| {
+                crate::llm::models::get_model_registry()
+                    .get(model_name.as_str())
+                    .map(|m| m.dimension)
+            })
+            .unwrap_or(384);
+
         Ok(Self {
             project_root: std::sync::RwLock::new(project_root),
             data_dir,
@@ -142,7 +152,7 @@ impl Config {
             model_name,
             reranker_model_name,
             hf_token: env::var("HF_TOKEN").unwrap_or_default(),
-            dimension: 384,
+            dimension,
             disable_watcher,
             embedder_pool_size,
             api_port,

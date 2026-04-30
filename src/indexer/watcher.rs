@@ -279,6 +279,7 @@ async fn distill_package_internal(
     let record = crate::db::Record {
         id: format!("distill-{}", uuid::Uuid::new_v4()),
         content: summary,
+        quantized_code: embedder.quantize(&vector).ok(),
         vector,
         metadata: metadata.to_string(),
     };

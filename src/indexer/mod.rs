@@ -61,7 +61,7 @@ pub async fn index_file(
     config: Arc<Config>,
     store: Arc<Store>,
     embedder: Arc<Embedder>,
-    summarizer: Arc<Summarizer>,
+    _summarizer: Arc<Summarizer>,
 ) -> Result<Vec<Record>> {
     let raw_bytes = tokio::fs::read(path)
         .await
@@ -117,55 +117,26 @@ pub async fn index_file(
     let chunk_texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
     let mut all_vectors: Vec<Vec<f32>> = Vec::with_capacity(chunk_texts.len());
     for batch in chunk_texts.chunks(EMBED_BATCH_SIZE) {
-        let vecs = embedder.embed_batch(batch)?;
+        let batch = batch.to_vec();
+        let embedder = Arc::clone(&embedder);
+        let vecs = tokio::task::spawn_blocking(move || embedder.embed_batch(&batch)).await??;
         all_vectors.extend(vecs);
     }
+    let quantized_codes: Vec<Option<Vec<u8>>> = all_vectors
+        .iter()
+        .map(|vector| embedder.quantize(vector).ok())
+        .collect();
 
-    // Run AI summarizations with bounded concurrency (semaphore) to avoid OOM / rate limits.
-    // Only run if local LLM is enabled; otherwise skip and let the background worker handle it.
-    const MAX_CONCURRENT_LLM_REQUESTS: usize = 4;
-    let enable_llm = config.feature_toggles.enable_local_llm;
-    let summaries: Vec<String> = if enable_llm {
-        let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_LLM_REQUESTS));
-        let summary_handles: Vec<_> = chunks
-            .iter()
-            .map(|chunk| {
-                let content = chunk.content.clone();
-                let score = chunk.function_score;
-                let summarizer = Arc::clone(&summarizer);
-                let config = Arc::clone(&config);
-                let path = path.to_string();
-                let sem = Arc::clone(&sem);
-                tokio::spawn(async move {
-                    if score > 0.5 {
-                        let _permit = sem.acquire().await;
-                        match summarizer.summarize_chunk(&content, config).await {
-                            Ok(s) => s,
-                            Err(e) => {
-                                tracing::error!("Summary failed for {}: {}", path, e);
-                                String::new()
-                            }
-                        }
-                    } else {
-                        String::new()
-                    }
-                })
-            })
-            .collect();
-        let mut out = Vec::with_capacity(summary_handles.len());
-        for h in summary_handles {
-            out.push(h.await.unwrap_or_default());
-        }
-        out
-    } else {
-        // Summaries deferred to background worker — leave empty for now.
-        vec![String::new(); chunks.len()]
-    };
+    // Summaries are intentionally deferred to the scanner's background worker.
+    // Running local LLM generation inline makes initial indexing and API
+    // readiness compete for the same CPU budget.
+    let summaries = vec![String::new(); chunks.len()];
 
     let mut records = Vec::with_capacity(chunks.len());
-    for (i, ((chunk, vector), ai_summary)) in chunks
+    for (i, (((chunk, vector), quantized_code), ai_summary)) in chunks
         .into_iter()
         .zip(all_vectors)
+        .zip(quantized_codes)
         .zip(summaries)
         .enumerate()
     {
@@ -194,6 +165,7 @@ pub async fn index_file(
             content: chunk.content,
             vector,
             metadata: metadata.to_string(),
+            quantized_code,
         });
     }
 

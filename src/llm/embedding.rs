@@ -10,6 +10,7 @@ use ort::value::Value;
 use std::sync::Mutex;
 use tokenizers::Tokenizer;
 use tracing::info;
+use turbo_quant::{TurboCode, TurboQuantizer};
 
 const MAX_SEQ_LEN: usize = 512;
 
@@ -59,10 +60,11 @@ pub struct Embedder {
     matryoshka_dim: Option<usize>,
     pub rerank_session: Option<Mutex<Session>>,
     pub rerank_tokenizer: Option<Tokenizer>,
+    pub quantizer: Option<TurboQuantizer>,
 }
 
 impl Embedder {
-    pub fn new(config: &Config) -> Result<Self> {
+    pub async fn new(config: &Config) -> Result<Self> {
         info!(model = %config.model_name, "Provisioning embedder model...");
 
         let registry = get_model_registry();
@@ -79,14 +81,16 @@ impl Embedder {
 
             if let Some(m_cfg) = model_cfg {
                 // Use Direct Download for known registry models
-                download_direct(m_cfg.onnx_url, &local_onnx_path)?;
-                download_direct(m_cfg.tokenizer_url, &local_tokenizer_path)?;
+                // Note: To use quantized models, ensure the URL points to a model_quantized.onnx file.
+                download_direct(m_cfg.onnx_url, &local_onnx_path).await?;
+                download_direct(m_cfg.tokenizer_url, &local_tokenizer_path).await?;
             } else {
                 // Fallback to HF Hub for unknown models
                 let api = Api::new().context("Failed to create HF API client")?;
                 let repo = api.model(config.model_name.clone());
 
                 if !local_onnx_path.exists() {
+                    // Prioritize INT8 quantized models for lower RAM and higher speed
                     let model_path = repo
                         .get("onnx/model_quantized.onnx")
                         .or_else(|_| repo.get("onnx/model.onnx"))
@@ -105,9 +109,32 @@ impl Embedder {
             }
         }
 
-        let session = Session::builder()?
+        // Configure ORT session with optimal execution providers (EP)
+        let builder = Session::builder()
+            .map_err(|e| anyhow::anyhow!("Failed to create ORT session builder: {e}"))?;
+
+        // Attempt to enable hardware acceleration
+        #[cfg(target_os = "macos")]
+        let builder = builder
+            .with_execution_providers([ort::execution_providers::CoreMLExecutionProvider::default(
+            )
+            .build()])
+            .map_err(|e| anyhow::anyhow!("Failed to enable CoreML EP: {e}"))?;
+
+        #[cfg(all(not(target_os = "macos"), feature = "cuda"))]
+        let builder = builder
+            .with_execution_providers([
+                ort::execution_providers::CUDAExecutionProvider::default().build()
+            ])
+            .map_err(|e| anyhow::anyhow!("Failed to enable CUDA EP: {e}"))?;
+
+        let session = builder
+            .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
+            .map_err(|e| anyhow::anyhow!("Failed to set optimization level: {e}"))?
+            .with_intra_threads(4)
+            .map_err(|e| anyhow::anyhow!("Failed to set intra threads: {e}"))?
             .commit_from_file(&local_onnx_path)
-            .context("Failed to load ONNX model")?;
+            .map_err(|e| anyhow::anyhow!("Failed to load ONNX model: {e}"))?;
 
         let tokenizer = build_tokenizer(local_tokenizer_path)?;
 
@@ -132,8 +159,8 @@ impl Embedder {
             if !r_onnx.exists() || !r_tok.exists() {
                 std::fs::create_dir_all(&r_dir)?;
                 if let Some(cfg) = r_cfg {
-                    download_direct(cfg.onnx_url, &r_onnx)?;
-                    download_direct(cfg.tokenizer_url, &r_tok)?;
+                    download_direct(cfg.onnx_url, &r_onnx).await?;
+                    download_direct(cfg.tokenizer_url, &r_tok).await?;
                 } else {
                     let api = Api::new().context("Failed to create HF API client for reranker")?;
                     let r_repo = api.model(config.reranker_model_name.clone());
@@ -149,11 +176,22 @@ impl Embedder {
                 }
             }
 
-            let sess = Session::builder()?.commit_from_file(r_onnx)?;
+            let sess = Session::builder()
+                .map_err(|e| anyhow::anyhow!("Failed to create reranker session builder: {e}"))?
+                .commit_from_file(r_onnx)
+                .map_err(|e| anyhow::anyhow!("Failed to load reranker ONNX model: {e}"))?;
             let tok = build_tokenizer(r_tok)?;
             rerank_session = Some(Mutex::new(sess));
             rerank_tokenizer = Some(tok);
         }
+
+        // Initialize TurboQuantizer if dimension is suitable (must be even)
+        let quantizer = if config.dimension % 2 == 0 {
+            let projections = config.dimension / 4;
+            TurboQuantizer::new(config.dimension, 8, projections, 42).ok()
+        } else {
+            None
+        };
 
         Ok(Self {
             session: Mutex::new(session),
@@ -163,6 +201,7 @@ impl Embedder {
             matryoshka_dim,
             rerank_session,
             rerank_tokenizer,
+            quantizer,
         })
     }
 
@@ -176,6 +215,31 @@ impl Embedder {
 
     pub fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
         self.embed_inner(text, true)
+    }
+
+    pub fn quantize(&self, vector: &[f32]) -> Result<Vec<u8>> {
+        let q = self
+            .quantizer
+            .as_ref()
+            .context("TurboQuantizer not initialized (dimension must be even)")?;
+        let code = q
+            .encode(vector)
+            .map_err(|e| anyhow::anyhow!("Quantization failed: {e}"))?;
+
+        bincode::serialize(&code).context("Failed to serialize TurboCode")
+    }
+
+    pub fn estimate_similarity(&self, code_bytes: &[u8], query: &[f32]) -> Result<f32> {
+        let q = self
+            .quantizer
+            .as_ref()
+            .context("TurboQuantizer not initialized")?;
+
+        let code: TurboCode =
+            bincode::deserialize(code_bytes).context("Failed to deserialize TurboCode")?;
+
+        q.inner_product_estimate(&code, query)
+            .map_err(|e| anyhow::anyhow!("Similarity estimation failed: {e}"))
     }
 
     /// Embed a batch of texts in a single ONNX forward pass.
@@ -230,8 +294,8 @@ impl Embedder {
             .map_err(|_| anyhow::anyhow!("Embedder mutex poisoned"))?;
 
         let mut inputs = ort::inputs![
-            "input_ids" => Value::from_array(input_ids)?,
-            "attention_mask" => Value::from_array(attention_mask)?,
+            "input_ids" => Value::from_array(input_ids).map_err(|e| anyhow::anyhow!("Failed to create input_ids: {e}"))?,
+            "attention_mask" => Value::from_array(attention_mask).map_err(|e| anyhow::anyhow!("Failed to create attention_mask: {e}"))?,
         ];
         if session
             .inputs()
@@ -240,16 +304,22 @@ impl Embedder {
         {
             inputs.push((
                 "token_type_ids".into(),
-                Value::from_array(token_type_ids)?.into(),
+                Value::from_array(token_type_ids)
+                    .map_err(|e| anyhow::anyhow!("Failed to create token_type_ids: {e}"))?
+                    .into(),
             ));
         }
 
-        let outputs = session.run(inputs)?;
+        let outputs = session
+            .run(inputs)
+            .map_err(|e| anyhow::anyhow!("Session run failed: {e}"))?;
         let output_value = outputs
             .get("last_hidden_state")
             .or_else(|| outputs.get("output"))
             .unwrap_or(&outputs[0]);
-        let output_array = output_value.try_extract_array::<f32>()?;
+        let output_array = output_value
+            .try_extract_array::<f32>()
+            .map_err(|e| anyhow::anyhow!("Failed to extract output array: {e}"))?;
 
         let target_dim = self.matryoshka_dim.unwrap_or(self.dimension);
         let mut result = Vec::with_capacity(batch_size);
@@ -302,8 +372,8 @@ impl Embedder {
             .map_err(|_| anyhow::anyhow!("Reranker mutex poisoned"))?;
 
         let mut inputs = ort::inputs![
-            "input_ids" => Value::from_array(input_ids)?,
-            "attention_mask" => Value::from_array(attention_mask)?,
+            "input_ids" => Value::from_array(input_ids).map_err(|e| anyhow::anyhow!("Failed to create input_ids: {e}"))?,
+            "attention_mask" => Value::from_array(attention_mask).map_err(|e| anyhow::anyhow!("Failed to create attention_mask: {e}"))?,
         ];
 
         // Handle models that don't support token_type_ids or have different names.
@@ -317,13 +387,19 @@ impl Embedder {
             let token_type_ids = Array2::from_shape_vec((batch_size, MAX_SEQ_LEN), type_ids)?;
             inputs.push((
                 "token_type_ids".into(),
-                Value::from_array(token_type_ids)?.into(),
+                Value::from_array(token_type_ids)
+                    .map_err(|e| anyhow::anyhow!("Failed to create token_type_ids: {e}"))?
+                    .into(),
             ));
         }
 
-        let outputs = session.run(inputs)?;
+        let outputs = session
+            .run(inputs)
+            .map_err(|e| anyhow::anyhow!("Reranker session run failed: {e}"))?;
 
-        let arr = outputs[0].try_extract_array::<f32>()?;
+        let arr = outputs[0]
+            .try_extract_array::<f32>()
+            .map_err(|e| anyhow::anyhow!("Failed to extract reranker output: {e}"))?;
         Ok((0..batch_size).map(|i| arr[[i, 0]]).collect())
     }
 
@@ -355,8 +431,8 @@ impl Embedder {
         // Dynamically build inputs based on what the model expects.
         // Some models (like BGE-M3) don't want token_type_ids.
         let mut inputs = ort::inputs![
-            "input_ids" => Value::from_array(input_ids)?,
-            "attention_mask" => Value::from_array(attention_mask)?,
+            "input_ids" => Value::from_array(input_ids).map_err(|e| anyhow::anyhow!("Failed to create input_ids: {e}"))?,
+            "attention_mask" => Value::from_array(attention_mask).map_err(|e| anyhow::anyhow!("Failed to create attention_mask: {e}"))?,
         ];
 
         if session
@@ -366,18 +442,24 @@ impl Embedder {
         {
             inputs.push((
                 "token_type_ids".into(),
-                Value::from_array(token_type_ids)?.into(),
+                Value::from_array(token_type_ids)
+                    .map_err(|e| anyhow::anyhow!("Failed to create token_type_ids: {e}"))?
+                    .into(),
             ));
         }
 
-        let outputs = session.run(inputs)?;
+        let outputs = session
+            .run(inputs)
+            .map_err(|e| anyhow::anyhow!("Session run failed: {e}"))?;
 
         let output_value = outputs
             .get("last_hidden_state")
             .or_else(|| outputs.get("output"))
             .unwrap_or(&outputs[0]);
 
-        let output_array = output_value.try_extract_array::<f32>()?;
+        let output_array = output_value
+            .try_extract_array::<f32>()
+            .map_err(|e| anyhow::anyhow!("Failed to extract output array: {e}"))?;
 
         // CLS pooling: token 0 of the sequence.
         let full_dim = self.dimension;

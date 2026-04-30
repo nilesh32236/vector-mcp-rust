@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use tracing::info;
 
-pub fn download_direct(url: &str, dest: &std::path::Path) -> Result<()> {
+pub async fn download_direct(url: &str, dest: &std::path::Path) -> Result<()> {
     info!("Direct downloading {} to {:?}", url, dest);
-    let mut response = reqwest::blocking::get(url).context("Failed to GET URL")?;
+    let response = reqwest::get(url).await.context("Failed to GET URL")?;
     if !response.status().is_success() {
         return Err(anyhow::anyhow!(
             "Failed to download {}: status {}",
@@ -11,7 +11,10 @@ pub fn download_direct(url: &str, dest: &std::path::Path) -> Result<()> {
             response.status()
         ));
     }
-    let mut out = std::fs::File::create(dest).context("Failed to create destination file")?;
-    std::io::copy(&mut response, &mut out).context("Failed to copy response to file")?;
+    let content = response
+        .bytes()
+        .await
+        .context("Failed to read response bytes")?;
+    std::fs::write(dest, content).context("Failed to write destination file")?;
     Ok(())
 }
