@@ -29,20 +29,20 @@ use tracing::info;
 use crate::config::Config;
 use crate::db::Store;
 use crate::llm::embedding::Embedder;
+use crate::llm::models::LlamaEngine;
 use crate::llm::summarizer::Summarizer;
 
 // ---------------------------------------------------------------------------
 // Logging & Telemetry
 // ---------------------------------------------------------------------------
 
-/// Initialise structured logging and OpenTelemetry.
+/// Initialise structured logging (file + stderr).
+///
+/// OpenTelemetry/gRPC tracing has been removed. Standard `tracing` subscriber
+/// with JSON file output and stderr console output is used instead.
 fn setup_logging(
     log_path: &std::path::Path,
 ) -> Result<tracing_appender::non_blocking::WorkerGuard> {
-    use opentelemetry::trace::TracerProvider as _;
-    use opentelemetry_otlp::WithExportConfig;
-    use opentelemetry_sdk::Resource;
-    use opentelemetry_sdk::trace::SdkTracerProvider;
     use tracing_subscriber::prelude::*;
 
     // Ensure the log directory exists.
@@ -67,35 +67,11 @@ fn setup_logging(
 
     let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
 
-    let registry = tracing_subscriber::registry()
+    tracing_subscriber::registry()
         .with(env_filter)
         .with(file_layer)
-        .with(stderr_layer);
-
-    let enable_otel = std::env::var("ENABLE_OTEL")
-        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-        .unwrap_or(false);
-    if enable_otel {
-        let exporter = opentelemetry_otlp::SpanExporter::builder()
-            .with_tonic()
-            .with_endpoint("http://localhost:4317")
-            .build()?;
-
-        let provider = SdkTracerProvider::builder()
-            .with_batch_exporter(exporter)
-            .with_resource(
-                Resource::builder()
-                    .with_service_name("vector-mcp-rust")
-                    .build(),
-            )
-            .build();
-
-        let tracer = provider.tracer("vector-mcp-rust");
-        let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
-        registry.with(telemetry).init();
-    } else {
-        registry.init();
-    }
+        .with(stderr_layer)
+        .init();
 
     Ok(guard)
 }
@@ -109,8 +85,18 @@ async fn init_components(cfg: &Config) -> Result<(Arc<Store>, Arc<Embedder>, Arc
     let store = db::connect_store(&db_uri, cfg.dimension, false).await?;
     info!("LanceDB connected — tables initialised");
 
-    let embedder = Arc::new(Embedder::new(cfg).await?);
-    let summarizer = Arc::new(Summarizer::new(cfg).await?);
+    // Construct LlamaEngine once; share it between Embedder and Summarizer.
+    let engine = Arc::new(LlamaEngine::new(&cfg.models_dir)?);
+    info!("LlamaEngine initialised (Vulkan backend, n_gpu_layers=1000)");
+
+    let embedder = Arc::new(Embedder::new(Arc::clone(&engine)));
+    let summarizer = Arc::new(Summarizer::new(
+        if cfg.feature_toggles.enable_local_llm {
+            Some(Arc::clone(&engine))
+        } else {
+            None
+        },
+    ));
 
     Ok((Arc::new(store), embedder, summarizer))
 }
@@ -151,8 +137,19 @@ async fn start_background_tasks(
 // Main
 // ---------------------------------------------------------------------------
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // Build a custom Tokio runtime with 8MB stack size for blocking threads.
+    // llama.cpp LlamaContext allocates large Vulkan compute buffers on the
+    // stack — the default 2MB causes overflows during concurrent embedding.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024) // 8MB per blocking thread
+        .build()?;
+
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     // 1. Load configuration first so we know the log path.
     let cfg = config::Config::load()?;
 
@@ -302,10 +299,17 @@ async fn run_slave(cfg: Config, socket_path: String) -> Result<()> {
     let db_uri = config.db_path.display().to_string();
     let store = Arc::new(db::connect_store(&db_uri, config.dimension, true).await?);
 
-    // NOTE: Embedder is loaded locally until the Server struct is refactored to
-    // accept a trait object. RemoteEmbedder exists in daemon::slave for that future work.
-    let embedder = Arc::new(Embedder::new(&config).await?);
-    let summarizer = Arc::new(Summarizer::new(&config).await?);
+    // NOTE: LlamaEngine is loaded locally in slave mode too so the slave can
+    // serve embedding/summarisation requests without round-tripping to the master.
+    let engine = Arc::new(LlamaEngine::new(&config.models_dir)?);
+    let embedder = Arc::new(Embedder::new(Arc::clone(&engine)));
+    let summarizer = Arc::new(Summarizer::new(
+        if config.feature_toggles.enable_local_llm {
+            Some(Arc::clone(&engine))
+        } else {
+            None
+        },
+    ));
 
     let (reload_tx, _reload_rx) = tokio::sync::mpsc::channel::<String>(10);
 

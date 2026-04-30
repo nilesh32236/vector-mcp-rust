@@ -2,7 +2,7 @@ use anyhow::Result;
 use futures::StreamExt;
 use ignore::{DirEntry, WalkBuilder};
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::config::Config;
 use crate::db::Store;
@@ -94,7 +94,6 @@ pub async fn scan_project(
     // Convert the mpsc receiver into a stream and process concurrently.
     let path_stream = tokio_stream::wrappers::ReceiverStream::new(path_rx);
 
-    let record_tx_clone = record_tx.clone();
     let progress_clone = Arc::clone(&progress);
     let discovered_clone = Arc::clone(&discovered);
 
@@ -104,52 +103,61 @@ pub async fn scan_project(
         .filter(|&n| n > 0)
         .unwrap_or(2);
 
-    let worker_task = path_stream.for_each_concurrent(worker_concurrency, |path_str| {
-        let config = Arc::clone(&config);
-        let store = Arc::clone(&store);
-        let embedder = Arc::clone(&embedder);
-        let summarizer = Arc::clone(&summarizer);
-        let progress = Arc::clone(&progress_clone);
-        let record_tx = record_tx_clone.clone();
-        let discovered = Arc::clone(&discovered_clone);
-        let indexed = Arc::clone(&indexed);
-        async move {
-            let n = discovered.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-            {
-                let mut p = progress.write().unwrap();
-                p.current_file = path_str.clone();
-                p.total_files = n; // dynamically updated as files are discovered
-            }
+    // record_tx is cloned into the worker closure. The original is dropped
+    // immediately after so that when all worker tasks finish (and their clones
+    // drop), record_rx sees EOF and the accumulator exits cleanly.
+    let store_for_workers = Arc::clone(&store);
+    let store_for_accumulator = Arc::clone(&store);
+    let indexed_for_read = Arc::clone(&indexed);
+    let worker_task = {
+        let record_tx_for_workers = record_tx.clone();
+        drop(record_tx); // drop original — only the workers' clones remain
+        path_stream.for_each_concurrent(worker_concurrency, move |path_str| {
+            let config = Arc::clone(&config);
+            let store = Arc::clone(&store_for_workers);
+            let embedder = Arc::clone(&embedder);
+            let summarizer = Arc::clone(&summarizer);
+            let progress = Arc::clone(&progress_clone);
+            let record_tx = record_tx_for_workers.clone();
+            let discovered = Arc::clone(&discovered_clone);
+            let indexed = Arc::clone(&indexed);
+            async move {
+                let n = discovered.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                {
+                    let mut p = progress.write().unwrap();
+                    p.current_file = path_str.clone();
+                    p.total_files = n;
+                }
 
-            match indexer::index_file(
-                &path_str,
-                Arc::clone(&config),
-                Arc::clone(&store),
-                Arc::clone(&embedder),
-                Arc::clone(&summarizer),
-            )
-            .await
-            {
-                Ok(records) => {
-                    if !records.is_empty() {
-                        let _ = record_tx.send((path_str, records)).await;
+                match indexer::index_file(
+                    &path_str,
+                    Arc::clone(&config),
+                    Arc::clone(&store),
+                    Arc::clone(&embedder),
+                    Arc::clone(&summarizer),
+                )
+                .await
+                {
+                    Ok(records) => {
+                        if !records.is_empty() {
+                            let _ = record_tx.send((path_str, records)).await;
+                        }
+                        let c = indexed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        let mut p = progress.write().unwrap();
+                        p.indexed_files = c;
                     }
-                    // Increment indexed count immediately for better UI feedback
-                    let c = indexed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    let mut p = progress.write().unwrap();
-                    p.indexed_files = c;
+                    Err(e) => {
+                        warn!("Failed to index {}: {:?}", path_str, e);
+                        let mut p = progress.write().unwrap();
+                        p.errors.push(format!("{}: {}", path_str, e));
+                    }
                 }
-                Err(e) => {
-                    warn!("Failed to index {}: {:?}", path_str, e);
-                    let mut p = progress.write().unwrap();
-                    p.errors.push(format!("{}: {}", path_str, e));
-                }
-            }
-        }
-    });
+            } // end async move
+        }) // end for_each_concurrent closure
+    }; // end worker_task block
 
     // Accumulator task: drain the record channel and flush in batches.
-    let store_clone = Arc::clone(&store);
+    let store_clone = Arc::clone(&store_for_accumulator);
 
     let accumulator_task = async move {
         let mut batch: Vec<crate::db::Record> = Vec::with_capacity(BATCH_INSERT_THRESHOLD);
@@ -183,47 +191,26 @@ pub async fn scan_project(
             }
         }
         // Final Tantivy commit after all bulk operations.
-        let _ = store_clone.commit_lexical();
+        if let Err(e) = store_clone.commit_lexical() {
+            error!("Final lexical commit failed: {:?}", e);
+        }
     };
 
-    // Drop the extra sender so the accumulator can detect when all workers are done.
-    drop(record_tx);
-
     // Run workers and accumulator concurrently.
+    // record_tx was already dropped inside the worker_task block above,
+    // so record_rx will see EOF as soon as all worker tasks complete.
     tokio::join!(worker_task, accumulator_task);
 
-    let final_count = indexed.load(std::sync::atomic::Ordering::Relaxed);
+    let final_count = indexed_for_read.load(std::sync::atomic::Ordering::Relaxed);
     let total = discovered.load(std::sync::atomic::Ordering::Relaxed);
-    info!("Initial scan complete. Indexed {} files.", final_count);
 
-    {
-        let mut p = progress.write().unwrap();
-        p.status = "Analyzing Relationships".into();
-        p.indexed_files = final_count;
-        p.total_files = total;
-    }
-
-    // Refresh knowledge graph once after all inserts.
-    if let Ok(all) = store.get_all_records().await {
-        store.graph.populate(&all);
-        // Enqueue records that need summarization (function_score > 0.5, no summary yet).
-        for r in &all {
-            let meta = r.metadata_json();
-            let already_summarized = meta["summary"]
-                .as_str()
-                .map(|s| !s.is_empty())
-                .unwrap_or(false);
-            if already_summarized {
-                continue;
-            }
-            let score = meta["function_score"].as_f64().unwrap_or(0.0) as f32;
-            let _ = summary_tx.try_send((r.id.clone(), r.content.clone(), score));
-        }
-    }
-
+    // Mark status as Ready immediately — don't block on the graph rebuild.
     {
         let mut p = progress.write().unwrap();
         p.status = "Ready".into();
+        p.indexed_files = final_count;
+        p.total_files = total;
+        p.current_file = String::new();
     }
 
     if let Some(tx) = &progress_tx {
@@ -237,6 +224,47 @@ pub async fn scan_project(
             })
             .await;
     }
+
+    // Rebuild knowledge graph and enqueue summaries in a background task so
+    // the scan function returns promptly and the status stays "Ready".
+    let store2 = Arc::clone(&store);
+    let progress2 = Arc::clone(&progress);
+    tokio::spawn(async move {
+        match store2.get_all_records().await {
+            Ok(all) => {
+                info!(
+                    "Persistence complete. Indexed {} files. Populating KnowledgeGraph ({} records)...",
+                    final_count,
+                    all.len()
+                );
+                store2.graph.populate(&all);
+
+                {
+                    let mut p = progress2.write().unwrap();
+                    p.status = "Ready".into();
+                }
+
+                // Enqueue records that need summarization.
+                for r in &all {
+                    let meta = r.metadata_json();
+                    let already_summarized = meta["summary"]
+                        .as_str()
+                        .map(|s| !s.is_empty())
+                        .unwrap_or(false);
+                    if already_summarized {
+                        continue;
+                    }
+                    let score = meta["function_score"].as_f64().unwrap_or(0.0) as f32;
+                    let _ = summary_tx.try_send((r.id.clone(), r.content.clone(), score));
+                }
+            }
+            Err(e) => {
+                error!("Failed to fetch records for KnowledgeGraph rebuild: {:?}", e);
+                let mut p = progress2.write().unwrap();
+                p.status = "Ready".into(); // still mark ready — search still works
+            }
+        }
+    });
 
     Ok(())
 }
@@ -283,7 +311,7 @@ pub fn spawn_summary_worker(
                     continue;
                 }
                 let summary = match summarizer
-                    .summarize_chunk(&content, None, Arc::clone(&config))
+                    .summarize_chunk(&content, Arc::clone(&config))
                     .await
                 {
                     Ok(s) if !s.is_empty() => s,

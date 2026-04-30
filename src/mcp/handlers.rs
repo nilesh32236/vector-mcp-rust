@@ -860,28 +860,12 @@ async fn handle_search_codebase(
     }
 
     let mut final_records = records;
-
-    // 2. Perform Reranking if enabled
-    if server.embedder.rerank_session.is_some() {
-        let docs: Vec<String> = final_records.iter().map(|r| r.content.clone()).collect();
-        if let Ok(scores) = server.embedder.rerank(&query, docs) {
-            let mut scored_records: Vec<_> = final_records.into_iter().zip(scores).collect();
-            // Higher score is better
-            scored_records
-                .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            final_records = scored_records
-                .into_iter()
-                .map(|(r, _)| r)
-                .take(top_k)
-                .collect();
-        }
-    } else {
-        final_records.truncate(top_k);
-    }
+    final_records.truncate(top_k);
 
     let max_tokens = optional_f64_arg(params, "max_tokens").unwrap_or(10000.0) as usize;
-    let bpe = tiktoken_rs::cl100k_base().unwrap();
-    let mut total_tokens = 0;
+    // Approximate token count: 1 token ≈ 4 characters (avoids tiktoken dependency)
+    let max_chars = max_tokens * 4;
+    let mut total_chars = 0;
     let mut out = String::new();
 
     for r in final_records {
@@ -911,8 +895,7 @@ async fn handle_search_codebase(
             path, start_line, end_line, symbols, summary, r.content
         );
 
-        let tokens = bpe.encode_with_special_tokens(&chunk_text).len();
-        if total_tokens + tokens > max_tokens && total_tokens > 0 {
+        if total_chars + chunk_text.len() > max_chars && total_chars > 0 {
             out.push_str(
                 "... (truncating further results to stay within context window)
 ",
@@ -921,7 +904,7 @@ async fn handle_search_codebase(
         }
 
         out.push_str(&chunk_text);
-        total_tokens += tokens;
+        total_chars += chunk_text.len();
     }
 
     if out.is_empty() {
@@ -970,7 +953,7 @@ async fn handle_get_summarized_context(
     }
     let summary = server
         .summarizer
-        .summarize_chunk(&text, None, Arc::clone(&server.config))
+        .summarize_chunk(&text, Arc::clone(&server.config))
         .await?;
     Ok(CallToolResult::text(format!("### Summary\n\n{}", summary)))
 }
@@ -1201,12 +1184,10 @@ async fn handle_reindex_all(
     ))
 }
 async fn handle_check_llm_connectivity(server: &Server) -> Result<CallToolResult> {
-    // Gemini removed — report local embedder status instead.
+    // Reports local llama.cpp engine status.
     let model = &server.config.model_name;
-    let reranker = &server.config.reranker_model_name;
-    let has_reranker = server.embedder.rerank_session.is_some();
     Ok(CallToolResult::text(format!(
-        "### ✅ Local LLM Status\n\n- **Embedder**: `{model}`\n- **Reranker**: `{reranker}` (loaded: {has_reranker})\n- **Local summarizer**: {}\n",
+        "### ✅ Local LLM Status\n\n- **Embedder model**: `{model}`\n- **Local summarizer**: {}\n",
         if server.config.feature_toggles.enable_local_llm {
             "enabled"
         } else {
@@ -1494,19 +1475,7 @@ async fn handle_search_workspace(
             }
 
             // Rerank if cross-encoder is available
-            if server.embedder.rerank_session.is_some() && results.len() > 1 {
-                let docs: Vec<String> = results.iter().map(|r| r.content.clone()).collect();
-                if let Ok(scores) = server.embedder.rerank(&query, docs) {
-                    let mut scored: Vec<_> = results.into_iter().zip(scores).collect();
-                    scored
-                        .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                    results = scored.into_iter().map(|(r, _)| r).take(limit).collect();
-                } else {
-                    results.truncate(limit);
-                }
-            } else {
-                results.truncate(limit);
-            }
+            results.truncate(limit);
 
             if results.is_empty() {
                 return Ok(CallToolResult::text("No matches found."));
@@ -1525,30 +1494,31 @@ async fn handle_search_workspace(
             Ok(CallToolResult::text(out))
         }
         "turbo" => {
+            // turbo_search has been removed; fall back to standard vector search.
             if query.is_empty() {
-                return Ok(CallToolResult::error("query is required for turbo search"));
+                return Ok(CallToolResult::error("query is required for vector search"));
             }
             let vector = embed_query_blocking(Arc::clone(&server.embedder), query.clone()).await?;
             let mut results = server
                 .store
-                .turbo_search(&server.embedder, vector, limit)
+                .vector_search(vector, limit, cross_reference.as_deref())
                 .await?;
 
             if let Some(ref pf) = path_filter {
-                results.retain(|(r, _)| r.metadata_str("path").contains(pf.as_str()));
+                results.retain(|r| r.metadata_str("path").contains(pf.as_str()));
             }
 
             if results.is_empty() {
                 return Ok(CallToolResult::text("No matches found."));
             }
-            let mut out = format!("### Turbo Search Results for '{query}':\n\n");
-            for (r, score) in results {
+            let mut out = format!("### Search Results for '{query}':\n\n");
+            for r in results {
                 let meta = r.metadata_json();
                 let path = meta["path"].as_str().unwrap_or("?");
                 let start = meta["start_line"].as_u64().unwrap_or(0);
                 let end = meta["end_line"].as_u64().unwrap_or(0);
                 out.push_str(&format!(
-                    "#### {path} (Lines {start}-{end}) [Score: {score:.4}]\n```\n{}\n```\n\n",
+                    "#### {path} (Lines {start}-{end})\n```\n{}\n```\n\n",
                     r.content
                 ));
             }
@@ -2073,7 +2043,6 @@ pub async fn handle_distill_package_purpose(
     let record = crate::db::Record {
         id: format!("distill-{}", uuid::Uuid::new_v4()),
         content: summary.clone(),
-        quantized_code: server.embedder.quantize(&vector).ok(),
         vector,
         metadata: metadata.to_string(),
     };

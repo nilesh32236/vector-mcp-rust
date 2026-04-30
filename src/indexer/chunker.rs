@@ -336,37 +336,41 @@ fn extract_calls(node: tree_sitter::Node, source: &[u8]) -> Vec<String> {
 }
 
 fn walk_calls(node: tree_sitter::Node, source: &[u8], out: &mut HashSet<String>) {
-    let kind = node.kind();
-    if kind == "call_expression" || kind == "function_call_expression" {
-        let child_count = node.child_count();
-        for i in 0..child_count {
-            if let Some(child) = node.child(i) {
-                let ct = child.kind();
-                if ct == "identifier" || ct == "property_identifier" || ct == "name" {
-                    if let Ok(text) = child.utf8_text(source) {
-                        out.insert(text.to_owned());
-                    }
-                } else if (ct == "selector_expression"
-                    || ct == "member_expression"
-                    || ct == "field_expression")
-                    && child.child_count() > 0
-                    && let Some(last) = child.child(child.child_count() - 1)
-                {
-                    let lt = last.kind();
-                    if (lt == "field_identifier" || lt == "property_identifier")
-                        && let Ok(text) = last.utf8_text(source)
+    let mut stack = vec![node];
+
+    while let Some(current) = stack.pop() {
+        let kind = current.kind();
+        if kind == "call_expression" || kind == "function_call_expression" {
+            let child_count = current.child_count();
+            for i in 0..child_count {
+                if let Some(child) = current.child(i) {
+                    let ct = child.kind();
+                    if ct == "identifier" || ct == "property_identifier" || ct == "name" {
+                        if let Ok(text) = child.utf8_text(source) {
+                            out.insert(text.to_owned());
+                        }
+                    } else if (ct == "selector_expression"
+                        || ct == "member_expression"
+                        || ct == "field_expression")
+                        && child.child_count() > 0
+                        && let Some(last) = child.child(child.child_count() - 1)
                     {
-                        out.insert(text.to_owned());
+                        let lt = last.kind();
+                        if (lt == "field_identifier" || lt == "property_identifier")
+                            && let Ok(text) = last.utf8_text(source)
+                        {
+                            out.insert(text.to_owned());
+                        }
                     }
                 }
             }
         }
-    }
 
-    let child_count = node.child_count();
-    for i in 0..child_count {
-        if let Some(child) = node.child(i) {
-            walk_calls(child, source, out);
+        let child_count = current.child_count();
+        for i in (0..child_count).rev() {
+            if let Some(child) = current.child(i) {
+                stack.push(child);
+            }
         }
     }
 }

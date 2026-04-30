@@ -1,6 +1,5 @@
 #![allow(dead_code)]
 pub mod graph;
-use crate::llm::embedding::Embedder;
 use anyhow::{Context, Result, bail};
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
@@ -8,8 +7,7 @@ use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::{Connection, Table as LanceTable, connect};
 use serde::{Deserialize, Serialize};
-use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use tantivy::collector::TopDocs;
@@ -65,13 +63,20 @@ impl LexicalIndex {
             let w = match index.writer(50_000_000) {
                 Ok(w) => w,
                 Err(tantivy::TantivyError::LockFailure(_, _)) => {
-                    // Stale lock from a previous crashed process — delete and retry.
-                    tracing::warn!("Tantivy lock busy, removing stale lockfile and retrying");
                     let lock_path = path.join(".tantivy-writer.lock");
-                    let _ = std::fs::remove_file(&lock_path);
-                    index
-                        .writer(50_000_000)
-                        .context("Acquiring Tantivy writer after lock removal")?
+                    if let Ok(meta) = std::fs::metadata(&lock_path) {
+                        let elapsed = meta.modified()?.elapsed().unwrap_or_default();
+                        if elapsed.as_secs() > 300 {
+                            tracing::warn!("Tantivy lock stale (>5m), removing and retrying");
+                            let _ = std::fs::remove_file(&lock_path);
+                            index.writer(50_000_000).context("Acquiring Tantivy writer after lock removal")?
+                        } else {
+                            bail!("Tantivy index is currently locked by another process (modified {}s ago)", elapsed.as_secs());
+                        }
+                    } else {
+                        // Lock file doesn't exist but we got LockFailure? Retry once.
+                        index.writer(50_000_000).context("Acquiring Tantivy writer (retry)")?
+                    }
                 }
                 Err(e) => return Err(e).context("Acquiring Tantivy writer"),
             };
@@ -183,7 +188,6 @@ pub struct Record {
     pub vector: Vec<f32>,
     /// JSON blob — matches Go's `map[string]string` serialised with `json.Marshal`.
     pub metadata: String,
-    pub quantized_code: Option<Vec<u8>>,
 }
 
 impl Record {
@@ -209,7 +213,6 @@ pub struct Store {
     pub project_context: LanceTable,
     lexical: Arc<LexicalIndex>,
     pub graph: graph::KnowledgeGraph,
-    pub quantized_cache: Arc<dashmap::DashMap<String, Vec<u8>>>,
 }
 
 impl Store {
@@ -217,6 +220,7 @@ impl Store {
         connection: Connection,
         dimension: usize,
         index_path: &Path,
+        read_only: bool,
     ) -> Result<Self> {
         let code_vectors = open_or_create_table(
             &connection,
@@ -233,7 +237,6 @@ impl Store {
                     false,
                 ),
                 ArrowField::new("metadata", DataType::Utf8, true),
-                ArrowField::new("quantized_code", DataType::Binary, true),
             ]))),
             dimension,
         )
@@ -251,14 +254,13 @@ impl Store {
         )
         .await?;
 
-        let lexical = Arc::new(LexicalIndex::open_or_create(index_path, false)?);
+        let lexical = Arc::new(LexicalIndex::open_or_create(index_path, read_only)?);
 
         let store = Self {
             code_vectors,
             project_context,
             lexical,
             graph: graph::KnowledgeGraph::new(),
-            quantized_cache: Arc::new(dashmap::DashMap::new()),
         };
 
         if store.code_vectors.count_rows(None).await? > 0 {
@@ -267,11 +269,6 @@ impl Store {
             );
             if let Ok(records) = store.get_all_records().await {
                 store.graph.populate(&records);
-                for r in &records {
-                    if let Some(code) = &r.quantized_code {
-                        store.quantized_cache.insert(r.id.clone(), code.clone());
-                    }
-                }
                 // Rebuild Tantivy if it has no segments (e.g. fresh install or schema change).
                 if store.lexical.is_empty() {
                     info!(
@@ -311,23 +308,26 @@ impl Store {
             return Ok(HashMap::new());
         }
 
-        let predicate = ids
-            .iter()
-            .map(|id| format!("id = '{}'", sql_escape(id)))
-            .collect::<Vec<_>>()
-            .join(" OR ");
+        let mut all_records = HashMap::new();
+        for chunk in ids.chunks(500) {
+            let predicate = chunk
+                .iter()
+                .map(|id| format!("id = '{}'", sql_escape(id)))
+                .collect::<Vec<_>>()
+                .join(" OR ");
 
-        let results = self
-            .code_vectors
-            .query()
-            .only_if(predicate)
-            .execute()
-            .await?;
-        let batches = results.try_collect::<Vec<_>>().await?;
-        Ok(batches_to_records(batches)?
-            .into_iter()
-            .map(|r| (r.id.clone(), r))
-            .collect())
+            let results = self
+                .code_vectors
+                .query()
+                .only_if(predicate)
+                .execute()
+                .await?;
+            let batches = results.try_collect::<Vec<_>>().await?;
+            for r in batches_to_records(batches)? {
+                all_records.insert(r.id.clone(), r);
+            }
+        }
+        Ok(all_records)
     }
 
     pub async fn update_record_metadata(&self, record_id: &str, new_metadata: &str) -> Result<()> {
@@ -352,9 +352,6 @@ impl Store {
         for r in &records {
             let _ = self.lexical.add_no_commit(&r.id, &bm25_document_text(r));
             self.graph.add_record(r);
-            if let Some(code) = &r.quantized_code {
-                self.quantized_cache.insert(r.id.clone(), code.clone());
-            }
         }
         let _ = self.lexical.commit();
 
@@ -370,9 +367,6 @@ impl Store {
         for r in records {
             let _ = self.lexical.add_no_commit(&r.id, &bm25_document_text(r));
             self.graph.add_record(r);
-            if let Some(code) = &r.quantized_code {
-                self.quantized_cache.insert(r.id.clone(), code.clone());
-            }
         }
         let _ = self.lexical.commit();
         self.code_vectors.add(vec![batch]).execute().await?;
@@ -405,7 +399,6 @@ impl Store {
             .context("Deleting records by path")?;
 
         for r in to_delete {
-            self.quantized_cache.remove(&r.id);
             if commit {
                 let _ = self.lexical.remove(&r.id);
             } else {
@@ -533,64 +526,6 @@ impl Store {
             .collect())
     }
 
-    pub async fn turbo_search(
-        &self,
-        embedder: &Embedder,
-        query_vector: Vec<f32>,
-        limit: usize,
-    ) -> Result<Vec<(Record, f32)>> {
-        #[derive(PartialEq)]
-        struct SearchHit {
-            id: String,
-            score: f32,
-        }
-        impl Eq for SearchHit {}
-        impl Ord for SearchHit {
-            fn cmp(&self, other: &Self) -> Ordering {
-                other
-                    .score
-                    .partial_cmp(&self.score)
-                    .unwrap_or(Ordering::Equal)
-            }
-        }
-        impl PartialOrd for SearchHit {
-            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-                Some(self.cmp(other))
-            }
-        }
-
-        let mut heap = BinaryHeap::with_capacity(limit + 1);
-
-        for entry in self.quantized_cache.iter() {
-            let (id, code) = entry.pair();
-            if let Ok(score) = embedder.estimate_similarity(code, &query_vector) {
-                heap.push(SearchHit {
-                    id: id.clone(),
-                    score,
-                });
-                if heap.len() > limit {
-                    heap.pop();
-                }
-            }
-        }
-
-        let mut ordered_hits = Vec::new();
-        while let Some(hit) = heap.pop() {
-            ordered_hits.push(hit);
-        }
-        let ids = ordered_hits
-            .iter()
-            .map(|hit| hit.id.clone())
-            .collect::<Vec<_>>();
-        let records = self.get_records_by_ids(&ids).await?;
-        let mut final_hits = ordered_hits
-            .into_iter()
-            .filter_map(|hit| records.get(&hit.id).cloned().map(|r| (r, hit.score)))
-            .collect::<Vec<_>>();
-        final_hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
-        Ok(final_hits)
-    }
-
     // -----------------------------------------------------------------------
     // Bulk reads
     // -----------------------------------------------------------------------
@@ -687,11 +622,7 @@ pub async fn connect_store(uri: &str, dimension: usize, read_only: bool) -> Resu
         .await
         .with_context(|| format!("connecting to LanceDB at {final_uri}"))?;
 
-    let mut store = Store::open_tables(connection, dimension, &tantivy_path).await?;
-    if read_only {
-        // Re-open lexical index in read-only mode
-        store.lexical = Arc::new(LexicalIndex::open_or_create(&tantivy_path, true)?);
-    }
+    let store = Store::open_tables(connection, dimension, &tantivy_path, read_only).await?;
     Ok(store)
 }
 
@@ -726,44 +657,59 @@ async fn open_or_create_table(
     connection: &Connection,
     name: &str,
     empty_batch: RecordBatch,
-    _dimension: usize,
+    dimension: usize,
 ) -> Result<LanceTable> {
     let table_names = connection.table_names().execute().await?;
     if table_names.contains(&name.to_string()) {
-        return connection
+        let table = connection
             .open_table(name)
             .execute()
             .await
-            .context("Opening table");
+            .context("Opening table")?;
+
+        // For the code_vectors table, verify the stored vector dimension matches
+        // the configured dimension. A mismatch means the embedding model changed
+        // (e.g. bge-small 384-dim → nomic-embed 768-dim). Drop and recreate so
+        // the schema stays consistent — data will be re-indexed on next scan.
+        if name == "code_vectors" && dimension > 0 {
+            let schema = table.schema().await?;
+            let dim_matches = schema
+                .field_with_name("vector")
+                .ok()
+                .and_then(|f| {
+                    if let arrow_schema::DataType::FixedSizeList(_, stored_dim) = f.data_type() {
+                        Some(*stored_dim as usize == dimension)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(true); // if we can't determine, assume ok
+
+            if !dim_matches {
+                tracing::warn!(
+                    "Vector dimension mismatch in table '{}': stored schema does not match \
+                     configured dimension {}. Dropping and recreating table — data will be \
+                     re-indexed on next scan.",
+                    name,
+                    dimension
+                );
+                connection.drop_table(name, &[]).await.ok();
+                return connection
+                    .create_table(name, empty_batch)
+                    .execute()
+                    .await
+                    .context("Re-creating table after dimension mismatch");
+            }
+        }
+
+        return Ok(table);
     }
 
-    let table = connection
+    connection
         .create_table(name, empty_batch)
         .execute()
         .await
-        .context("Creating table")?;
-
-    // TODO: move index creation to background task (only when count_rows > 5000)
-    /*
-    if dimension > 0 {
-        if let Err(e) = table
-            .create_index(
-                &["vector"],
-                LanceIndex::IvfPq(
-                    IvfPqIndexBuilder::default()
-                        .num_partitions(256)
-                        .num_sub_vectors(16),
-                ),
-            )
-            .execute()
-            .await
-        {
-            warn!("IvfPq index creation failed (non-fatal, table may be empty): {e}");
-        }
-    }
-    */
-
-    Ok(table)
+        .context("Creating table")
 }
 
 fn records_to_batch(records: &[Record]) -> Result<RecordBatch> {
@@ -784,7 +730,6 @@ fn records_to_batch(records: &[Record]) -> Result<RecordBatch> {
             false,
         ),
         ArrowField::new("metadata", DataType::Utf8, true),
-        ArrowField::new("quantized_code", DataType::Binary, true),
     ]));
 
     let ids = StringArray::from(records.iter().map(|r| r.id.as_str()).collect::<Vec<_>>());
@@ -798,12 +743,6 @@ fn records_to_batch(records: &[Record]) -> Result<RecordBatch> {
         records
             .iter()
             .map(|r| r.metadata.as_str())
-            .collect::<Vec<_>>(),
-    );
-    let quantized_codes = arrow_array::BinaryArray::from(
-        records
-            .iter()
-            .map(|r| r.quantized_code.as_deref())
             .collect::<Vec<_>>(),
     );
 
@@ -821,7 +760,6 @@ fn records_to_batch(records: &[Record]) -> Result<RecordBatch> {
             Arc::new(contents),
             Arc::new(vectors),
             Arc::new(metadatas),
-            Arc::new(quantized_codes),
         ],
     )
     .context("Building RecordBatch")
@@ -851,15 +789,6 @@ pub fn batches_to_records(batches: Vec<RecordBatch>) -> Result<Vec<Record>> {
             .downcast_ref::<arrow_array::StringArray>()
             .context("metadata column")?;
 
-        let quantized_codes = if batch.num_columns() > 4 {
-            batch
-                .column(4)
-                .as_any()
-                .downcast_ref::<arrow_array::BinaryArray>()
-        } else {
-            None
-        };
-
         for i in 0..batch.num_rows() {
             let vec_val = vectors.value(i);
             let vec_f32 = vec_val
@@ -869,20 +798,11 @@ pub fn batches_to_records(batches: Vec<RecordBatch>) -> Result<Vec<Record>> {
                 .values()
                 .to_vec();
 
-            let q_code = quantized_codes.and_then(|qc| {
-                if qc.is_null(i) {
-                    None
-                } else {
-                    Some(qc.value(i).to_vec())
-                }
-            });
-
             records.push(Record {
                 id: ids.value(i).to_string(),
                 content: contents.value(i).to_string(),
                 vector: vec_f32,
                 metadata: metadatas.value(i).to_string(),
-                quantized_code: q_code,
             });
         }
     }

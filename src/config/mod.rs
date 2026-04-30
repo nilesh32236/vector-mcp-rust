@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 /// Controls optional subsystems that can be disabled on constrained hardware.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FeatureToggles {
-    /// When `true`, the server loads and uses a local LLM for embeddings.
+    /// When `true`, the server loads and uses a local LLM for embeddings and
+    /// summarisation via `LlamaEngine`.
     pub enable_local_llm: bool,
     /// When `true`, the file-watcher triggers live re-indexing on save.
     pub enable_live_indexing: bool,
@@ -21,10 +22,8 @@ pub struct FeatureToggles {
 // Application Configuration
 // ---------------------------------------------------------------------------
 
-/// Central configuration mirroring the Go `config.Config` struct.
-///
-/// All fields are resolved once at startup via [`Config::load`] and then
-/// shared immutably (wrapped in `Arc`) with every subsystem.
+/// Central configuration resolved once at startup and shared immutably via
+/// `Arc<Config>` with every subsystem.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
     pub project_root: std::sync::RwLock<String>,
@@ -32,17 +31,16 @@ pub struct Config {
     pub db_path: PathBuf,
     pub models_dir: PathBuf,
     pub log_path: PathBuf,
+    /// Retained for future extensibility; not used to drive model loading.
     pub model_name: String,
+    /// Retained for future extensibility; not used to drive model loading.
     pub reranker_model_name: String,
     pub hf_token: String,
+    /// Embedding output dimension.  Defaults to 768 (nomic-embed-text-v1.5).
     pub dimension: usize,
     pub disable_watcher: bool,
     pub embedder_pool_size: usize,
     pub api_port: String,
-    pub gemini_api_key: String,
-    pub default_gemini_model: String,
-    // Kept for backward compat; Gemini integration removed — values are ignored.
-    pub model_path: String,
     pub feature_toggles: FeatureToggles,
 }
 
@@ -80,7 +78,7 @@ impl Config {
     }
 
     /// Load configuration from environment variables (and an optional `.env`
-    /// file).  Mirrors the Go `LoadConfig` function:
+    /// file).
     ///
     /// 1. Attempt to load `.env` (ignore if absent).
     /// 2. Resolve paths with the same fallback chain as the Go version.
@@ -91,20 +89,19 @@ impl Config {
 
         let home = dirs_home()?;
 
-        // --- path resolution (same chain as Go) --------------------------
-        let (data_dir, db_path, models_dir, log_path, project_root) = Self::resolve_paths(&home)?;
+        let (data_dir, db_path, models_dir, log_path, project_root) =
+            Self::resolve_paths(&home)?;
 
-        // Ensure directories exist (match Go's `os.MkdirAll`)
+        // Ensure directories exist.
         std::fs::create_dir_all(&db_path)
             .with_context(|| format!("creating db directory: {}", db_path.display()))?;
         std::fs::create_dir_all(&models_dir)
             .with_context(|| format!("creating models directory: {}", models_dir.display()))?;
 
         let model_name =
-            env::var("MODEL_NAME").unwrap_or_else(|_| "BAAI/bge-small-en-v1.5".to_string());
+            env::var("MODEL_NAME").unwrap_or_else(|_| "nomic-embed-text-v1.5".to_string());
 
-        let reranker_model_name = env::var("RERANKER_MODEL_NAME")
-            .unwrap_or_else(|_| "cross-encoder/ms-marco-MiniLM-L-6-v2".to_string());
+        let reranker_model_name = env::var("RERANKER_MODEL_NAME").unwrap_or_default();
 
         let disable_watcher = env::var("DISABLE_FILE_WATCHER")
             .map(|v| v.eq_ignore_ascii_case("true"))
@@ -118,30 +115,16 @@ impl Config {
 
         let api_port = env::var("API_PORT").unwrap_or_else(|_| "47821".to_string());
 
-        let default_gemini_model =
-            env::var("GEMINI_DEFAULT_MODEL").unwrap_or_else(|_| "gemini-2.5-flash".to_string());
+        // Default to 768 — the output dimension of nomic-embed-text-v1.5.
+        let dimension = env::var("EMBEDDING_DIM")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(768);
 
-        // --- feature toggles ----------------------------------------------
         let feature_toggles = FeatureToggles {
             enable_local_llm: env_bool("ENABLE_LOCAL_LLM"),
             enable_live_indexing: env_bool("ENABLE_LIVE_INDEXING"),
         };
-
-        let model_path = models_dir
-            .join(model_name.replace('/', "_"))
-            .join("model.onnx")
-            .display()
-            .to_string();
-
-        let dimension = env::var("EMBEDDING_DIM")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .or_else(|| {
-                crate::llm::models::get_model_registry()
-                    .get(model_name.as_str())
-                    .map(|m| m.dimension)
-            })
-            .unwrap_or(384);
 
         Ok(Self {
             project_root: std::sync::RwLock::new(project_root),
@@ -156,9 +139,6 @@ impl Config {
             disable_watcher,
             embedder_pool_size,
             api_port,
-            gemini_api_key: env::var("GEMINI_API_KEY").unwrap_or_default(),
-            default_gemini_model,
-            model_path,
             feature_toggles,
         })
     }
@@ -168,15 +148,12 @@ impl Config {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Returns the user's home directory, falling back to the system temp dir.
 fn dirs_home() -> Result<PathBuf> {
     env::var("HOME")
         .map(PathBuf::from)
         .or_else(|_| Ok(env::temp_dir()))
 }
 
-/// Read an env var; if unset or empty, call `default_fn` and convert to
-/// `String` via `Display`.
 fn env_or_default<F, P>(key: &str, default_fn: F) -> String
 where
     F: FnOnce() -> P,
@@ -188,8 +165,6 @@ where
     }
 }
 
-/// Parse a boolean-ish env var (`"true"` / `"1"` → `true`, anything else →
-/// `false`).
 fn env_bool(key: &str) -> bool {
     env::var(key)
         .map(|v| v.eq_ignore_ascii_case("true") || v == "1")

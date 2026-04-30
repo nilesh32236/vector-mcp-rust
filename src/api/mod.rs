@@ -63,6 +63,9 @@ struct SearchResponse {
     text: String,
     similarity: f32,
     path: String,
+    summary: String,
+    start_line: u64,
+    end_line: u64,
 }
 
 #[derive(Deserialize)]
@@ -231,55 +234,18 @@ async fn handle_search(
         })
         .map(|(r, score)| {
             let path = r.metadata_str("path");
+            let meta = r.metadata_json();
+            let summary = meta["summary"].as_str().unwrap_or("").to_string();
+            let start_line = meta["start_line"].as_u64().unwrap_or(0);
+            let end_line = meta["end_line"].as_u64().unwrap_or(0);
             SearchResponse {
                 id: r.id,
                 text: r.content,
                 similarity: score,
                 path,
-            }
-        })
-        .collect();
-
-    Json(resp).into_response()
-}
-
-async fn handle_turbo_search(
-    State(s): State<Arc<ApiState>>,
-    Json(req): Json<SearchRequest>,
-) -> impl IntoResponse {
-    let limit = req.top_k.clamp(1, 100);
-
-    let vector = match embed_query_blocking(Arc::clone(&s.embedder), req.query).await {
-        Ok(v) => v,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e })),
-            )
-                .into_response();
-        }
-    };
-
-    let results = match s.store.turbo_search(&s.embedder, vector, limit).await {
-        Ok(r) => r,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response();
-        }
-    };
-
-    let resp: Vec<SearchResponse> = results
-        .into_iter()
-        .map(|(r, score)| {
-            let path = r.metadata_str("path");
-            SearchResponse {
-                id: r.id,
-                text: r.content,
-                similarity: score,
-                path,
+                summary,
+                start_line,
+                end_line,
             }
         })
         .collect();
@@ -312,7 +278,6 @@ async fn handle_context(
     let record = crate::db::Record {
         id,
         content: req.text,
-        quantized_code: s.embedder.quantize(&vector).ok(),
         vector,
         metadata: metadata.to_string(),
     };
@@ -332,18 +297,20 @@ async fn handle_context(
 // ---------------------------------------------------------------------------
 
 pub fn router(state: Arc<ApiState>) -> Router {
+    let api_routes = Router::new()
+        .route("/health", get(handle_health))
+        .route("/ready", get(handle_ready))
+        .route("/live", get(handle_live))
+        .route("/stats", get(handle_stats))
+        .route("/tools/repos", get(handle_tools_repos))
+        .route("/tools/status", get(handle_tools_status))
+        .route("/tools/index", post(handle_tools_index))
+        .route("/tools/skeleton", get(handle_tools_skeleton))
+        .route("/search", post(handle_search))
+        .route("/context", post(handle_context));
+
     Router::new()
-        .route("/api/health", get(handle_health))
-        .route("/api/ready", get(handle_ready))
-        .route("/api/live", get(handle_live))
-        .route("/api/stats", get(handle_stats))
-        .route("/api/tools/repos", get(handle_tools_repos))
-        .route("/api/tools/status", get(handle_tools_status))
-        .route("/api/tools/index", post(handle_tools_index))
-        .route("/api/tools/skeleton", get(handle_tools_skeleton))
-        .route("/api/search", post(handle_search))
-        .route("/api/context", post(handle_context))
-        .route("/api/turbo_search", post(handle_turbo_search))
+        .nest("/api", api_routes)
         .fallback_service(ServeDir::new("public").fallback(ServeFile::new("public/index.html")))
         .layer(CorsLayer::permissive())
         .with_state(state)
