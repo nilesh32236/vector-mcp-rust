@@ -228,7 +228,16 @@ fn normalize_path(path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use std::fs;
+    use std::sync::Mutex;
     use tempfile::tempdir;
+
+    /// Serialises all tests that read or write the `WRITE_ALLOWLIST` environment
+    /// variable.  Because `std::env::set_var` / `remove_var` are process-global,
+    /// running those tests concurrently causes a race: one test may see the env
+    /// var set by another test and fail unexpectedly.  Holding this lock for the
+    /// duration of any test that touches `WRITE_ALLOWLIST` prevents the race
+    /// without requiring an external `serial_test` crate.
+    static ENV_VAR_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_path_guard_basics() -> Result<()> {
@@ -303,6 +312,10 @@ mod tests {
 
     #[test]
     fn test_write_extension_allowlist() -> Result<()> {
+        // Hold the env-var mutex so this test cannot run concurrently with
+        // test_write_allowlist_env_var (which sets WRITE_ALLOWLIST globally).
+        let _env_lock = ENV_VAR_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
         let dir = tempdir()?;
         let base = dir.path();
         let guard = PathGuard::new(base)?;
@@ -322,6 +335,10 @@ mod tests {
 
     #[test]
     fn test_write_allowlist_env_var() -> Result<()> {
+        // Hold the env-var mutex for the entire test so that no other test can
+        // observe the WRITE_ALLOWLIST env var while it is temporarily set here.
+        let _env_lock = ENV_VAR_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+
         let dir = tempdir()?;
         let base = dir.path();
 

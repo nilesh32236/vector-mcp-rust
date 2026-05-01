@@ -717,6 +717,9 @@ async fn handle_analyze_architecture(
     let monorepo_prefix = optional_string_arg(params, "monorepo_prefix").unwrap_or_default();
     let records = server.store.get_all_records().await?;
 
+    // Read project root once outside the loop to avoid repeated lock acquisitions.
+    let root = server.config.project_root.read().unwrap().clone();
+
     // adjacency: src_pkg -> set of target_pkgs
     let mut adj: HashMap<String, HashSet<String>> = HashMap::new();
 
@@ -726,7 +729,16 @@ async fn handle_analyze_architecture(
         if path.is_empty() {
             continue;
         }
-        let parts: Vec<&str> = path.split('/').collect();
+
+        // Strip the project root prefix so we work with relative paths.
+        // trim_start_matches('/') handles the case where root does not end with '/'.
+        let rel_path = if path.starts_with(&root) {
+            path[root.len()..].trim_start_matches('/').to_string()
+        } else {
+            path.clone()
+        };
+
+        let parts: Vec<&str> = rel_path.split('/').collect();
         if parts.len() < 2 {
             continue;
         }
@@ -771,6 +783,25 @@ async fn handle_analyze_architecture(
     Ok(CallToolResult::text(out))
 }
 
+/// Source file extensions that are considered compilable source code.
+/// Non-source files (`.md`, `.json`, `.toml`, etc.) are excluded from
+/// dead-code analysis to prevent false positives from doc strings and config keys.
+const SOURCE_EXTENSIONS: &[&str] = &["rs", "ts", "tsx", "js", "jsx", "go", "py"];
+
+/// Returns `true` if `path` ends with a recognised source-code extension.
+///
+/// Uses `std::path::Path::extension()` rather than `rsplit('.')` so that
+/// extensionless files (`Makefile`, `Dockerfile`) and dotfiles (`.gitignore`)
+/// correctly return `None` → `""` → excluded, instead of returning the full
+/// filename as the "extension".
+fn is_source_file(path: &str) -> bool {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    SOURCE_EXTENSIONS.contains(&ext)
+}
+
 async fn handle_find_dead_code(server: &Server, params: &CallToolParams) -> Result<CallToolResult> {
     let is_library = params
         .arguments
@@ -780,9 +811,14 @@ async fn handle_find_dead_code(server: &Server, params: &CallToolParams) -> Resu
     let records = server.store.get_all_records().await?;
     let mut exports = HashMap::new();
     let mut usages = HashSet::new();
+    let mut source_record_count = 0usize;
 
     for r in records {
         let path = r.metadata_str("path");
+        if !is_source_file(&path) {
+            continue; // skip non-source files (markdown, JSON, TOML, etc.)
+        }
+        source_record_count += 1;
         if path.contains("test") || path.contains("spec") {
             continue;
         }
@@ -813,6 +849,12 @@ async fn handle_find_dead_code(server: &Server, params: &CallToolParams) -> Resu
         if !usages.contains(&name) && !usages.contains(base_name) {
             dead.push((name, path));
         }
+    }
+
+    if source_record_count == 0 {
+        return Ok(CallToolResult::text(
+            "No source-code records found in the index.",
+        ));
     }
 
     if dead.is_empty() {
@@ -1065,6 +1107,7 @@ async fn handle_list_api_endpoints(
     _params: &CallToolParams,
 ) -> Result<CallToolResult> {
     let keywords = [
+        // Existing patterns — Go, Express, Flask
         "HandleFunc",
         "mux.Handle",
         "app.GET",
@@ -1072,6 +1115,15 @@ async fn handle_list_api_endpoints(
         "router.Register",
         "Route(",
         "@app.route",
+        // Axum patterns — both forms to handle rustfmt line-breaking.
+        // `.route(` (without the quote) catches `.route("/path", ...)` on one line
+        // and the multi-line formatted form where the path string is on the next line.
+        ".route(",
+        "routing::get",
+        "routing::post",
+        "routing::put",
+        "routing::delete",
+        "routing::patch",
     ];
 
     let mut unique: HashMap<String, crate::db::Record> = HashMap::new();
@@ -1632,11 +1684,12 @@ async fn handle_search_workspace(
             handle_filesystem_grep(server, &synthetic).await
         }
         "graph" => {
-            if query.is_empty() {
+            let sub_action = optional_string_arg(params, "sub_action").unwrap_or_default();
+
+            // `stats` does not require a query argument.
+            if query.is_empty() && sub_action != "stats" {
                 return Ok(CallToolResult::error("query is required for graph search"));
             }
-
-            let sub_action = optional_string_arg(params, "sub_action").unwrap_or_default();
 
             match sub_action.as_str() {
                 "callers" => {
@@ -1672,8 +1725,21 @@ async fn handle_search_workspace(
                     }
                     Ok(CallToolResult::text(out))
                 }
+                "stats" => {
+                    // Return graph population statistics without requiring a query.
+                    let node_count = server.store.graph.node_count();
+                    let edge_count = server.store.graph.call_edge_count();
+                    let impl_count = server.store.graph.impl_edge_count();
+                    Ok(CallToolResult::text(format!(
+                        "## Knowledge Graph Stats\n\n\
+                         - **Nodes**: {node_count}\n\
+                         - **Call Edges**: {edge_count}\n\
+                         - **Impl Edges**: {impl_count}"
+                    )))
+                }
                 _ => {
-                    // Default: existing get_implementations + search_by_name logic
+                    // Default: existing get_implementations + search_by_name logic,
+                    // with a vector-search fallback when the graph has no results.
                     let impls = server.store.graph.get_implementations(&query);
                     if !impls.is_empty() {
                         let mut out = format!("Implementations of '{query}':\n");
@@ -1684,8 +1750,27 @@ async fn handle_search_workspace(
                     }
                     let nodes = server.store.graph.search_by_name(&query);
                     if nodes.is_empty() {
+                        // Graph had no results — fetch counts and try vector fallback.
+                        let node_count = server.store.graph.node_count();
+                        let edge_count = server.store.graph.call_edge_count();
+                        let vector =
+                            embed_query_blocking(Arc::clone(&server.embedder), query.clone())
+                                .await?;
+                        let fallback = server
+                            .store
+                            .hybrid_search(vector, &query, limit, None)
+                            .await?;
+                        if fallback.is_empty() {
+                            return Ok(CallToolResult::text(format!(
+                                "⚠️ Graph has {node_count} nodes and {edge_count} edges — no entries found for '{query}'.\n\
+                                 Vector search also returned no results.\n\
+                                 Run workspace_manager with action='trigger_index' to rebuild the index."
+                            )));
+                        }
+                        let body = format_search_results(&fallback, &query);
                         return Ok(CallToolResult::text(format!(
-                            "No graph entries found for '{query}'."
+                            "⚠️ Graph had no entries for '{query}' (graph has {node_count} nodes, {edge_count} edges).\n\
+                             Falling back to vector search:\n\n{body}"
                         )));
                     }
                     let mut out = format!("Graph results for '{query}':\n");
@@ -2669,6 +2754,30 @@ async fn handle_auto_fix(server: &Server, params: &CallToolParams) -> Result<Cal
 // lsp_query — definition / references / type_hierarchy / impact_analysis
 // ---------------------------------------------------------------------------
 
+/// Maps a file extension to the LSP binary name for that language.
+fn lsp_binary_for_ext(ext: &str) -> &'static str {
+    match ext {
+        ".rs" => "rust-analyzer",
+        ".go" => "gopls",
+        ".ts" | ".tsx" | ".js" | ".jsx" => "typescript-language-server",
+        ".py" => "pylsp",
+        _ => "unknown",
+    }
+}
+
+/// Returns the installation command for the LSP binary associated with `ext`.
+fn lsp_install_hint(ext: &str) -> &'static str {
+    match ext {
+        ".rs" => "rustup component add rust-analyzer",
+        ".go" => "go install golang.org/x/tools/gopls@latest",
+        ".ts" | ".tsx" | ".js" | ".jsx" => {
+            "npm install -g typescript-language-server typescript"
+        }
+        ".py" => "pip install python-lsp-server",
+        _ => "Install the appropriate language server for this file type",
+    }
+}
+
 pub async fn handle_lsp_query(server: &Server, params: &CallToolParams) -> Result<CallToolResult> {
     let action = optional_string_arg(params, "action").unwrap_or_default();
     let path = optional_string_arg(params, "path").unwrap_or_default();
@@ -2684,6 +2793,42 @@ pub async fn handle_lsp_query(server: &Server, params: &CallToolParams) -> Resul
         .and_then(|e| e.to_str())
         .map(|e| format!(".{e}"))
         .unwrap_or_default();
+
+    // Handle the `health` action before attempting to acquire an LSP pool entry.
+    // This lets callers check binary availability without spawning a language server.
+    if action == "health" {
+        let binary = lsp_binary_for_ext(&ext);
+        // Cross-platform binary existence check: `binary --version` returns Err(NotFound)
+        // on both Unix and Windows when the binary is absent — no need for `which`/`where`.
+        let found = std::process::Command::new(binary)
+            .arg("--version")
+            .output()
+            .is_ok();
+        if found {
+            return Ok(CallToolResult::text(format!(
+                "✅ LSP binary `{binary}` found on PATH"
+            )));
+        } else {
+            return Ok(CallToolResult::text(format!(
+                "❌ LSP binary `{binary}` not found.\nInstall: {}",
+                lsp_install_hint(&ext)
+            )));
+        }
+    }
+
+    // Pre-flight check: verify the required LSP binary is present before trying
+    // to acquire a pool entry (which would eventually time out if the binary is absent).
+    let binary = lsp_binary_for_ext(&ext);
+    let binary_found = std::process::Command::new(binary)
+        .arg("--version")
+        .output()
+        .is_ok();
+    if !binary_found {
+        return Ok(CallToolResult::error(format!(
+            "LSP binary `{binary}` not found on PATH.\nInstall with: {}\nThen retry this query.",
+            lsp_install_hint(&ext)
+        )));
+    }
 
     let lsp = match server.lsp_pool.get(&ext) {
         Some(l) => l,
@@ -2701,7 +2846,7 @@ pub async fn handle_lsp_query(server: &Server, params: &CallToolParams) -> Resul
         "impact_analysis" => "textDocument/references",
         _ => {
             return Ok(CallToolResult::error(
-                "Invalid action. Use: definition, references, type_hierarchy, impact_analysis",
+                "Invalid action. Use: health, definition, references, type_hierarchy, impact_analysis",
             ));
         }
     };
