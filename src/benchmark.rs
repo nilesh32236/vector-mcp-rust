@@ -164,6 +164,69 @@ pub fn run(args: Vec<String>) -> Result<()> {
         }
         report.push_str("\n");
     }
+
+    // Phase 5: Ground Truth Audit (Golden Standard)
+    println!("[5/5] Ground Truth Audit (Accuracy Scoring)");
+    report.push_str("[Ground Truth Accuracy]\n");
+    
+    let mut total_points = 0.0;
+    let mut possible_points = 0.0;
+
+    let golden_tests = vec![
+        ("How is distance between points calculated?", "math_utils.go", "math.Sqrt"),
+        ("How to load configuration from JSON?", "config_manager.py", "json.load"),
+        ("How are Tree-sitter chunks extracted?", "chunker.rs", "fn tree_sitter_chunk"),
+        ("Where is email validation logic?", "config_manager.py", "def validate_email"),
+    ];
+
+    for (query, file_name, marker) in golden_tests {
+        // Only run if the file being tested matches or if we're doing a general audit
+        if !test_file.to_str().unwrap().contains(file_name) {
+            continue;
+        }
+
+        println!("Audit: \"{}\"", query);
+        possible_points += 1.0;
+        
+        let query_vec = engine.generate_embedding(query)?;
+        let mut scores: Vec<(f32, &chunker::Chunk)> = embedded_chunks.iter().map(|(chunk, emb)| {
+            let score = cosine_similarity(&query_vec, emb);
+            (score, chunk)
+        }).collect();
+        scores.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Check Top-3
+        let mut found_rank = None;
+        for (i, (_score, chunk)) in scores.iter().take(3).enumerate() {
+            if chunk.content.contains(marker) {
+                found_rank = Some(i + 1);
+                break;
+            }
+        }
+
+        match found_rank {
+            Some(1) => {
+                println!("  ✅ Perfect Hit (#1)");
+                total_points += 1.0;
+                report.push_str(&format!("Query: \"{}\" -> ✅ Match #1 (100%)\n", query));
+            }
+            Some(r) => {
+                println!("  ⚠️ Partial Match (#{}/3)", r);
+                total_points += 0.5;
+                report.push_str(&format!("Query: \"{}\" -> ⚠️ Match #{} (50%)\n", query, r));
+            }
+            None => {
+                println!("  ❌ Missed");
+                report.push_str(&format!("Query: \"{}\" -> ❌ Miss (0%)\n", query));
+            }
+        }
+    }
+
+    if possible_points > 0.0 {
+        let accuracy = (total_points / possible_points) * 100.0;
+        println!("\nFinal Accuracy Score: {:.1}%\n", accuracy);
+        report.push_str(&format!("\nFINAL ACCURACY SCORE: {:.1}%\n\n", accuracy));
+    }
     
     let footer = "=========================================================";
     println!("{}", footer);
@@ -179,6 +242,5 @@ pub fn run(args: Vec<String>) -> Result<()> {
 
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    // Since embeddings from LlamaEngine are already L2 normalized, dot product == cosine similarity.
     dot
 }

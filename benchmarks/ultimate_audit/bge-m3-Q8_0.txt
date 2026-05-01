@@ -1,0 +1,121 @@
+=========================================================
+Embedding Benchmark Report
+Model: /home/nilesh/.local/share/vector-mcp-rust/models/bge-m3-Q8_0.gguf
+Test File: src/indexer/chunker.rs
+=========================================================
+
+Initialization Time: 898.181923ms
+
+Total Chunks: 28
+
+[Speed Results]
+Cold Start (1st chunk): 345.666709ms
+Warm Single Latency:   346.406007ms
+Batch Total Time:      10.365354233s
+Average Time/Chunk:    370.18 ms
+
+[Vibe Test Results]
+Query: "Where is the Tantivy BM25 indexing logic?"
+  #1: Score 0.6971 | Lines 88-91 | Preview: pub struct ImplEdge {     pub struct_name: String,     pub trait_name: String,...
+  #2: Score 0.6937 | Lines 98-101 | Preview: struct LangSpec {     language: Language,     queries: &'static [&'static str],...
+  #3: Score 0.6902 | Lines 378-382 | Preview: pub fn parse_pdf(bytes: &[u8], file_path: &str) -> Result<Vec<Chunk>> {     let text = pdf_extract::extract_text_from_mem(bytes)         .map_err(|e| anyhow::anyhow!("PDF extraction failed: {}", e))?;...
+
+Query: "How are Tree-sitter semantic chunks extracted from files?"
+  #1: Score 0.8569 | Lines 531-549 | Preview: fn tree_sitter_chunk(content: &str, _file_path: &str, spec: &LangSpec) -> Result<Vec<Chunk>> {     let mut parser = Parser::new();     parser...
+  #2: Score 0.8207 | Lines 555-561 | Preview: fn extract_calls(node: tree_sitter::Node, source: &[u8]) -> Vec<String> {     let mut unique: HashSet<String> = HashSet::new();     walk_calls(node, source, &mut unique);...
+  #3: Score 0.7670 | Lines 378-382 | Preview: pub fn parse_pdf(bytes: &[u8], file_path: &str) -> Result<Vec<Chunk>> {     let text = pdf_extract::extract_text_from_mem(bytes)         .map_err(|e| anyhow::anyhow!("PDF extraction failed: {}", e))?;...
+
+Query: "How does the LlamaEngine generate Vulkan embeddings?"
+  #1: Score 0.7182 | Lines 88-91 | Preview: pub struct ImplEdge {     pub struct_name: String,     pub trait_name: String,...
+  #2: Score 0.7136 | Lines 98-101 | Preview: struct LangSpec {     language: Language,     queries: &'static [&'static str],...
+  #3: Score 0.7090 | Lines 555-561 | Preview: fn extract_calls(node: tree_sitter::Node, source: &[u8]) -> Vec<String> {     let mut unique: HashSet<String> = HashSet::new();     walk_calls(node, source, &mut unique);...
+
+[Ground Truth Accuracy]
+Query: "How are Tree-sitter chunks extracted?" -> ✅ Match #1 (100%)
+
+FINAL ACCURACY SCORE: 100.0%
+
+
+
+
+=========================================================
+Embedding Benchmark Report
+Model: /home/nilesh/.local/share/vector-mcp-rust/models/bge-m3-Q8_0.gguf
+Test File: samples/math_utils.go
+=========================================================
+
+Initialization Time: 884.79977ms
+
+Total Chunks: 4
+
+[Speed Results]
+Cold Start (1st chunk): 73.280132ms
+Warm Single Latency:   71.893876ms
+Batch Total Time:      289.655446ms
+Average Time/Chunk:    72.25 ms
+
+[Vibe Test Results]
+Query: "Where is the Tantivy BM25 indexing logic?"
+  #1: Score 0.7077 | Lines 9-11 | Preview: type Point struct { 	X, Y float64 }...
+  #2: Score 0.6764 | Lines 26-30 | Preview: func main() { 	p1 := Point{0, 0} 	p2 := Point{3, 4}...
+  #3: Score 0.6272 | Lines 22-24 | Preview: func AreaOfCircle(radius float64) float64 { 	return math.Pi * math.Pow(radius, 2) }...
+
+Query: "How are Tree-sitter semantic chunks extracted from files?"
+  #1: Score 0.7509 | Lines 9-11 | Preview: type Point struct { 	X, Y float64 }...
+  #2: Score 0.7413 | Lines 26-30 | Preview: func main() { 	p1 := Point{0, 0} 	p2 := Point{3, 4}...
+  #3: Score 0.6815 | Lines 22-24 | Preview: func AreaOfCircle(radius float64) float64 { 	return math.Pi * math.Pow(radius, 2) }...
+
+Query: "How does the LlamaEngine generate Vulkan embeddings?"
+  #1: Score 0.7245 | Lines 9-11 | Preview: type Point struct { 	X, Y float64 }...
+  #2: Score 0.6807 | Lines 26-30 | Preview: func main() { 	p1 := Point{0, 0} 	p2 := Point{3, 4}...
+  #3: Score 0.6747 | Lines 22-24 | Preview: func AreaOfCircle(radius float64) float64 { 	return math.Pi * math.Pow(radius, 2) }...
+
+[Ground Truth Accuracy]
+Query: "How is distance between points calculated?" -> ⚠️ Match #2 (50%)
+
+FINAL ACCURACY SCORE: 50.0%
+
+
+
+
+=========================================================
+Embedding Benchmark Report
+Model: /home/nilesh/.local/share/vector-mcp-rust/models/bge-m3-Q8_0.gguf
+Test File: samples/config_manager.py
+=========================================================
+
+Initialization Time: 827.950839ms
+
+Total Chunks: 5
+
+[Speed Results]
+Cold Start (1st chunk): 74.992828ms
+Warm Single Latency:   74.13527ms
+Batch Total Time:      786.992849ms
+Average Time/Chunk:    157.20 ms
+
+[Vibe Test Results]
+Query: "Where is the Tantivy BM25 indexing logic?"
+  #1: Score 0.7174 | Lines 27-29 | Preview: def get(self, key, default=None):         """Retrieves a setting by key."""         return self.settings.get(key, default)...
+  #2: Score 0.7156 | Lines 9-11 | Preview: def __init__(self, config_path):         self.config_path = config_path         self.settings = {}...
+  #3: Score 0.6923 | Lines 13-25 | Preview: def load(self):         """Loads configuration from the filesystem."""         if not os.path.exists(self.config_path):...
+
+Query: "How are Tree-sitter semantic chunks extracted from files?"
+  #1: Score 0.7594 | Lines 27-29 | Preview: def get(self, key, default=None):         """Retrieves a setting by key."""         return self.settings.get(key, default)...
+  #2: Score 0.7449 | Lines 13-25 | Preview: def load(self):         """Loads configuration from the filesystem."""         if not os.path.exists(self.config_path):...
+  #3: Score 0.7339 | Lines 9-11 | Preview: def __init__(self, config_path):         self.config_path = config_path         self.settings = {}...
+
+Query: "How does the LlamaEngine generate Vulkan embeddings?"
+  #1: Score 0.7073 | Lines 13-25 | Preview: def load(self):         """Loads configuration from the filesystem."""         if not os.path.exists(self.config_path):...
+  #2: Score 0.7009 | Lines 27-29 | Preview: def get(self, key, default=None):         """Retrieves a setting by key."""         return self.settings.get(key, default)...
+  #3: Score 0.6970 | Lines 9-11 | Preview: def __init__(self, config_path):         self.config_path = config_path         self.settings = {}...
+
+[Ground Truth Accuracy]
+Query: "How to load configuration from JSON?" -> ✅ Match #1 (100%)
+Query: "Where is email validation logic?" -> ✅ Match #1 (100%)
+
+FINAL ACCURACY SCORE: 100.0%
+
+
+
+
