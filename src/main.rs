@@ -192,8 +192,10 @@ async fn start_background_tasks(
 
 fn main() -> Result<()> {
     // 0. Silence internal llama.cpp logging.
-    std::env::set_var("LLAMA_LOG_VERBOSITY", "-1");
-    std::env::set_var("GGML_QUIET", "1");
+    unsafe {
+        std::env::set_var("LLAMA_LOG_VERBOSITY", "-1");
+        std::env::set_var("GGML_QUIET", "1");
+    }
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() > 1 && args[1] == "benchmark" {
@@ -212,10 +214,6 @@ fn main() -> Result<()> {
 }
 
 async fn async_main() -> Result<()> {
-    // 0. Silence internal llama.cpp logging.
-    std::env::set_var("LLAMA_LOG_VERBOSITY", "-1");
-    std::env::set_var("GGML_QUIET", "1");
-
     // 1. Load configuration first so we know the log path.
     let cfg = config::Config::load()?;
 

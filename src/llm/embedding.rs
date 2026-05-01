@@ -67,6 +67,7 @@ impl Embedder {
     /// multiple contexts to contend for the shared APU VRAM simultaneously,
     /// exhausting memory and hanging the Vulkan driver. Sequential processing
     /// keeps the memory footprint stable regardless of batch size.
+    #[allow(dead_code)]
     pub fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
         texts.iter().map(|t| self.embed_text(t)).collect()
     }

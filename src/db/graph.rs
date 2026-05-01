@@ -1,7 +1,7 @@
 use crate::db::Record;
 use crate::indexer::chunker::{CallEdge, ImplEdge};
 use dashmap::DashMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub struct EntityNode {
@@ -21,10 +21,15 @@ pub struct KnowledgeGraph {
     interfaces: DashMap<String, HashMap<String, String>>,
     /// caller_symbol → Vec<CallEdge>
     call_edges: DashMap<String, Vec<CallEdge>>,
+    /// caller_symbol → set of callee_symbols already in call_edges (O(1) dedup).
+    call_edges_seen: DashMap<String, HashSet<String>>,
     /// trait_name → Vec<struct_name>
     trait_impls: DashMap<String, Vec<String>>,
-    /// Secondary index: node name → record ID for O(1) name lookups.
-    name_to_id: DashMap<String, String>,
+    /// trait_name → set of struct_names already in trait_impls (O(1) dedup).
+    trait_impls_seen: DashMap<String, HashSet<String>>,
+    /// Secondary index: node name → record IDs for O(1) name lookups.
+    /// A Vec is used to handle nodes with duplicate names.
+    name_to_id: DashMap<String, Vec<String>>,
 }
 
 impl KnowledgeGraph {
@@ -34,7 +39,9 @@ impl KnowledgeGraph {
             impls: DashMap::new(),
             interfaces: DashMap::new(),
             call_edges: DashMap::new(),
+            call_edges_seen: DashMap::new(),
             trait_impls: DashMap::new(),
+            trait_impls_seen: DashMap::new(),
             name_to_id: DashMap::new(),
         }
     }
@@ -64,8 +71,12 @@ impl KnowledgeGraph {
         };
 
         self.nodes.insert(r.id.clone(), node.clone());
-        // Maintain secondary name → id index.
-        self.name_to_id.insert(name.clone(), r.id.clone());
+        // Maintain secondary name → ids index (supports duplicate names).
+        // Deduplicate: only push r.id if it isn't already present for this name.
+        let mut ids = self.name_to_id.entry(name.clone()).or_default();
+        if !ids.contains(&r.id) {
+            ids.push(r.id.clone());
+        }
 
         // --- Existing interface/impl logic ---
         if node_type == "interface_type" || node_type == "interface" {
@@ -126,13 +137,10 @@ impl KnowledgeGraph {
             .unwrap_or_default();
 
         for edge in &callee_rels {
-            let mut edges = self.call_edges.entry(edge.caller_symbol.clone()).or_default();
-            // Deduplicate by (caller_symbol, callee_symbol) pair.
-            let already_present = edges
-                .iter()
-                .any(|e| e.callee_symbol == edge.callee_symbol);
-            if !already_present {
-                edges.push(edge.clone());
+            // O(1) dedup using a parallel seen-set keyed by (caller, callee).
+            let mut seen = self.call_edges_seen.entry(edge.caller_symbol.clone()).or_default();
+            if seen.insert(edge.callee_symbol.clone()) {
+                self.call_edges.entry(edge.caller_symbol.clone()).or_default().push(edge.clone());
             }
         }
 
@@ -147,9 +155,10 @@ impl KnowledgeGraph {
             .unwrap_or_default();
 
         for edge in &impl_rels {
-            let mut impls = self.trait_impls.entry(edge.trait_name.clone()).or_default();
-            if !impls.contains(&edge.struct_name) {
-                impls.push(edge.struct_name.clone());
+            // O(1) dedup using a parallel seen-set keyed by (trait, struct).
+            let mut seen = self.trait_impls_seen.entry(edge.trait_name.clone()).or_default();
+            if seen.insert(edge.struct_name.clone()) {
+                self.trait_impls.entry(edge.trait_name.clone()).or_default().push(edge.struct_name.clone());
             }
         }
     }
@@ -160,7 +169,9 @@ impl KnowledgeGraph {
         self.impls.clear();
         self.interfaces.clear();
         self.call_edges.clear();
+        self.call_edges_seen.clear();
         self.trait_impls.clear();
+        self.trait_impls_seen.clear();
         self.name_to_id.clear();
 
         for r in records {
@@ -212,10 +223,12 @@ impl KnowledgeGraph {
             let caller_sym = entry.key();
             let edges = entry.value();
             if edges.iter().any(|e| e.callee_symbol == callee_symbol) {
-                // O(1) lookup via name_to_id index.
-                if let Some(id) = self.name_to_id.get(caller_sym) {
-                    if let Some(node) = self.nodes.get(id.value()) {
-                        callers.push(node.clone());
+                // O(1) lookup via name_to_id index — iterate all IDs for this name.
+                if let Some(ids) = self.name_to_id.get(caller_sym) {
+                    for id in ids.iter() {
+                        if let Some(node) = self.nodes.get(id) {
+                            callers.push(node.clone());
+                        }
                     }
                 }
             }
@@ -230,11 +243,16 @@ impl KnowledgeGraph {
             .map(|edges| {
                 edges
                     .iter()
-                    .filter_map(|e| {
-                        // O(1) lookup via name_to_id index.
+                    .flat_map(|e| {
+                        // O(1) lookup via name_to_id index — iterate all IDs for this name.
                         self.name_to_id
                             .get(&e.callee_symbol)
-                            .and_then(|id| self.nodes.get(id.value()).map(|n| n.clone()))
+                            .map(|ids| {
+                                ids.iter()
+                                    .filter_map(|id| self.nodes.get(id).map(|n| n.clone()))
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default()
                     })
                     .collect()
             })
@@ -248,11 +266,16 @@ impl KnowledgeGraph {
             .map(|names| {
                 names
                     .iter()
-                    .filter_map(|struct_name| {
-                        // O(1) lookup via name_to_id index.
+                    .flat_map(|struct_name| {
+                        // O(1) lookup via name_to_id index — iterate all IDs for this name.
                         self.name_to_id
                             .get(struct_name)
-                            .and_then(|id| self.nodes.get(id.value()).map(|n| n.clone()))
+                            .map(|ids| {
+                                ids.iter()
+                                    .filter_map(|id| self.nodes.get(id).map(|n| n.clone()))
+                                    .collect::<Vec<_>>()
+                            })
+                            .unwrap_or_default()
                     })
                     .collect()
             })

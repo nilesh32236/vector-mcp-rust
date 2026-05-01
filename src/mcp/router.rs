@@ -111,9 +111,18 @@ impl SemanticRouter {
         for (intent, proto) in &self.prototypes {
             let sim = dot_product(&query_vec, proto);
             match intent {
-                Intent::SearchOnly => { search_score += sim; search_count += 1; }
-                Intent::Summarize => { summarize_score += sim; summarize_count += 1; }
-                Intent::Analyze => { analyze_score += sim; analyze_count += 1; }
+                Intent::SearchOnly => {
+                    search_score += sim;
+                    search_count += 1;
+                }
+                Intent::Summarize => {
+                    summarize_score += sim;
+                    summarize_count += 1;
+                }
+                Intent::Analyze => {
+                    analyze_score += sim;
+                    analyze_count += 1;
+                }
             }
         }
 
@@ -150,5 +159,6 @@ impl SemanticRouter {
 /// Dot product of two equal-length slices.
 /// For L2-normalised vectors this equals cosine similarity.
 fn dot_product(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len(), "dot_product: slice lengths must be equal");
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }

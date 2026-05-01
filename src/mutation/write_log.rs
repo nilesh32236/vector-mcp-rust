@@ -155,6 +155,27 @@ impl WriteLog {
             }
         }
 
+        // Process any leftover bytes before the first newline (the file's first line).
+        if !tail_buf.is_empty() && collected_lines.len() < n {
+            let trimmed = tail_buf
+                .iter()
+                .copied()
+                .skip_while(|&b| b == b' ' || b == b'\r')
+                .collect::<Vec<_>>();
+            let trimmed = {
+                let mut v = trimmed;
+                while v.last() == Some(&b' ') || v.last() == Some(&b'\r') {
+                    v.pop();
+                }
+                v
+            };
+            if !trimmed.is_empty() {
+                if let Ok(s) = std::str::from_utf8(&trimmed) {
+                    collected_lines.push(s.to_string());
+                }
+            }
+        }
+
         // Parse and return in chronological order (oldest first).
         let mut entries: Vec<WriteLogEntry> = collected_lines
             .iter()
@@ -175,7 +196,8 @@ impl WriteLog {
 fn lock_exclusive(file: &std::fs::File) -> Result<()> {
     use std::os::unix::io::AsRawFd;
     let fd = file.as_raw_fd();
-    let ret = libc_flock(fd, 2 /* LOCK_EX */);
+    // SAFETY: flock is a standard POSIX syscall; fd is valid for the lifetime of the call.
+    let ret = unsafe { libc::flock(fd, libc::LOCK_EX) };
     if ret != 0 {
         Err(anyhow::anyhow!(
             "flock(LOCK_EX) failed: {}",
@@ -190,7 +212,8 @@ fn lock_exclusive(file: &std::fs::File) -> Result<()> {
 fn unlock(file: &std::fs::File) -> Result<()> {
     use std::os::unix::io::AsRawFd;
     let fd = file.as_raw_fd();
-    let ret = libc_flock(fd, 8 /* LOCK_UN */);
+    // SAFETY: flock is a standard POSIX syscall; fd is valid for the lifetime of the call.
+    let ret = unsafe { libc::flock(fd, libc::LOCK_UN) };
     if ret != 0 {
         Err(anyhow::anyhow!(
             "flock(LOCK_UN) failed: {}",
@@ -201,24 +224,17 @@ fn unlock(file: &std::fs::File) -> Result<()> {
     }
 }
 
-#[cfg(unix)]
-unsafe extern "C" {
-    fn flock(fd: std::os::raw::c_int, operation: std::os::raw::c_int) -> std::os::raw::c_int;
-}
-
-#[cfg(unix)]
-fn libc_flock(fd: std::os::raw::c_int, op: std::os::raw::c_int) -> std::os::raw::c_int {
-    // SAFETY: flock is a standard POSIX syscall; fd is valid for the lifetime of the call.
-    unsafe { flock(fd, op) }
-}
-
-// On non-Unix platforms fall back to a no-op lock.
+// On non-Unix platforms use fs2 for cross-platform advisory file locking.
 #[cfg(not(unix))]
-fn lock_exclusive(_file: &std::fs::File) -> Result<()> {
-    Ok(())
+fn lock_exclusive(file: &std::fs::File) -> Result<()> {
+    use fs2::FileExt;
+    file.lock_exclusive()
+        .map_err(|e| anyhow::anyhow!("lock_exclusive failed: {e}"))
 }
 
 #[cfg(not(unix))]
-fn unlock(_file: &std::fs::File) -> Result<()> {
-    Ok(())
+fn unlock(file: &std::fs::File) -> Result<()> {
+    use fs2::FileExt;
+    file.unlock()
+        .map_err(|e| anyhow::anyhow!("unlock failed: {e}"))
 }

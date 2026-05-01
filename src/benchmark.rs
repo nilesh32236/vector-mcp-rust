@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::path::PathBuf;
 use std::time::Instant;
 use crate::indexer::chunker;
@@ -77,7 +77,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
     // Chunking the test file
     println!("[2/5] Parsing Test File...");
     let content = std::fs::read_to_string(&test_file)?;
-    let extension = format!(".{}", test_file.extension().unwrap().to_str().unwrap());
+    let extension = test_file.extension().and_then(|s| s.to_str()).map(|ext| format!(".{}", ext)).unwrap_or_default();
     let mut chunks = chunker::parse_file(&content, test_file.to_str().unwrap(), &extension)?;
     
     if chunks.is_empty() {
@@ -154,7 +154,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
             (score, chunk)
         }).collect();
 
-        scores.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scores.sort_by(|a, b| b.0.total_cmp(&a.0));
 
         for (i, (score, chunk)) in scores.iter().take(3).enumerate() {
             let preview: String = chunk.content.lines().take(3).collect::<Vec<_>>().join("\n");
@@ -180,8 +180,16 @@ pub fn run(args: Vec<String>) -> Result<()> {
     ];
 
     for (query, file_name, marker) in golden_tests {
-        // Only run if the file being tested matches or if we're doing a general audit
-        if !test_file.to_str().unwrap().contains(file_name) {
+        // Only run if the file being tested matches or if we're doing a general audit.
+        // Use an exact stem match against "all" to avoid false positives like "football.rs".
+        let test_file_str = test_file.to_str().unwrap_or("");
+        let is_general_audit = test_file
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|stem| stem == "all")
+            .unwrap_or(false);
+        if !is_general_audit && !test_file_str.contains(file_name) {
+            tracing::debug!("Skipping golden test '{}' (file '{}' not matched by test_file)", query, file_name);
             continue;
         }
 
@@ -193,7 +201,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
             let score = cosine_similarity(&query_vec, emb);
             (score, chunk)
         }).collect();
-        scores.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        scores.sort_by(|a, b| b.0.total_cmp(&a.0));
 
         // Check Top-3
         let mut found_rank = None;
@@ -242,5 +250,12 @@ pub fn run(args: Vec<String>) -> Result<()> {
 
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    dot
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let denom = norm_a * norm_b;
+    if denom == 0.0 {
+        0.0
+    } else {
+        dot / denom
+    }
 }

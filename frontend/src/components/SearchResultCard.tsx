@@ -56,16 +56,13 @@ function extToLang(path: string): string {
  */
 function shortenPath(path: string): string {
   if (!path) return path;
-  // Strip common project-root prefixes by finding the first meaningful segment
-  // after known root markers (src/, frontend/, docs/, etc.)
   const markers = ["/src/", "/frontend/", "/docs/", "/scripts/", "/design-system/"];
   for (const marker of markers) {
     const idx = path.indexOf(marker);
     if (idx !== -1) {
-      return path.slice(idx + 1); // keep the marker segment, drop leading slash
+      return path.slice(idx + 1);
     }
   }
-  // Fallback: show only the last 3 path segments
   const parts = path.replace(/\\/g, "/").split("/").filter(Boolean);
   return parts.slice(-3).join("/");
 }
@@ -77,6 +74,9 @@ function relevanceLabel(score: number): { label: string; cls: string } {
   return { label: "Low", cls: "text-foreground/40" };
 }
 
+// Lines of code to show when collapsed
+const COLLAPSED_LINES = 12;
+
 export function SearchResultCard({ result }: SearchResultCardProps) {
   const [copied, setCopied] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
@@ -87,7 +87,7 @@ export function SearchResultCard({ result }: SearchResultCardProps) {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch {
-      // clipboard permission denied — no false success indicator
+      // clipboard permission denied
     }
   };
 
@@ -103,17 +103,19 @@ export function SearchResultCard({ result }: SearchResultCardProps) {
   const similarity = result.similarity ?? 0;
   const { label: relLabel, cls: relCls } = relevanceLabel(similarity);
 
-  // The text coming from the backend is raw source code, not markdown.
-  // Wrap it in a fenced code block so react-markdown routes it to CodeBlock.
-  const isLikelyCode = lang !== "plaintext" || result.text.includes("\n");
-  const markdownContent = isLikelyCode
-    ? `\`\`\`${lang}\n${result.text}\n\`\`\``
+  // Count lines to decide whether truncation is needed
+  const lines = result.text.split("\n");
+  const needsTruncation = lines.length > COLLAPSED_LINES;
+
+  // When collapsed, show only the first N lines
+  const displayText = needsTruncation && !isExpanded
+    ? lines.slice(0, COLLAPSED_LINES).join("\n")
     : result.text;
 
-  const COLLAPSE_THRESHOLD = 300; // chars before showing expand button
+  const markdownContent = `\`\`\`${lang}\n${displayText}\n\`\`\``;
 
   return (
-    <div className="glass rounded-2xl group hover:border-cta/30 transition-all duration-300 overflow-hidden">
+    <div className="glass rounded-2xl group hover:border-cta/30 transition-all duration-300">
       {/* ── Header ── */}
       <div className="flex items-start justify-between px-5 pt-5 pb-4 gap-4">
         {/* File info */}
@@ -217,71 +219,61 @@ export function SearchResultCard({ result }: SearchResultCardProps) {
       )}
 
       {/* ── Code content ── */}
-      <div
-        className={cn(
-          "relative transition-all duration-500",
-          isExpanded ? "max-h-[3000px]" : "max-h-64"
-        )}
-      >
-        <div className="px-5 pb-1">
-          <ReactMarkdown
-            components={{
-              code({ className, children, ...props }) {
-                const isBlock =
-                  Boolean(className?.startsWith("language-")) ||
-                  String(children).includes("\n");
-                if (isBlock) {
-                  return (
-                    <CodeBlock className={className}>
-                      {String(children).replace(/\n$/, "")}
-                    </CodeBlock>
-                  );
-                }
+      <div className="px-5 pb-1">
+        <ReactMarkdown
+          components={{
+            code({ className, children, ...props }) {
+              const isBlock =
+                Boolean(className?.startsWith("language-")) ||
+                String(children).includes("\n");
+              if (isBlock) {
                 return (
-                  <code
-                    className="bg-white/10 px-1.5 py-0.5 rounded text-cta font-mono text-xs"
-                    {...props}
-                  >
-                    {children}
-                  </code>
+                  <CodeBlock className={className}>
+                    {String(children).replace(/\n$/, "")}
+                  </CodeBlock>
                 );
-              },
-              p({ children }) {
-                return (
-                  <p className="mb-2 last:mb-0 text-xs leading-relaxed font-mono text-foreground/75 whitespace-pre-wrap">
-                    {children}
-                  </p>
-                );
-              },
-              pre({ children }) {
-                return <>{children}</>;
-              },
-            }}
-          >
-            {markdownContent}
-          </ReactMarkdown>
-        </div>
-
-        {/* Fade-out gradient when collapsed */}
-        {!isExpanded && result.text.length > COLLAPSE_THRESHOLD && (
-          <div className="absolute bottom-0 left-0 right-0 h-20 bg-gradient-to-t from-[#1E293B] to-transparent pointer-events-none" />
-        )}
+              }
+              return (
+                <code
+                  className="bg-white/10 px-1.5 py-0.5 rounded text-cta font-mono text-xs"
+                  {...props}
+                >
+                  {children}
+                </code>
+              );
+            },
+            p({ children }) {
+              return (
+                <p className="mb-2 last:mb-0 text-xs leading-relaxed font-mono text-foreground/75 whitespace-pre-wrap">
+                  {children}
+                </p>
+              );
+            },
+            pre({ children }) {
+              return <>{children}</>;
+            },
+          }}
+        >
+          {markdownContent}
+        </ReactMarkdown>
       </div>
 
       {/* ── Expand / Collapse ── */}
-      {result.text.length > COLLAPSE_THRESHOLD && (
-        <div className="px-5 pb-4 pt-2 flex justify-center">
+      {needsTruncation && (
+        <div className="px-5 pb-4 pt-1 flex justify-center">
           <button
             onClick={() => setIsExpanded(!isExpanded)}
-            className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-widest text-foreground/30 hover:text-cta transition-all cursor-pointer px-3 py-1.5 rounded-full hover:bg-white/5"
+            className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-widest text-foreground/40 hover:text-cta transition-all cursor-pointer px-4 py-2 rounded-full hover:bg-white/5 border border-white/5 hover:border-cta/20"
           >
             {isExpanded ? (
               <>
-                <ChevronUp className="w-3 h-3" /> Collapse
+                <ChevronUp className="w-3 h-3" />
+                Collapse
               </>
             ) : (
               <>
-                <ChevronDown className="w-3 h-3" /> Show full code
+                <ChevronDown className="w-3 h-3" />
+                Show full code ({lines.length} lines)
               </>
             )}
           </button>

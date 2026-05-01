@@ -68,10 +68,10 @@ impl LlamaEngine {
              add LimitMEMLOCK=infinity to the systemd unit to guarantee locking."
         );
 
-        let mut coder_path = models_dir.join("qwen2.5-coder-0.5b-instruct-q4_k_m.gguf");
+        let mut coder_path = models_dir.join("qwen2.5-coder-1.5b-instruct-q4_k_m.gguf");
         if !coder_path.exists() {
             if let Ok(home) = std::env::var("HOME") {
-                let fallback = Path::new(&home).join(".local/share/vector-mcp-rust/models/qwen2.5-coder-0.5b-instruct-q4_k_m.gguf");
+                let fallback = Path::new(&home).join(".local/share/vector-mcp-rust/models/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf");
                 if fallback.exists() {
                     coder_path = fallback;
                 }
@@ -85,7 +85,7 @@ impl LlamaEngine {
         );
 
         let embed_path = embed_model_path.map(std::path::PathBuf::from).unwrap_or_else(|| {
-            models_dir.join("nomic-embed-text-v1.5.Q4_K_M.gguf")
+            models_dir.join("e5-small-v2.Q8_0.gguf")
         });
         anyhow::ensure!(
             embed_path.exists(),

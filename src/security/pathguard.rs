@@ -44,6 +44,19 @@ impl PathGuard {
         let write_allowlist = std::env::var_os("WRITE_ALLOWLIST").map(|val| {
             std::env::split_paths(&val)
                 .filter(|p| !p.as_os_str().is_empty())
+                .filter_map(|p| {
+                    match std::fs::canonicalize(&p) {
+                        Ok(canonical) => Some(canonical),
+                        Err(e) => {
+                            tracing::warn!(
+                                path = %p.display(),
+                                error = %e,
+                                "WRITE_ALLOWLIST: failed to canonicalize entry — ignoring"
+                            );
+                            None
+                        }
+                    }
+                })
                 .collect::<Vec<_>>()
         });
 
@@ -319,8 +332,20 @@ mod tests {
         // Set WRITE_ALLOWLIST to the allowed sub-directory.
         // Use std::env::join_paths to be platform-safe.
         let allowlist_val = std::env::join_paths([&allowed_sub]).unwrap();
-        // SAFETY: test-only; single-threaded test runner.
+
+        // RAII guard: ensures WRITE_ALLOWLIST is always removed, even on panic.
+        // NOTE: This test must run single-threaded (or with serial_test) to avoid
+        // races on the shared WRITE_ALLOWLIST environment variable.
+        struct EnvVarGuard(&'static str);
+        impl Drop for EnvVarGuard {
+            fn drop(&mut self) {
+                // SAFETY: test-only cleanup; no other threads should be reading this var.
+                unsafe { std::env::remove_var(self.0) };
+            }
+        }
+        // SAFETY: test-only; must run single-threaded.
         unsafe { std::env::set_var("WRITE_ALLOWLIST", &allowlist_val) };
+        let _guard = EnvVarGuard("WRITE_ALLOWLIST");
 
         let guard = PathGuard::new(base)?;
 
@@ -335,9 +360,6 @@ mod tests {
             guard.validate("other/main.rs", PathOp::Write).is_err(),
             "path outside WRITE_ALLOWLIST should be rejected"
         );
-
-        // Clean up env var so other tests are not affected.
-        unsafe { std::env::remove_var("WRITE_ALLOWLIST") };
 
         Ok(())
     }

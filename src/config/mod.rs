@@ -36,7 +36,7 @@ pub struct Config {
     /// Retained for future extensibility; not used to drive model loading.
     pub reranker_model_name: String,
     pub hf_token: String,
-    /// Embedding output dimension.  Defaults to 768 (nomic-embed-text-v1.5).
+    /// Embedding output dimension.  Defaults to 384 (e5-small-v2).
     pub dimension: usize,
     pub disable_watcher: bool,
     pub embedder_pool_size: usize,
@@ -125,11 +125,11 @@ impl Config {
 
         let api_port = env::var("API_PORT").unwrap_or_else(|_| "47821".to_string());
 
-        // Default to 768 — the output dimension of nomic-embed-text-v1.5.
+        // Default to 384 — the output dimension of e5-small-v2.
         let dimension = env::var("EMBEDDING_DIM")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(768);
+            .unwrap_or(384);
 
         let feature_toggles = FeatureToggles {
             enable_local_llm: env_bool("ENABLE_LOCAL_LLM"),

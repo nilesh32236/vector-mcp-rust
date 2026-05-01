@@ -46,11 +46,13 @@ impl KvCacheStore {
     }
 
     /// Return the path for the cache file corresponding to `hash`.
+    #[allow(dead_code)]
     pub fn cache_path(&self, hash: &str) -> PathBuf {
         self.dir.join(format!("{hash}.kvcache"))
     }
 
     /// Check whether a cache file exists for `hash`.
+    #[allow(dead_code)]
     pub fn exists(&self, hash: &str) -> bool {
         self.cache_path(hash).exists()
     }
@@ -60,6 +62,7 @@ impl KvCacheStore {
     ///
     /// Combining touch + eviction in a single lock acquisition prevents the
     /// transient off-by-one where `lru.len() == max_entries + 1` between calls.
+    #[allow(dead_code)]
     pub fn touch(&self, hash: &str) {
         let mut lru = self.lru.lock().unwrap();
         lru.retain(|h| h != hash);
@@ -83,12 +86,16 @@ impl KvCacheStore {
 
     /// Evict the least-recently-used entry if the cache is over capacity.
     ///
-    /// Kept for backwards compatibility; `touch` now handles eviction inline.
+    /// Deprecated: eviction is now handled atomically inside [`touch`](Self::touch).
+    /// Call `touch` instead.
+    #[allow(dead_code)]
+    #[deprecated(since = "0.1.0", note = "use `touch` instead — eviction is now handled atomically inside touch")]
     pub fn evict_if_needed(&self) {
         // No-op: eviction is now handled atomically inside `touch`.
     }
 
     /// Remove a specific cache file (e.g. when it is found to be corrupt).
+    #[allow(dead_code)]
     pub fn remove(&self, hash: &str) {
         let path = self.cache_path(hash);
         let _ = std::fs::remove_file(&path);
@@ -131,25 +138,63 @@ impl KvCacheStore {
     /// Clearing on startup is the safest policy.
     pub fn clear_on_startup(&self) {
         let dir = &self.dir;
-        let count = std::fs::read_dir(dir)
-            .into_iter()
-            .flatten()
-            .flatten()
-            .filter(|e| {
-                e.path()
-                    .extension()
-                    .and_then(|x| x.to_str())
-                    .map(|x| x == "kvcache")
-                    .unwrap_or(false)
-            })
-            .filter_map(|e| std::fs::remove_file(e.path()).ok())
-            .count();
+        let mut purged = 0usize;
+        let mut failed = 0usize;
+
+        match std::fs::read_dir(dir) {
+            Err(e) => {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    error = %e,
+                    "KV-cache: failed to read cache directory on startup"
+                );
+                return;
+            }
+            Ok(entries) => {
+                for entry_result in entries {
+                    match entry_result {
+                        Err(e) => {
+                            tracing::warn!(
+                                dir = %dir.display(),
+                                error = %e,
+                                "KV-cache: failed to read directory entry"
+                            );
+                            failed += 1;
+                        }
+                        Ok(entry) => {
+                            let path = entry.path();
+                            let is_kvcache = path
+                                .extension()
+                                .and_then(|x| x.to_str())
+                                .map(|x| x == "kvcache")
+                                .unwrap_or(false);
+                            if !is_kvcache {
+                                continue;
+                            }
+                            match std::fs::remove_file(&path) {
+                                Ok(()) => purged += 1,
+                                Err(e) => {
+                                    tracing::warn!(
+                                        path = %path.display(),
+                                        error = %e,
+                                        "KV-cache: failed to remove stale cache file"
+                                    );
+                                    failed += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         let mut lru = self.lru.lock().unwrap();
         lru.clear();
-        if count > 0 {
+        if purged > 0 || failed > 0 {
             tracing::info!(
                 dir = %dir.display(),
-                count,
+                count = purged,
+                failed,
                 "KV-cache: purged stale files from previous run"
             );
         }

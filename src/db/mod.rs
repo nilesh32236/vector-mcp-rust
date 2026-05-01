@@ -38,6 +38,8 @@ pub struct LexicalIndex {
     reader: IndexReader,
     writer: Option<Arc<RwLock<IndexWriter>>>,
     fields: LexicalFields,
+    /// True when this index lives entirely in RAM (slave read-only fallback).
+    in_ram: bool,
 }
 
 struct LexicalFields {
@@ -52,14 +54,23 @@ impl LexicalIndex {
         let text = schema_builder.add_text_field("text", TEXT | STORED);
         let schema = schema_builder.build();
 
-        let index = if path.exists() && path.is_dir() && std::fs::read_dir(path)?.next().is_some() {
-            TantivyIndex::open_in_dir(path).context("Opening Tantivy index")?
+        let index_exists =
+            path.exists() && path.is_dir() && std::fs::read_dir(path)?.next().is_some();
+
+        let (index, in_ram) = if index_exists {
+            (TantivyIndex::open_in_dir(path).context("Opening Tantivy index")?, false)
+        } else if read_only {
+            // Slave mode: index hasn't been created by the master yet.
+            // Build an in-RAM index so searches return empty results
+            // rather than hard-failing startup.
+            tracing::info!(
+                "Tantivy index not found at {} (read-only mode) — using in-RAM fallback",
+                path.display()
+            );
+            (TantivyIndex::create_in_ram(schema), true)
         } else {
-            if read_only {
-                bail!("Cannot create a new index in read-only mode");
-            }
             std::fs::create_dir_all(path).context("Creating index directory")?;
-            TantivyIndex::create_in_dir(path, schema).context("Creating Tantivy index")?
+            (TantivyIndex::create_in_dir(path, schema).context("Creating Tantivy index")?, false)
         };
 
         let reader = index
@@ -67,8 +78,14 @@ impl LexicalIndex {
             .reload_policy(ReloadPolicy::OnCommitWithDelay)
             .try_into()?;
 
-        let writer = if read_only {
+        let writer = if read_only && !in_ram {
             None
+        } else if read_only && in_ram {
+            // In-RAM index: create a writer so we can populate it from existing
+            // LanceDB records during startup, then keep it for future in-memory
+            // updates. No data is ever written to disk.
+            let w = index.writer(15_000_000).context("Acquiring in-RAM Tantivy writer")?;
+            Some(Arc::new(RwLock::new(w)))
         } else {
             let w = match index.writer(50_000_000) {
                 Ok(w) => w,
@@ -101,6 +118,7 @@ impl LexicalIndex {
             reader,
             writer,
             fields: LexicalFields { id, text },
+            in_ram,
         })
     }
 

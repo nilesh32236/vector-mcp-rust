@@ -1996,7 +1996,13 @@ fn chrono_now_rfc3339() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    secs_to_rfc3339(total_secs)
+}
 
+/// Convert a Unix timestamp (seconds since 1970-01-01T00:00:00Z) to an RFC 3339 string.
+///
+/// Pure function — no I/O, fully testable.
+fn secs_to_rfc3339(total_secs: u64) -> String {
     let s = (total_secs % 60) as u32;
     let m = ((total_secs / 60) % 60) as u32;
     let h = ((total_secs / 3600) % 24) as u32;
@@ -2017,6 +2023,44 @@ fn chrono_now_rfc3339() -> String {
     let yr = if mo <= 2 { y + 1 } else { y };
 
     format!("{yr:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+#[cfg(test)]
+mod rfc3339_tests {
+    use super::secs_to_rfc3339;
+
+    #[test]
+    fn test_unix_epoch() {
+        assert_eq!(secs_to_rfc3339(0), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn test_leap_day_2020() {
+        // 2020-02-29T00:00:00Z = 1582934400
+        assert_eq!(secs_to_rfc3339(1_582_934_400), "2020-02-29T00:00:00Z");
+    }
+
+    #[test]
+    fn test_end_of_year_2020() {
+        // 2020-12-31T23:59:59Z = 1609459199
+        assert_eq!(secs_to_rfc3339(1_609_459_199), "2020-12-31T23:59:59Z");
+    }
+
+    #[test]
+    fn test_new_year_2021() {
+        // 2021-01-01T00:00:00Z = 1609459200
+        assert_eq!(secs_to_rfc3339(1_609_459_200), "2021-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn test_rfc3339_format() {
+        let s = secs_to_rfc3339(1_700_000_000);
+        // Must match YYYY-MM-DDTHH:MM:SSZ
+        assert!(
+            s.len() == 20 && s.ends_with('Z') && s.chars().nth(10) == Some('T'),
+            "unexpected format: {s}"
+        );
+    }
 }
 
 /// Format a generated doc string into the appropriate comment style for the
@@ -2145,13 +2189,17 @@ async fn handle_generate_inline_docs(
     let start_line_hint = meta["start_line"].as_u64().map(|l| l as usize);
 
     let insert_pos: Option<usize> = if let Some(line_no) = start_line_hint {
-        // line_no is 1-based; find the byte offset of that line.
+        // line_no is 1-based; find the byte offset of that line by counting '\n' bytes.
         let mut offset = 0usize;
-        for (idx, line) in content.lines().enumerate() {
-            if idx + 1 == line_no {
+        let mut current_line = 1usize;
+        for (i, &b) in content.as_bytes().iter().enumerate() {
+            if current_line == line_no {
+                offset = i;
                 break;
             }
-            offset += line.len() + 1; // +1 for '\n'
+            if b == b'\n' {
+                current_line += 1;
+            }
         }
         Some(offset)
     } else {
@@ -2162,9 +2210,11 @@ async fn handle_generate_inline_docs(
         let mut i = 0;
         while i + pat.len() <= bytes.len() {
             if bytes[i..i + pat.len()] == *pat {
-                let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_';
+                let before_ok = i == 0
+                    || (!bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_');
                 let after_ok = i + pat.len() >= bytes.len()
-                    || !bytes[i + pat.len()].is_ascii_alphanumeric() && bytes[i + pat.len()] != b'_';
+                    || (!bytes[i + pat.len()].is_ascii_alphanumeric()
+                        && bytes[i + pat.len()] != b'_');
                 if before_ok && after_ok {
                     // Walk back to the start of this line.
                     let line_start = content[..i].rfind('\n').map(|p| p + 1).unwrap_or(0);
@@ -2207,8 +2257,26 @@ async fn handle_generate_inline_docs(
     tokio::fs::write(&tmp, new_content.as_bytes())
         .await
         .map_err(|e| anyhow::anyhow!("write to tmp failed: {e}"))?;
-    std::fs::rename(&abs, &bak).map_err(|e| anyhow::anyhow!("backup rename failed: {e}"))?;
-    std::fs::rename(&tmp, &abs).map_err(|e| anyhow::anyhow!("atomic install failed: {e}"))?;
+    // Atomic backup-and-install using async renames with rollback on failure.
+    tokio::fs::rename(&abs, &bak)
+        .await
+        .map_err(|e| anyhow::anyhow!("backup rename failed: {e}"))?;
+    if let Err(e) = tokio::fs::rename(&tmp, &abs).await {
+        // Install failed — attempt to restore the original from backup.
+        match tokio::fs::rename(&bak, &abs).await {
+            Ok(()) => tracing::warn!(
+                path = %abs.display(),
+                "atomic install failed: {e}; rollback succeeded — original restored from backup"
+            ),
+            Err(rb_err) => tracing::error!(
+                path = %abs.display(),
+                "atomic install failed: {e}; rollback ALSO failed: {rb_err} — \
+                 original may be lost, backup is at {}",
+                bak.display()
+            ),
+        }
+        return Err(anyhow::anyhow!("atomic install failed: {e}"));
+    }
 
     // 7. Log the operation.
     let hash = sha256_hex(new_content.as_bytes());
