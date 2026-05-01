@@ -6,8 +6,11 @@ use llama_cpp_2::{
     model::{params::LlamaModelParams, AddBos, LlamaModel},
     sampling::LlamaSampler,
 };
+use sha2::{Digest, Sha256};
 use std::num::NonZeroU32;
 use std::path::Path;
+
+use crate::llm::kv_cache::KvCacheStore;
 
 // ---------------------------------------------------------------------------
 // LlamaEngine — unified inference engine for embeddings + summarisation
@@ -26,6 +29,10 @@ pub struct LlamaEngine {
     coder_model: LlamaModel,
     /// nomic-embed-text-v1.5 Q4_K_M — used for vector embeddings.
     embed_model: LlamaModel,
+    /// Optional reranker model (e.g. bge-reranker-v2-m3-Q4_K_M).
+    reranker_model: Option<LlamaModel>,
+    /// On-disk KV-cache store for zero-latency follow-up summarisations.
+    kv_cache: Option<KvCacheStore>,
 }
 
 impl LlamaEngine {
@@ -34,11 +41,31 @@ impl LlamaEngine {
     /// Both models are fully offloaded to the Vulkan backend via
     /// `n_gpu_layers = 1000`.  Returns `Err` with the missing file path if
     /// either GGUF is absent.
+    #[allow(dead_code)]
     pub fn new(models_dir: &Path) -> Result<Self> {
+        Self::new_with_config(models_dir, None, None, None)
+    }
+
+    /// Full constructor — used by `init_components` to pass KV-cache and
+    /// reranker configuration from `Config`.
+    pub fn new_with_config(
+        models_dir: &Path,
+        kv_cache_dir: Option<&Path>,
+        kv_cache_max_entries: Option<usize>,
+        reranker_model_path: Option<&Path>,
+    ) -> Result<Self> {
         let backend = LlamaBackend::init()
             .map_err(|e| anyhow!("Failed to initialise LlamaBackend: {e}"))?;
 
-        let model_params = LlamaModelParams::default().with_n_gpu_layers(1000);
+        let model_params = LlamaModelParams::default()
+            .with_n_gpu_layers(1000)
+            .with_use_mmap(true)
+            .with_use_mlock(true);
+        tracing::info!(
+            "LlamaModelParams: n_gpu_layers=1000, use_mmap=true, use_mlock=true. \
+             Note: mlock may silently fail if RLIMIT_MEMLOCK is insufficient — \
+             add LimitMEMLOCK=infinity to the systemd unit to guarantee locking."
+        );
 
         let coder_path = models_dir.join("qwen2.5-coder-0.5b-instruct-q4_k_m.gguf");
         anyhow::ensure!(
@@ -60,10 +87,40 @@ impl LlamaEngine {
         let embed_model = LlamaModel::load_from_file(&backend, &embed_path, &model_params)
             .map_err(|e| anyhow!("Failed to load embed model from {}: {e}", embed_path.display()))?;
 
+        // Optionally load the reranker model — non-fatal if absent.
+        let reranker_model = reranker_model_path.and_then(|p| {
+            if p.exists() {
+                match LlamaModel::load_from_file(&backend, p, &model_params) {
+                    Ok(m) => {
+                        tracing::info!(path = %p.display(), "Reranker model loaded");
+                        Some(m)
+                    }
+                    Err(e) => {
+                        tracing::warn!(path = %p.display(), error = %e, "Failed to load reranker model — reranking disabled");
+                        None
+                    }
+                }
+            } else {
+                tracing::info!(path = %p.display(), "Reranker model not found — reranking disabled");
+                None
+            }
+        });
+
+        // Initialise KV-cache store if a directory is configured.
+        // Purge any files left over from a previous run — they may have been
+        // saved with a different n_ctx and would cause SIGABRT if loaded.
+        let kv_cache = kv_cache_dir.map(|dir| {
+            let store = KvCacheStore::new(dir.to_path_buf(), kv_cache_max_entries.unwrap_or(10));
+            store.clear_on_startup();
+            store
+        });
+
         Ok(Self {
             _backend: backend,
             coder_model,
             embed_model,
+            reranker_model,
+            kv_cache,
         })
     }
 
@@ -75,18 +132,17 @@ impl LlamaEngine {
     /// instruct model.
     ///
     /// A fresh `LlamaContext` is created per call so this method is safe to
-    /// call concurrently from multiple threads via `Arc<LlamaEngine>`.
-    /// Truncation to the 2048-token context window is handled by llama.cpp
-    /// during batch decode — no character-count slicing is performed.
-    pub fn summarize_code(&self, text: &str) -> Result<String> {
-        let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(2048));
-
-        let mut ctx = self
-            .coder_model
-            .new_context(&self._backend, ctx_params)
-            .map_err(|e| anyhow!("Failed to create summariser context: {e}"))?;
-
+    /// call from the dedicated `LlmWorker` thread.
+    ///
+    /// If `token_tx` is `Some`, each generated token piece is sent on the
+    /// channel as it is produced, enabling real-time SSE streaming to the
+    /// frontend.  When `token_tx` is `None`, behaviour is identical to the
+    /// non-streaming path — no allocation overhead.
+    pub fn summarize_code(
+        &self,
+        text: &str,
+        token_tx: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
+    ) -> Result<String> {
         // Qwen2.5-Coder instruct chat template
         let prompt = format!(
             "<|im_start|>system\nSummarize the following code concisely in one sentence.<|im_end|>\n\
@@ -94,21 +150,46 @@ impl LlamaEngine {
              <|im_start|>assistant\n"
         );
 
+        // Tokenize first to determine the minimum context size needed.
         let tokens = self
             .coder_model
             .str_to_token(&prompt, AddBos::Always)
             .map_err(|e| anyhow!("Tokenization failed: {e}"))?;
 
-        // Prefill batch — only the last token needs logits for sampling
-        let mut batch = LlamaBatch::new(2048, 1);
-        let last_idx = (tokens.len() - 1) as i32;
-        for (i, &token) in tokens.iter().enumerate() {
-            batch
-                .add(token, i as i32, &[0], i as i32 == last_idx)
-                .map_err(|e| anyhow!("Batch add failed: {e}"))?;
+        // Dynamic n_ctx: next power-of-two >= token_count + 64 (generation budget), capped at 2048.
+        let n_ctx = next_pow2_ctx(tokens.len() + 64, 512, 2048);
+
+        let ctx_params = LlamaContextParams::default()
+            .with_n_ctx(NonZeroU32::new(n_ctx));
+
+        let mut ctx = self
+            .coder_model
+            .new_context(&self._backend, ctx_params)
+            .map_err(|e| anyhow!("Failed to create summariser context: {e}"))?;
+
+        // Compute prompt hash for KV-cache lookup.
+        // NOTE: KV-cache state persistence is disabled because state_load_file
+        // in llama-cpp-2 v0.1.145 produces corrupt output buffers when the
+        // saved context n_ctx differs from the current context n_ctx, causing
+        // GGML_ASSERT(logits != nullptr) → SIGABRT. The feature is kept as
+        // dead code so it can be re-enabled when the upstream bug is fixed.
+        let _prompt_hash = sha256_hex(&prompt);
+        let kv_cache_hit = false;
+
+        // Full prefill — always performed (KV-cache load disabled).
+        let mut batch = LlamaBatch::new(n_ctx as usize, 1);
+        if !kv_cache_hit {
+            let last_idx = (tokens.len() - 1) as i32;
+            for (i, &token) in tokens.iter().enumerate() {
+                batch
+                    .add(token, i as i32, &[0], i as i32 == last_idx)
+                    .map_err(|e| anyhow!("Batch add failed: {e}"))?;
+            }
+            ctx.decode(&mut batch)
+                .map_err(|e| anyhow!("Prefill decode failed: {e}"))?;
+
+            // KV-cache save disabled — see note above about state_load_file crash.
         }
-        ctx.decode(&mut batch)
-            .map_err(|e| anyhow!("Prefill decode failed: {e}"))?;
 
         // Greedy sampling loop — max 64 new tokens (summaries are short)
         let mut sampler = LlamaSampler::greedy();
@@ -116,7 +197,7 @@ impl LlamaEngine {
         let mut output = String::new();
         let start_pos = batch.n_tokens();
 
-        for (i, _) in (0..64_i32).enumerate() {
+        for i in 0..64_i32 {
             let token = sampler.sample(&ctx, batch.n_tokens() - 1);
 
             if self.coder_model.is_eog_token(token) {
@@ -129,11 +210,17 @@ impl LlamaEngine {
                 .coder_model
                 .token_to_piece(token, &mut decoder, true, None)
                 .map_err(|e| anyhow!("Detokenization failed: {e}"))?;
+
+            // Stream token to SSE client if a channel is provided.
+            if let Some(tx) = token_tx {
+                let _ = tx.send(piece.clone());
+            }
+
             output.push_str(&piece);
 
             batch.clear();
             batch
-                .add(token, start_pos + i as i32, &[0], true)
+                .add(token, start_pos + i, &[0], true)
                 .map_err(|e| anyhow!("Batch add (generation) failed: {e}"))?;
             ctx.decode(&mut batch)
                 .map_err(|e| anyhow!("Generation decode failed: {e}"))?;
@@ -167,12 +254,26 @@ impl LlamaEngine {
                 format!("search_document: {text}")
             };
 
-        const EMBED_CTX: u32 = 1024;
+        // Tokenize first to determine the minimum context size needed.
+        let mut tokens = self
+            .embed_model
+            .str_to_token(&prefixed, AddBos::Always)
+            .map_err(|e| anyhow!("Tokenization failed: {e}"))?;
+
+        // Truncate to hard cap to avoid "Insufficient Space" / assert failures.
+        tokens.truncate(1024);
+        let token_count = tokens.len();
+
+        // Dynamic n_ctx: next power-of-two >= token_count, floored at 64, capped at 1024.
+        let n_ctx = (token_count as u32)
+            .next_power_of_two()
+            .max(64)
+            .min(1024);
 
         let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(EMBED_CTX))
-            .with_n_batch(EMBED_CTX)
-            .with_n_ubatch(EMBED_CTX)
+            .with_n_ctx(NonZeroU32::new(n_ctx))
+            .with_n_batch(n_ctx)
+            .with_n_ubatch(n_ctx)
             .with_embeddings(true);
 
         let mut ctx = self
@@ -180,15 +281,7 @@ impl LlamaEngine {
             .new_context(&self._backend, ctx_params)
             .map_err(|e| anyhow!("Failed to create embedding context: {e}"))?;
 
-        let mut tokens = self
-            .embed_model
-            .str_to_token(&prefixed, AddBos::Always)
-            .map_err(|e| anyhow!("Tokenization failed: {e}"))?;
-
-        // Truncate to context window to avoid "Insufficient Space" / assert failures.
-        tokens.truncate(EMBED_CTX as usize);
-
-        let mut batch = LlamaBatch::new(EMBED_CTX as usize, 1);
+        let mut batch = LlamaBatch::new(n_ctx as usize, 1);
         batch
             .add_sequence(&tokens, 0, false)
             .map_err(|e| anyhow!("Batch add_sequence failed: {e}"))?;
@@ -203,6 +296,100 @@ impl LlamaEngine {
 
         Ok(l2_normalize(raw.to_vec()))
     }
+
+    /// Clear the on-disk KV-cache (called from `LlmWorker`).
+    pub fn clear_kv_cache(&self) {
+        if let Some(ref kv) = self.kv_cache {
+            kv.clear();
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Cross-encoder reranking
+    // -----------------------------------------------------------------------
+
+    /// Rerank `candidates` against `query` using the cross-encoder reranker model.
+    ///
+    /// Returns `(original_index, score)` pairs sorted by descending relevance.
+    ///
+    /// When no reranker model is loaded, returns an identity ranking
+    /// `[(0, 0.0), (1, 0.0), ...]` so callers can always use the result
+    /// without special-casing the absent-model path.
+    pub fn rerank_results(
+        &self,
+        query: &str,
+        candidates: &[String],
+    ) -> Result<Vec<(usize, f32)>> {
+        if self.reranker_model.is_none() {
+            tracing::debug!("rerank_results: no reranker model loaded — returning identity ranking");
+            return Ok((0..candidates.len()).map(|i| (i, 0.0_f32)).collect());
+        }
+
+        // Score each (query, candidate) pair sequentially to avoid VRAM contention.
+        let mut scores: Vec<(usize, f32)> = candidates
+            .iter()
+            .enumerate()
+            .map(|(i, candidate)| {
+                let score = self
+                    .score_pair(query, candidate)
+                    .unwrap_or(0.0);
+                (i, score)
+            })
+            .collect();
+
+        // Sort descending by score.
+        scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        Ok(scores)
+    }
+
+    /// Score a single (query, document) pair using the reranker model.
+    ///
+    /// Uses the standard cross-encoder input format: `"query [SEP] document"`.
+    /// Extracts the first logit as the relevance score.
+    fn score_pair(&self, query: &str, document: &str) -> Result<f32> {
+        let reranker = self
+            .reranker_model
+            .as_ref()
+            .ok_or_else(|| anyhow!("Reranker model not loaded"))?;
+
+        let input = format!("{query} [SEP] {document}");
+
+        let tokens = reranker
+            .str_to_token(&input, AddBos::Always)
+            .map_err(|e| anyhow!("Reranker tokenization failed: {e}"))?;
+
+        let token_count = tokens.len().min(512);
+        let n_ctx = (token_count as u32).next_power_of_two().max(64).min(512);
+
+        let ctx_params = LlamaContextParams::default()
+            .with_n_ctx(NonZeroU32::new(n_ctx))
+            .with_embeddings(true);
+
+        let mut ctx = reranker
+            .new_context(&self._backend, ctx_params)
+            .map_err(|e| anyhow!("Failed to create reranker context: {e}"))?;
+
+        let mut batch = LlamaBatch::new(n_ctx as usize, 1);
+        let last_idx = (token_count - 1) as i32;
+        for (i, &token) in tokens[..token_count].iter().enumerate() {
+            batch
+                .add(token, i as i32, &[0], i as i32 == last_idx)
+                .map_err(|e| anyhow!("Reranker batch add failed: {e}"))?;
+        }
+        ctx.decode(&mut batch)
+            .map_err(|e| anyhow!("Reranker decode failed: {e}"))?;
+
+        // Extract the relevance score from the sequence embedding.
+        // For ranking models like bge-reranker, llama.cpp exposes the
+        // sequence classification score as the sequence embedding.
+        let score = ctx
+            .embeddings_seq_ith(0)
+            .ok()
+            .and_then(|e| e.first().copied())
+            .unwrap_or(0.0);
+
+        Ok(score)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -215,4 +402,42 @@ fn l2_normalize(mut v: Vec<f32>) -> Vec<f32> {
         v.iter_mut().for_each(|x| *x /= norm);
     }
     v
+}
+
+/// Compute the smallest power-of-two context size that is:
+/// - at least `floor`
+/// - at least `min` tokens
+/// - at most `cap`
+///
+/// Used for dynamic context sizing: allocate only as much VRAM as the prompt
+/// actually needs, leaving headroom for other operations on the shared APU.
+///
+/// # Examples
+/// ```
+/// assert_eq!(next_pow2_ctx(100, 512, 2048), 512);  // small chunk → floor
+/// assert_eq!(next_pow2_ctx(600, 512, 2048), 1024); // medium chunk → 1024
+/// assert_eq!(next_pow2_ctx(2000, 512, 2048), 2048); // large chunk → cap
+/// ```
+fn next_pow2_ctx(min: usize, floor: u32, cap: u32) -> u32 {
+    if min <= floor as usize {
+        return floor;
+    }
+    let mut n = floor;
+    while (n as usize) < min {
+        n = n.saturating_mul(2);
+        if n >= cap {
+            return cap;
+        }
+    }
+    n.min(cap)
+}
+
+/// Compute the SHA-256 hex digest of `text`.
+///
+/// Used to key KV-cache files so that identical prompts reuse the same
+/// cached context state.
+fn sha256_hex(text: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(text.as_bytes());
+    hex::encode(h.finalize())
 }

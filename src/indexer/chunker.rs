@@ -58,12 +58,36 @@ pub struct Chunk {
     pub node_type: String,
     /// Function/method calls made inside this chunk.
     pub calls: Vec<String>,
+    /// Structured call edges extracted from this chunk (richer than `calls`).
+    pub callee_relationships: Vec<CallEdge>,
+    /// Trait/interface implementation edges (Rust: `impl Trait for Struct`).
+    pub impl_relationships: Vec<ImplEdge>,
+    /// Class/interface inheritance edges (TS/JS: `class X extends Y`).
+    pub extends_relationships: Vec<String>,
     /// Heuristic importance score (higher = more relevant).
     pub function_score: f32,
     /// 1-based start line number.
     pub start_line: usize,
     /// 1-based end line number.
     pub end_line: usize,
+}
+
+/// A directed call edge: `caller_symbol` calls `callee_symbol`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CallEdge {
+    /// The symbol defined in this chunk (the caller).
+    pub caller_symbol: String,
+    /// The function/method being called.
+    pub callee_symbol: String,
+    /// Import path hint if resolvable from the file's relationships.
+    pub callee_file_hint: Option<String>,
+}
+
+/// A trait/interface implementation edge.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ImplEdge {
+    pub struct_name: String,
+    pub trait_name: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -116,6 +140,8 @@ const JS_TS_QUERIES: &[&str] = &[
     "(method_definition name: (property_identifier) @name) @entity",
     r#"(lexical_declaration (variable_declarator name: (identifier) @name value: [(arrow_function) (function)])) @entity"#,
     r#"(export_statement declaration: (lexical_declaration (variable_declarator name: (identifier) @name value: [(arrow_function) (function)]))) @entity"#,
+    // Class inheritance: class X extends Y
+    r#"(class_declaration name: (type_identifier) @name (class_heritage (extends_clause value: (identifier) @base_name))) @entity"#,
 ];
 
 const PHP_QUERIES: &[&str] = &[
@@ -131,6 +157,8 @@ const RUST_QUERIES: &[&str] = &[
     "(enum_item name: (type_identifier) @name) @entity",
     "(trait_item name: (type_identifier) @name) @entity",
     "(impl_item type: (type_identifier) @name) @entity",
+    // Trait implementations — captures both trait and struct names
+    "(impl_item trait: (type_identifier) @trait_name type: (type_identifier) @name) @entity",
 ];
 
 /// Python S-expression queries — mirrors Go's `chunker.go` PYTHON_QUERIES block.
@@ -148,6 +176,138 @@ const PYTHON_QUERIES: &[&str] = &[
 ];
 
 // ---------------------------------------------------------------------------
+// Markdown chunker
+// ---------------------------------------------------------------------------
+
+/// Parse a Markdown file into semantic chunks.
+///
+/// Strategy:
+/// 1. Split the document on ATX headings (`#` … `######`).  Each heading
+///    starts a new section chunk that includes the heading text and the prose
+///    that follows it (up to the next heading).
+/// 2. Within each section, extract fenced code blocks (` ```lang … ``` `) as
+///    **separate** chunks so they get their own embedding vector.  This lets
+///    code-search queries find doc examples directly.
+/// 3. Remaining prose (after code blocks are removed) is kept as a prose chunk
+///    if it contains meaningful text.
+pub fn parse_markdown(content: &str, file_path: &str) -> Vec<Chunk> {
+    static HEADING_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"(?m)^(#{1,6})\s+(.+)$").unwrap());
+    static FENCE_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"(?s)```(\w*)\n(.*?)```").unwrap()
+    });
+
+    let mut chunks: Vec<Chunk> = Vec::new();
+    let lines: Vec<&str> = content.lines().collect();
+
+    // Collect heading positions (line index, level, title).
+    let mut section_starts: Vec<(usize, usize, String)> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        if let Some(cap) = HEADING_RE.captures(line) {
+            let level = cap[1].len();
+            let title = cap[2].trim().to_string();
+            section_starts.push((i, level, title));
+        }
+    }
+
+    // If no headings, treat the whole file as one section.
+    if section_starts.is_empty() {
+        section_starts.push((0, 1, file_path.to_string()));
+    }
+
+    // Add a sentinel so the last section runs to EOF.
+    section_starts.push((lines.len(), 0, String::new()));
+
+    for window in section_starts.windows(2) {
+        let (start_line, _level, title) = &window[0];
+        let (end_line, _, _) = &window[1];
+
+        let section_lines = &lines[*start_line..*end_line];
+        let section_text = section_lines.join("\n");
+
+        if section_text.trim().is_empty() {
+            continue;
+        }
+
+        // Extract fenced code blocks from this section.
+        let mut code_ranges: Vec<(usize, usize)> = Vec::new(); // byte ranges of full ``` blocks
+        for cap in FENCE_RE.captures_iter(&section_text) {
+            let lang = cap[1].trim().to_string();
+            let code = cap[2].trim().to_string();
+            if code.is_empty() {
+                continue;
+            }
+
+            // Find the line numbers of this code block within the section.
+            let match_start = cap.get(0).unwrap().start();
+            let match_end = cap.get(0).unwrap().end();
+            code_ranges.push((match_start, match_end));
+
+            let code_start_line = start_line
+                + section_text[..match_start].chars().filter(|&c| c == '\n').count();
+            let code_end_line =
+                code_start_line + code.chars().filter(|&c| c == '\n').count() + 2; // +2 for fence lines
+
+            let lang_tag = if lang.is_empty() { "text".to_string() } else { lang };
+            let symbol = format!("{title} [{lang_tag} example]");
+
+            chunks.push(Chunk {
+                contextual_string: format!(
+                    "File: {file_path}. Section: {title}. Code example ({lang_tag}):\n{code}"
+                ),
+                content: code.clone(),
+                symbols: vec![symbol],
+                relationships: Vec::new(),
+                node_type: format!("code_block_{lang_tag}"),
+                calls: Vec::new(),
+                callee_relationships: Vec::new(),
+                impl_relationships: Vec::new(),
+                extends_relationships: Vec::new(),
+                function_score: 1.2, // code examples are high-value
+                start_line: code_start_line + 1,
+                end_line: code_end_line + 1,
+            });
+        }
+
+        // Build prose chunk: section text with code blocks removed.
+        let mut prose = section_text.clone();
+        // Remove code blocks in reverse order to preserve byte offsets.
+        for (start, end) in code_ranges.iter().rev() {
+            prose.replace_range(start..end, "");
+        }
+        let prose = prose.trim().to_string();
+
+        if prose.len() > 30 {
+            // Only index prose with meaningful content.
+            let prose_end_line = start_line + section_lines.len();
+            chunks.push(Chunk {
+                contextual_string: format!(
+                    "File: {file_path}. Section: {title}. Content:\n{prose}"
+                ),
+                content: prose.clone(),
+                symbols: vec![title.clone()],
+                relationships: Vec::new(),
+                node_type: "markdown_section".to_string(),
+                calls: Vec::new(),
+                callee_relationships: Vec::new(),
+                impl_relationships: Vec::new(),
+                extends_relationships: Vec::new(),
+                function_score: 0.8,
+                start_line: start_line + 1,
+                end_line: prose_end_line,
+            });
+        }
+    }
+
+    // Fallback: if we produced nothing (e.g. no headings, no code), use fast_chunk.
+    if chunks.is_empty() {
+        return fast_chunk(content, file_path);
+    }
+
+    chunks
+}
+
+// ---------------------------------------------------------------------------
 // Core public function
 // ---------------------------------------------------------------------------
 
@@ -156,6 +316,18 @@ const PYTHON_QUERIES: &[&str] = &[
 pub fn parse_file(content: &str, file_path: &str, extension: &str) -> Result<Vec<Chunk>> {
     if extension == ".pdf" {
         return parse_pdf(content.as_bytes(), file_path);
+    }
+
+    // Markdown gets its own semantic chunker that understands headings and
+    // fenced code blocks — fast_chunk would just slice it arbitrarily.
+    if extension == ".md" {
+        let mut chunks = parse_markdown(content, file_path);
+        // Extract link/reference relationships from the full markdown text.
+        let relationships = parse_md_relationships(content);
+        for c in &mut chunks {
+            c.relationships.clone_from(&relationships);
+        }
+        return Ok(chunks);
     }
 
     let relationships = parse_relationships(content, extension);
@@ -229,6 +401,14 @@ fn extract_raw_chunks(source: &[u8], spec: &LangSpec, tree: &tree_sitter::Tree) 
             .capture_names()
             .iter()
             .position(|n| *n == "name" || *n == "hook_name");
+        let trait_idx = query
+            .capture_names()
+            .iter()
+            .position(|n| *n == "trait_name");
+        let base_idx = query
+            .capture_names()
+            .iter()
+            .position(|n| *n == "base_name");
 
         let mut cursor = QueryCursor::new();
         let mut matches = cursor.matches(&query, root, source);
@@ -241,6 +421,18 @@ fn extract_raw_chunks(source: &[u8], spec: &LangSpec, tree: &tree_sitter::Tree) 
                     .map(|c| c.node)
             });
             let name_node: Option<Node> = name_idx.and_then(|idx| {
+                m.captures
+                    .iter()
+                    .find(|c| c.index as usize == idx)
+                    .map(|c| c.node)
+            });
+            let trait_node: Option<Node> = trait_idx.and_then(|idx| {
+                m.captures
+                    .iter()
+                    .find(|c| c.index as usize == idx)
+                    .map(|c| c.node)
+            });
+            let base_node: Option<Node> = base_idx.and_then(|idx| {
                 m.captures
                     .iter()
                     .find(|c| c.index as usize == idx)
@@ -270,6 +462,36 @@ fn extract_raw_chunks(source: &[u8], spec: &LangSpec, tree: &tree_sitter::Tree) 
             let calls = extract_calls(entity_node, source);
             let score = calculate_score(entity_node, &calls);
 
+            // Build ImplEdge when both @trait_name and @name are captured.
+            let impl_relationships = if let Some(trait_node) = trait_node {
+                let trait_name = trait_node
+                    .utf8_text(source)
+                    .unwrap_or("")
+                    .to_owned();
+                if !trait_name.is_empty() && symbol_name != "Unknown" {
+                    vec![ImplEdge {
+                        struct_name: symbol_name.clone(),
+                        trait_name,
+                    }]
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+
+            // Build extends_relationships when @base_name is captured (TS/JS class inheritance).
+            let extends_relationships = if let Some(base_node) = base_node {
+                let base_name = base_node.utf8_text(source).unwrap_or("").to_owned();
+                if !base_name.is_empty() {
+                    vec![base_name]
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+
             raw_chunks.push(Chunk {
                 content: chunk_text,
                 contextual_string: String::new(), // filled later
@@ -277,6 +499,9 @@ fn extract_raw_chunks(source: &[u8], spec: &LangSpec, tree: &tree_sitter::Tree) 
                 relationships: Vec::new(), // filled later
                 node_type: entity_node.kind().to_owned(),
                 calls,
+                callee_relationships: Vec::new(), // populated in parse_file
+                impl_relationships,
+                extends_relationships,
                 function_score: score,
                 start_line: entity_node.start_position().row + 1,
                 end_line: entity_node.end_position().row + 1,
@@ -349,17 +574,20 @@ fn walk_calls(node: tree_sitter::Node, source: &[u8], out: &mut HashSet<String>)
                         if let Ok(text) = child.utf8_text(source) {
                             out.insert(text.to_owned());
                         }
-                    } else if (ct == "selector_expression"
+                    } else if ct == "selector_expression"
                         || ct == "member_expression"
-                        || ct == "field_expression")
-                        && child.child_count() > 0
-                        && let Some(last) = child.child(child.child_count() - 1)
+                        || ct == "field_expression"
                     {
-                        let lt = last.kind();
-                        if (lt == "field_identifier" || lt == "property_identifier")
-                            && let Ok(text) = last.utf8_text(source)
-                        {
-                            out.insert(text.to_owned());
+                        let cc = child.child_count();
+                        if cc > 0 {
+                            if let Some(last) = child.child(cc - 1) {
+                                let lt = last.kind();
+                                if (lt == "field_identifier" || lt == "property_identifier")
+                                    && let Ok(text) = last.utf8_text(source)
+                                {
+                                    out.insert(text.to_owned());
+                                }
+                            }
                         }
                     }
                 }
@@ -488,6 +716,32 @@ fn parse_rust_relationships(text: &str, relations: &mut Vec<String>) {
     }
 }
 
+/// Extract link targets from Markdown: `[text](url)`, `[text][ref]`, and bare URLs.
+fn parse_md_relationships(text: &str) -> Vec<String> {
+    static MD_LINK_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"\[([^\]]+)\]\(([^)]+)\)").unwrap());
+    // Reference-style link definitions: `[label]: url` — use (?m) for multiline ^
+    static MD_REF_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"(?m)^\[([^\]]+)\]:\s*(\S+)").unwrap());
+
+    let mut relations: Vec<String> = Vec::new();
+    let mut seen = HashSet::new();
+
+    for cap in MD_LINK_RE.captures_iter(text) {
+        let url = cap[2].trim().to_string();
+        if !url.is_empty() && seen.insert(url.clone()) {
+            relations.push(url);
+        }
+    }
+    for cap in MD_REF_RE.captures_iter(text) {
+        let url = cap[2].trim().to_string();
+        if !url.is_empty() && seen.insert(url.clone()) {
+            relations.push(url);
+        }
+    }
+    relations
+}
+
 fn parse_relationships(text: &str, ext: &str) -> Vec<String> {
     let mut relations: Vec<String> = Vec::new();
 
@@ -561,6 +815,9 @@ fn fast_chunk(text: &str, file_path: &str) -> Vec<Chunk> {
             relationships: Vec::new(),
             node_type: "chunk".to_owned(),
             calls: Vec::new(),
+            callee_relationships: Vec::new(),
+            impl_relationships: Vec::new(),
+            extends_relationships: Vec::new(),
             function_score: 0.0,
             start_line,
             end_line,
@@ -632,6 +889,86 @@ mod tests {
         let go_code = "import \"net/http\"";
         let go_rels = parse_relationships(go_code, ".go");
         assert!(go_rels.contains(&"net/http".to_string()));
+    }
+
+    #[test]
+    fn test_parse_markdown_code_blocks() {
+        let md = r#"# My Doc
+
+Some intro text here.
+
+## Usage
+
+Here is how to use it:
+
+```rust
+fn hello() {
+    println!("hello");
+}
+```
+
+More prose after the code.
+
+```typescript
+const x = 42;
+```
+"#;
+        let chunks = parse_markdown(md, "README.md");
+
+        // Should have code block chunks
+        let code_chunks: Vec<_> = chunks
+            .iter()
+            .filter(|c| c.node_type.starts_with("code_block_"))
+            .collect();
+        assert!(
+            code_chunks.len() >= 2,
+            "expected at least 2 code block chunks, got {}",
+            code_chunks.len()
+        );
+
+        // Rust code block should contain the function
+        let rust_chunk = code_chunks
+            .iter()
+            .find(|c| c.node_type == "code_block_rust");
+        assert!(rust_chunk.is_some(), "expected a rust code block chunk");
+        assert!(rust_chunk.unwrap().content.contains("fn hello"));
+
+        // TypeScript code block
+        let ts_chunk = code_chunks
+            .iter()
+            .find(|c| c.node_type == "code_block_typescript");
+        assert!(ts_chunk.is_some(), "expected a typescript code block chunk");
+
+        // Should have prose/section chunks
+        let prose_chunks: Vec<_> = chunks
+            .iter()
+            .filter(|c| c.node_type == "markdown_section")
+            .collect();
+        assert!(
+            !prose_chunks.is_empty(),
+            "expected at least one prose section chunk"
+        );
+
+        // Code blocks should have higher function_score than prose
+        let code_score = code_chunks[0].function_score;
+        let prose_score = prose_chunks[0].function_score;
+        assert!(
+            code_score > prose_score,
+            "code blocks should score higher than prose"
+        );
+    }
+
+    #[test]
+    fn test_parse_md_relationships() {
+        let md = r#"See [the docs](https://example.com/docs) for more.
+Also check [RFC 1234](https://rfc.example.org/1234).
+
+[ref-link]: https://ref.example.com
+"#;
+        let rels = parse_md_relationships(md);
+        assert!(rels.contains(&"https://example.com/docs".to_string()));
+        assert!(rels.contains(&"https://rfc.example.org/1234".to_string()));
+        assert!(rels.contains(&"https://ref.example.com".to_string()));
     }
 
     #[test]

@@ -21,6 +21,7 @@ use tracing::info;
 use crate::config::Config;
 use crate::db::Store;
 use crate::llm::embedding::Embedder;
+use crate::llm::kv_cache::KvCacheStore;
 use crate::llm::summarizer::Summarizer;
 use crate::security::ratelimit::RateLimiter;
 
@@ -39,6 +40,8 @@ pub struct ApiState {
     pub rate_limiter: Arc<RateLimiter>,
     pub progress: Arc<std::sync::RwLock<crate::indexer::scanner::ProgressState>>,
     pub version: &'static str,
+    /// Optional KV-cache store reference for the /api/cache/status endpoint.
+    pub kv_cache: Option<Arc<KvCacheStore>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +256,26 @@ async fn handle_search(
     Json(resp).into_response()
 }
 
+async fn handle_cache_status(State(s): State<Arc<ApiState>>) -> impl IntoResponse {
+    match &s.kv_cache {
+        Some(kv) => Json(serde_json::json!({
+            "enabled": true,
+            "entries": kv.entry_count(),
+            "max_entries": kv.max_entries(),
+            "cache_dir": kv.dir().display().to_string(),
+        })),
+        None => Json(serde_json::json!({ "enabled": false })),
+    }
+}
+
+async fn handle_graph_stats(State(s): State<Arc<ApiState>>) -> impl IntoResponse {
+    Json(serde_json::json!({
+        "nodes": s.store.graph.node_count(),
+        "call_edges": s.store.graph.call_edge_count(),
+        "impl_edges": s.store.graph.impl_edge_count(),
+    }))
+}
+
 async fn handle_context(
     State(s): State<Arc<ApiState>>,
     Json(req): Json<ContextRequest>,
@@ -306,6 +329,8 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/tools/status", get(handle_tools_status))
         .route("/tools/index", post(handle_tools_index))
         .route("/tools/skeleton", get(handle_tools_skeleton))
+        .route("/cache/status", get(handle_cache_status))
+        .route("/graph/stats", get(handle_graph_stats))
         .route("/search", post(handle_search))
         .route("/context", post(handle_context));
 

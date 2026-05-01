@@ -1,14 +1,16 @@
 "use client";
 
-import { 
-  Terminal, 
-  Activity, 
-  Plus, 
-  RefreshCw, 
+import { useEffect, useState } from "react";
+import {
+  Terminal,
+  Activity,
+  Plus,
+  RefreshCw,
   Info,
-  Clock
+  Clock,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { ThemeToggle } from "./ThemeToggle";
 
 interface IndexStatus {
   status: string;
@@ -18,20 +20,48 @@ interface IndexStatus {
 }
 
 interface SidebarProps {
-  status: IndexStatus | null;
   onAddContext: () => void;
   onReindex: () => void;
   recentSearches?: string[];
   onSelectRecent?: (query: string) => void;
 }
 
-export function Sidebar({ 
-  status, 
-  onAddContext, 
-  onReindex, 
-  recentSearches = [], 
-  onSelectRecent 
+/**
+ * Sidebar owns its own status-polling state so that the 3-second poll
+ * never triggers a re-render of the parent page (and therefore never
+ * causes the search results list to flicker).
+ */
+export function Sidebar({
+  onAddContext,
+  onReindex,
+  recentSearches = [],
+  onSelectRecent,
 }: SidebarProps) {
+  const [status, setStatus] = useState<IndexStatus | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const fetchStatus = async () => {
+      try {
+        const res = await fetch("/api/tools/status");
+        if (res.ok && !cancelled) {
+          const data = await res.json();
+          setStatus(data);
+        }
+      } catch {
+        // Silent — status polling failure is non-critical
+      }
+    };
+
+    fetchStatus();
+    const interval = setInterval(fetchStatus, 3000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, []);
+
   return (
     <aside className="w-80 glass border-r flex flex-col h-full">
       <div className="p-6 border-b">
@@ -54,23 +84,36 @@ export function Sidebar({
             <div className="glass-light p-4 rounded-xl space-y-3">
               <div className="flex justify-between items-center text-sm">
                 <span className="text-foreground/80 font-medium">Indexing</span>
-                <span className={cn(
-                  "px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider",
-                  status?.status === "Ready" ? "bg-cta/20 text-cta" : "bg-blue-500/20 text-blue-400"
-                )}>
+                <span
+                  className={cn(
+                    "px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider",
+                    status?.status === "Ready"
+                      ? "bg-cta/20 text-cta"
+                      : "bg-blue-500/20 text-blue-400"
+                  )}
+                >
                   {status?.status || "Idle"}
                 </span>
               </div>
               {status && status.total_files > 0 && (
                 <div className="space-y-1.5">
                   <div className="flex justify-between text-[10px] font-mono text-foreground/50">
-                    <span>{status.indexed_files} / {status.total_files} files</span>
-                    <span>{Math.round((status.indexed_files / status.total_files) * 100)}%</span>
+                    <span>
+                      {status.indexed_files} / {status.total_files} files
+                    </span>
+                    <span>
+                      {Math.round(
+                        (status.indexed_files / status.total_files) * 100
+                      )}
+                      %
+                    </span>
                   </div>
                   <div className="h-1.5 w-full bg-primary rounded-full overflow-hidden">
-                    <div 
-                      className="h-full bg-cta transition-all duration-700 ease-out" 
-                      style={{ width: `${(status.indexed_files / status.total_files) * 100}%` }}
+                    <div
+                      className="h-full bg-cta transition-all duration-700 ease-out"
+                      style={{
+                        width: `${(status.indexed_files / status.total_files) * 100}%`,
+                      }}
                     />
                   </div>
                 </div>
@@ -107,10 +150,10 @@ export function Sidebar({
         {/* Actions */}
         <section>
           <h2 className="text-[10px] font-bold text-foreground/40 uppercase tracking-[0.2em] mb-3 flex items-center gap-2">
-             Quick Actions
+            Quick Actions
           </h2>
           <div className="space-y-1">
-            <button 
+            <button
               onClick={onAddContext}
               className="w-full flex items-center gap-3 p-3 rounded-xl hover:bg-white/5 transition-all text-sm group cursor-pointer"
             >
@@ -119,12 +162,17 @@ export function Sidebar({
               </div>
               <span className="font-medium">Add Context</span>
             </button>
-            <button 
+            <button
               onClick={onReindex}
               className="w-full flex items-center gap-3 p-3 rounded-xl hover:bg-white/5 transition-all text-sm group cursor-pointer"
             >
               <div className="p-2 bg-primary rounded-lg group-hover:bg-secondary transition-all">
-                <RefreshCw className={cn("w-4 h-4 text-foreground/60", status?.status !== "Ready" && "animate-spin text-cta")} />
+                <RefreshCw
+                  className={cn(
+                    "w-4 h-4 text-foreground/60",
+                    status?.status !== "Ready" && "animate-spin text-cta"
+                  )}
+                />
               </div>
               <span className="font-medium">Re-index Repository</span>
             </button>
@@ -133,9 +181,12 @@ export function Sidebar({
       </div>
 
       <div className="p-4 border-t glass">
-        <div className="flex items-center gap-3 text-[10px] text-foreground/40 font-mono">
-          <Info className="w-4 h-4" />
-          <p>VERSION 0.1.0-ALPHA</p>
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-3 text-[10px] text-foreground/40 font-mono">
+            <Info className="w-4 h-4" />
+            <p>VERSION 0.1.0-ALPHA</p>
+          </div>
+          <ThemeToggle />
         </div>
       </div>
     </aside>

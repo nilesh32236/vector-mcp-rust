@@ -31,6 +31,9 @@ use crate::db::Store;
 use crate::llm::embedding::Embedder;
 use crate::llm::models::LlamaEngine;
 use crate::llm::summarizer::Summarizer;
+use crate::llm::worker::LlmWorker;
+use crate::mcp::router::SemanticRouter;
+use crate::mutation::write_log::WriteLog;
 
 // ---------------------------------------------------------------------------
 // Logging & Telemetry
@@ -80,25 +83,73 @@ fn setup_logging(
 // Component initialisation
 // ---------------------------------------------------------------------------
 
-async fn init_components(cfg: &Config) -> Result<(Arc<Store>, Arc<Embedder>, Arc<Summarizer>)> {
+/// Initialise LlamaEngine, Embedder, and LlmWorker from config.
+///
+/// Degrades gracefully when GGUF model files are absent — returns
+/// `(None, disabled_embedder, None)` so the server starts in degraded mode.
+fn init_llm_components(
+    cfg: &Config,
+    mode: &str,
+) -> (Option<Arc<LlamaEngine>>, Arc<Embedder>, Option<Arc<LlmWorker>>) {
+    let engine_opt: Option<Arc<LlamaEngine>> = match LlamaEngine::new_with_config(
+        &cfg.models_dir,
+        Some(&cfg.kv_cache_dir),
+        Some(cfg.kv_cache_max_entries),
+        cfg.reranker_model_path.as_deref(),
+    ) {
+        Ok(e) => {
+            info!("LlamaEngine initialised ({mode}, Vulkan backend, n_gpu_layers=1000)");
+            Some(Arc::new(e))
+        }
+        Err(e) => {
+            tracing::error!(
+                models_dir = %cfg.models_dir.display(),
+                mode,
+                error = %e,
+                "Failed to initialise LlamaEngine — starting in degraded mode"
+            );
+            tracing::warn!(
+                "Degraded mode ({mode}): summarisation and local embedding are disabled. \
+                 Ensure GGUF model files are present in {} and restart to re-enable.",
+                cfg.models_dir.display()
+            );
+            None
+        }
+    };
+
+    let embedder = match &engine_opt {
+        Some(engine) => Arc::new(Embedder::new(Arc::clone(engine))),
+        None => Arc::new(Embedder::new_disabled()),
+    };
+
+    let worker_opt: Option<Arc<LlmWorker>> = engine_opt
+        .as_ref()
+        .map(|e| Arc::new(LlmWorker::spawn(Arc::clone(e))));
+
+    (engine_opt, embedder, worker_opt)
+}
+
+async fn init_components(
+    cfg: &Config,
+) -> Result<(Arc<Store>, Arc<Embedder>, Arc<Summarizer>, Option<Arc<LlmWorker>>, Option<Arc<SemanticRouter>>)> {
     let db_uri = cfg.db_path.display().to_string();
     let store = db::connect_store(&db_uri, cfg.dimension, false).await?;
     info!("LanceDB connected — tables initialised");
 
-    // Construct LlamaEngine once; share it between Embedder and Summarizer.
-    let engine = Arc::new(LlamaEngine::new(&cfg.models_dir)?);
-    info!("LlamaEngine initialised (Vulkan backend, n_gpu_layers=1000)");
+    let (_engine_opt, embedder, worker_opt) = init_llm_components(cfg, "master");
 
-    let embedder = Arc::new(Embedder::new(Arc::clone(&engine)));
     let summarizer = Arc::new(Summarizer::new(
         if cfg.feature_toggles.enable_local_llm {
-            Some(Arc::clone(&engine))
+            worker_opt.clone()
         } else {
             None
         },
     ));
 
-    Ok((Arc::new(store), embedder, summarizer))
+    // Build SemanticRouter from prototype embeddings (non-fatal if embedder is degraded).
+    let semantic_router = Arc::new(SemanticRouter::build(&embedder));
+
+    Ok((Arc::new(store), embedder, summarizer, worker_opt, Some(semantic_router)))
 }
 
 async fn start_background_tasks(
@@ -186,7 +237,7 @@ async fn run_master(cfg: Config, socket_path: String) -> Result<()> {
     info!("Starting in MASTER mode");
 
     // Initialise heavy components.
-    let (store, embedder, summarizer) = init_components(&cfg).await?;
+    let (store, embedder, summarizer, worker_opt, semantic_router) = init_components(&cfg).await?;
     let config = Arc::new(cfg);
 
     // Shared indexing progress map.
@@ -244,7 +295,7 @@ async fn run_master(cfg: Config, socket_path: String) -> Result<()> {
     // Watcher reload channel — hold each new watcher alive by storing it.
     let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel::<String>(10);
     {
-        let cfg3 = Arc::clone(&config);
+        let cfg3: Arc<Config> = Arc::clone(&config);
         let store3 = Arc::clone(&store);
         let emb3 = Arc::clone(&embedder);
         let sum3 = Arc::clone(&summarizer);
@@ -270,7 +321,10 @@ async fn run_master(cfg: Config, socket_path: String) -> Result<()> {
         Arc::clone(&config),
         Arc::clone(&embedder),
         Arc::clone(&summarizer),
+        worker_opt,
+        semantic_router,
         reload_tx,
+        Arc::new(WriteLog::new(&config.data_dir)),
     ));
 
     start_servers(
@@ -301,15 +355,19 @@ async fn run_slave(cfg: Config, socket_path: String) -> Result<()> {
 
     // NOTE: LlamaEngine is loaded locally in slave mode too so the slave can
     // serve embedding/summarisation requests without round-tripping to the master.
-    let engine = Arc::new(LlamaEngine::new(&config.models_dir)?);
-    let embedder = Arc::new(Embedder::new(Arc::clone(&engine)));
+    // Degrades gracefully if models are missing.
+    let (_engine_opt, embedder, worker_opt) = init_llm_components(&config, "slave");
+
     let summarizer = Arc::new(Summarizer::new(
         if config.feature_toggles.enable_local_llm {
-            Some(Arc::clone(&engine))
+            worker_opt.clone()
         } else {
             None
         },
     ));
+
+    // Build SemanticRouter for slave mode too.
+    let semantic_router = Some(Arc::new(SemanticRouter::build(&embedder)));
 
     let (reload_tx, _reload_rx) = tokio::sync::mpsc::channel::<String>(10);
 
@@ -318,7 +376,10 @@ async fn run_slave(cfg: Config, socket_path: String) -> Result<()> {
         Arc::clone(&config),
         Arc::clone(&embedder),
         Arc::clone(&summarizer),
+        worker_opt,
+        semantic_router,
         reload_tx,
+        Arc::new(WriteLog::new(&config.data_dir)),
     ));
 
     // Slaves do NOT run the file watcher (master owns indexing).
@@ -354,6 +415,7 @@ async fn start_servers(
             rate_limiter: Arc::clone(&server.rate_limiter),
             progress,
             version: env!("CARGO_PKG_VERSION"),
+            kv_cache: None, // KvCacheStore is owned by LlamaEngine; expose via engine if needed
         });
 
         info!(mcp_port, api_port, "vector-mcp-rust ready ✓");

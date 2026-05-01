@@ -11,12 +11,19 @@ export function ContextModal({ onClose, onSubmit }: ContextModalProps) {
   const [text, setText] = useState("");
   const [source, setSource] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
 
   const handleSubmit = async () => {
+    setSubmitError(null);
     setIsSubmitting(true);
     try {
       await onSubmit(text, source);
-      onClose();
+      onClose(); // only close on success
+    } catch (err) {
+      setSubmitError(
+        err instanceof Error ? err.message : "An unexpected error occurred."
+      );
+      // Modal stays open — user can retry or cancel
     } finally {
       setIsSubmitting(false);
     }
@@ -55,6 +62,14 @@ export function ContextModal({ onClose, onSubmit }: ContextModalProps) {
             />
           </div>
         </div>
+        {/* Error message — shown only when submission fails */}
+        {submitError && (
+          <div className="px-8 pb-2">
+            <p className="text-sm text-red-400 bg-red-500/10 border border-red-500/20 rounded-xl px-4 py-3">
+              {submitError}
+            </p>
+          </div>
+        )}
         <div className="p-6 bg-white/5 flex justify-end gap-4">
           <button 
             onClick={onClose}

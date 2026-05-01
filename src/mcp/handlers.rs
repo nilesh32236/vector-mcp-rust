@@ -11,6 +11,7 @@ use std::sync::Arc;
 use super::protocol::{CallToolParams, CallToolResult};
 use super::server::Server;
 use crate::llm::embedding::Embedder;
+use crate::mutation::write_log::WriteLogEntry;
 use crate::security::pathguard::PathOp;
 
 /// Route a `tools/call` to the appropriate handler by tool name.
@@ -93,11 +94,32 @@ async fn embed_text_blocking(embedder: Arc<Embedder>, text: String) -> Result<Ve
 }
 
 // ---------------------------------------------------------------------------
-// Handlers
+// Helpers
 // ---------------------------------------------------------------------------
 
 fn handle_ping() -> CallToolResult {
     CallToolResult::text("pong")
+}
+
+/// Format a slice of search result records into a markdown string.
+///
+/// Returns `"No matches found."` for an empty slice.
+fn format_search_results(results: &[crate::db::Record], query: &str) -> String {
+    if results.is_empty() {
+        return "No matches found.".to_string();
+    }
+    let mut out = format!("### Search Results for '{query}':\n\n");
+    for r in results {
+        let meta = r.metadata_json();
+        let path = meta["path"].as_str().unwrap_or("?");
+        let start = meta["start_line"].as_u64().unwrap_or(0);
+        let end = meta["end_line"].as_u64().unwrap_or(0);
+        out.push_str(&format!(
+            "#### {path} (Lines {start}-{end})\n```\n{}\n```\n\n",
+            r.content
+        ));
+    }
+    out
 }
 
 async fn handle_trigger_project_index(
@@ -863,8 +885,10 @@ async fn handle_search_codebase(
     final_records.truncate(top_k);
 
     let max_tokens = optional_f64_arg(params, "max_tokens").unwrap_or(10000.0) as usize;
-    // Approximate token count: 1 token ≈ 4 characters (avoids tiktoken dependency)
-    let max_chars = max_tokens * 4;
+    // Code content averages ~3 chars/token (vs 4 for prose) because identifiers,
+    // braces, and punctuation are often single-char tokens. Using 3 avoids
+    // underestimating the budget and truncating results prematurely.
+    let max_chars = max_tokens * 3;
     let mut total_chars = 0;
     let mut out = String::new();
 
@@ -1458,6 +1482,11 @@ async fn handle_search_workspace(
     let limit = optional_f64_arg(params, "limit").unwrap_or(10.0) as usize;
     let path_filter = optional_string_arg(params, "path");
     let cross_reference = optional_string_array_arg(params, "cross_reference_projects");
+    let include_graph_context = params
+        .arguments
+        .get("include_graph_context")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     match action.as_str() {
         "vector" | "" => {
@@ -1475,54 +1504,120 @@ async fn handle_search_workspace(
             }
 
             // Rerank if cross-encoder is available
+            if let Some(ref worker) = server.llm_worker {
+                let candidates: Vec<String> = results.iter().map(|r| r.content.clone()).collect();
+                if let Ok(ranking) = worker.rerank(query.clone(), candidates).await {
+                    let mut reranked = Vec::with_capacity(ranking.len());
+                    for (idx, _score) in ranking {
+                        if idx < results.len() {
+                            reranked.push(results[idx].clone());
+                        }
+                    }
+                    results = reranked;
+                }
+            }
+
             results.truncate(limit);
 
-            if results.is_empty() {
-                return Ok(CallToolResult::text("No matches found."));
+            // When include_graph_context is true, append callers/callees for each result.
+            let base_body = format_search_results(&results, &query);
+            let body = if include_graph_context {
+                let mut enriched = base_body.clone();
+                for r in &results {
+                    let meta = r.metadata_json();
+                    // Extract the primary symbol name from metadata
+                    let symbol = meta["symbols"]
+                        .as_array()
+                        .and_then(|a| a.first())
+                        .and_then(|v| v.as_str())
+                        .or_else(|| meta["name"].as_str())
+                        .unwrap_or("")
+                        .to_string();
+
+                    if symbol.is_empty() {
+                        continue;
+                    }
+
+                    let callers = server.store.graph.get_callers(&symbol);
+                    let callees = server.store.graph.get_callees(&symbol);
+
+                    if callers.is_empty() && callees.is_empty() {
+                        continue;
+                    }
+
+                    enriched.push_str(&format!("\n#### Graph Context for `{symbol}`\n\n"));
+                    if !callers.is_empty() {
+                        enriched.push_str("**Callers** (up to 5):\n");
+                        for n in callers.iter().take(5) {
+                            enriched.push_str(&format!("- {} in {}\n", n.name, n.path));
+                        }
+                    }
+                    if !callees.is_empty() {
+                        enriched.push_str("**Callees** (up to 5):\n");
+                        for n in callees.iter().take(5) {
+                            enriched.push_str(&format!("- {} in {}\n", n.name, n.path));
+                        }
+                    }
+                }
+                enriched
+            } else {
+                base_body
+            };
+
+            // When intent is Summarize, prepend an AI summary of the top result.
+            let intent = server
+                .semantic_router
+                .as_ref()
+                .map(|r| r.classify(&query, &server.embedder))
+                .unwrap_or(crate::mcp::router::Intent::SearchOnly);
+
+            if intent == crate::mcp::router::Intent::Summarize {
+                if let (Some(worker), Some(top)) = (&server.llm_worker, results.first()) {
+                    if let Ok(summary) = worker.summarize(top.content.clone()).await {
+                        if !summary.is_empty() {
+                            return Ok(CallToolResult::text(format!(
+                                "## AI Summary\n{summary}\n\n---\n\n{body}"
+                            )));
+                        }
+                    }
+                }
             }
-            let mut out = format!("### Search Results for '{query}':\n\n");
-            for r in results {
-                let meta = r.metadata_json();
-                let path = meta["path"].as_str().unwrap_or("?");
-                let start = meta["start_line"].as_u64().unwrap_or(0);
-                let end = meta["end_line"].as_u64().unwrap_or(0);
-                out.push_str(&format!(
-                    "#### {path} (Lines {start}-{end})\n```\n{}\n```\n\n",
-                    r.content
-                ));
-            }
-            Ok(CallToolResult::text(out))
+
+            Ok(CallToolResult::text(body))
         }
         "turbo" => {
-            // turbo_search has been removed; fall back to standard vector search.
+            // turbo_search has been removed; fall back to standard hybrid search.
             if query.is_empty() {
                 return Ok(CallToolResult::error("query is required for vector search"));
             }
             let vector = embed_query_blocking(Arc::clone(&server.embedder), query.clone()).await?;
             let mut results = server
                 .store
-                .vector_search(vector, limit, cross_reference.as_deref())
+                .hybrid_search(vector, &query, limit * 3, cross_reference.as_deref())
                 .await?;
 
             if let Some(ref pf) = path_filter {
                 results.retain(|r| r.metadata_str("path").contains(pf.as_str()));
             }
 
-            if results.is_empty() {
-                return Ok(CallToolResult::text("No matches found."));
+            // Rerank if cross-encoder is available, then truncate to limit.
+            if let Some(ref worker) = server.llm_worker {
+                let candidates: Vec<String> = results.iter().map(|r| r.content.clone()).collect();
+                if let Ok(ranking) = worker.rerank(query.clone(), candidates).await {
+                    let mut reranked = Vec::with_capacity(ranking.len());
+                    for (idx, _score) in ranking {
+                        if idx < results.len() {
+                            reranked.push(results[idx].clone());
+                        }
+                    }
+                    results = reranked;
+                } else {
+                    tracing::warn!("Reranking failed for turbo branch — using raw order");
+                }
             }
-            let mut out = format!("### Search Results for '{query}':\n\n");
-            for r in results {
-                let meta = r.metadata_json();
-                let path = meta["path"].as_str().unwrap_or("?");
-                let start = meta["start_line"].as_u64().unwrap_or(0);
-                let end = meta["end_line"].as_u64().unwrap_or(0);
-                out.push_str(&format!(
-                    "#### {path} (Lines {start}-{end})\n```\n{}\n```\n\n",
-                    r.content
-                ));
-            }
-            Ok(CallToolResult::text(out))
+            results.truncate(limit);
+
+            Ok(CallToolResult::text(format_search_results(&results, &query)))
         }
         "regex" => {
             let mut grep_params = params.arguments.clone();
@@ -1540,25 +1635,66 @@ async fn handle_search_workspace(
             if query.is_empty() {
                 return Ok(CallToolResult::error("query is required for graph search"));
             }
-            let impls = server.store.graph.get_implementations(&query);
-            if !impls.is_empty() {
-                let mut out = format!("Implementations of '{query}':\n");
-                for n in impls {
-                    out.push_str(&format!("- {} ({}) in {}\n", n.name, n.node_type, n.path));
+
+            let sub_action = optional_string_arg(params, "sub_action").unwrap_or_default();
+
+            match sub_action.as_str() {
+                "callers" => {
+                    let nodes = server.store.graph.get_callers(&query);
+                    if nodes.is_empty() {
+                        return Ok(CallToolResult::text("No results found.".to_string()));
+                    }
+                    let mut out = format!("## Callers of `{query}`\n\n");
+                    for n in nodes.iter().take(limit) {
+                        out.push_str(&format!("- {} ({})\n", n.name, n.path));
+                    }
+                    Ok(CallToolResult::text(out))
                 }
-                return Ok(CallToolResult::text(out));
+                "callees" => {
+                    let nodes = server.store.graph.get_callees(&query);
+                    if nodes.is_empty() {
+                        return Ok(CallToolResult::text("No results found.".to_string()));
+                    }
+                    let mut out = format!("## Callees of `{query}`\n\n");
+                    for n in nodes.iter().take(limit) {
+                        out.push_str(&format!("- {} ({})\n", n.name, n.path));
+                    }
+                    Ok(CallToolResult::text(out))
+                }
+                "impls" => {
+                    let nodes = server.store.graph.get_impl_chain(&query);
+                    if nodes.is_empty() {
+                        return Ok(CallToolResult::text("No results found.".to_string()));
+                    }
+                    let mut out = format!("## Implementations of trait `{query}`\n\n");
+                    for n in nodes.iter().take(limit) {
+                        out.push_str(&format!("- {} ({})\n", n.name, n.path));
+                    }
+                    Ok(CallToolResult::text(out))
+                }
+                _ => {
+                    // Default: existing get_implementations + search_by_name logic
+                    let impls = server.store.graph.get_implementations(&query);
+                    if !impls.is_empty() {
+                        let mut out = format!("Implementations of '{query}':\n");
+                        for n in impls {
+                            out.push_str(&format!("- {} ({}) in {}\n", n.name, n.node_type, n.path));
+                        }
+                        return Ok(CallToolResult::text(out));
+                    }
+                    let nodes = server.store.graph.search_by_name(&query);
+                    if nodes.is_empty() {
+                        return Ok(CallToolResult::text(format!(
+                            "No graph entries found for '{query}'."
+                        )));
+                    }
+                    let mut out = format!("Graph results for '{query}':\n");
+                    for n in nodes.iter().take(limit) {
+                        out.push_str(&format!("- {} ({}) in {}\n", n.name, n.node_type, n.path));
+                    }
+                    Ok(CallToolResult::text(out))
+                }
             }
-            let nodes = server.store.graph.search_by_name(&query);
-            if nodes.is_empty() {
-                return Ok(CallToolResult::text(format!(
-                    "No graph entries found for '{query}'."
-                )));
-            }
-            let mut out = format!("Graph results for '{query}':\n");
-            for n in nodes.iter().take(limit) {
-                out.push_str(&format!("- {} ({}) in {}\n", n.name, n.node_type, n.path));
-            }
-            Ok(CallToolResult::text(out))
         }
         "related_context" => {
             let file_path = if !query.is_empty() {
@@ -1606,8 +1742,77 @@ async fn handle_workspace_manager(
         "get_indexing_diagnostics" => handle_get_indexing_diagnostics(server).await,
         "store_context" => handle_store_context(server, params).await,
         "delete_context" => handle_delete_context(server, params).await,
+        "clear_kv_cache" => {
+            match &server.llm_worker {
+                Some(worker) => {
+                    match worker.clear_kv_cache().await {
+                        Ok(_) => Ok(CallToolResult::text("KV cache cleared successfully")),
+                        Err(e) => Ok(CallToolResult::error(format!("Failed to clear KV cache: {e}"))),
+                    }
+                }
+                None => Ok(CallToolResult::text("KV cache not active (LLM engine not loaded)")),
+            }
+        }
+        "list_write_ops" => {
+            let n = optional_f64_arg(params, "limit").unwrap_or(20.0) as usize;
+            let entries = server.write_log.last_n(n);
+            if entries.is_empty() {
+                return Ok(CallToolResult::text("No write operations recorded yet.".to_string()));
+            }
+            let mut out = String::from(
+                "| Timestamp | Action | Path | Backup |\n\
+                 |-----------|--------|------|--------|\n",
+            );
+            for e in &entries {
+                let bak = e.backup_path.as_deref().unwrap_or("—");
+                out.push_str(&format!(
+                    "| {} | {} | {} | {} |\n",
+                    e.timestamp, e.action, e.path, bak
+                ));
+            }
+            Ok(CallToolResult::text(out))
+        }
+        "restore_backup" => {
+            let backup_path = require_string_arg(params, "backup_path")?;
+            let original_path = require_string_arg(params, "original_path")?;
+
+            // Validate backup path (read) and original path (write).
+            let abs_backup = match server.path_guard.validate(&backup_path, PathOp::Read) {
+                Ok(p) => p,
+                Err(e) => return Ok(CallToolResult::error(format!("Backup path rejected: {e}"))),
+            };
+            let abs_original = match server.path_guard.validate(&original_path, PathOp::Write) {
+                Ok(p) => p,
+                Err(e) => return Ok(CallToolResult::error(format!("Original path rejected: {e}"))),
+            };
+
+            // Copy backup over original.
+            std::fs::copy(&abs_backup, &abs_original)
+                .map_err(|e| anyhow::anyhow!("restore failed: {e}"))?;
+
+            // Log the restore operation.
+            let content = std::fs::read(&abs_original)
+                .map_err(|e| anyhow::anyhow!("read after restore failed: {e}"))?;
+            let hash = sha256_hex(&content);
+            let entry = WriteLogEntry {
+                timestamp: chrono_now_rfc3339(),
+                path: original_path.clone(),
+                action: "restore".to_string(),
+                backup_path: Some(backup_path.clone()),
+                content_hash: hash,
+            };
+            if let Err(e) = server.write_log.append(&entry) {
+                tracing::warn!(path = %original_path, "Failed to append restore log entry: {e}");
+            }
+
+            let _ = server.reload_watcher_tx.send(original_path.clone()).await;
+
+            Ok(CallToolResult::text(format!(
+                "✅ Restored {original_path} from backup {backup_path}"
+            )))
+        }
         _ => Ok(CallToolResult::error(format!(
-            "Invalid action '{action}'. Use: set_project_root, trigger_index, get_indexing_diagnostics, store_context, delete_context"
+            "Invalid action '{action}'. Use: set_project_root, trigger_index, get_indexing_diagnostics, store_context, delete_context, clear_kv_cache, list_write_ops, restore_backup"
         ))),
     }
 }
@@ -1673,10 +1878,521 @@ async fn handle_modify_workspace(
         "run_linter" => handle_run_linter(server, params).await,
         "verify_patch" => handle_verify_patch(server, params),
         "auto_fix" => handle_auto_fix(server, params).await,
+        "write_file" => handle_write_file(server, params).await,
+        "generate_inline_docs" => handle_generate_inline_docs(server, params).await,
+        "propose_refactor" => handle_propose_refactor(server, params).await,
         _ => Ok(CallToolResult::error(format!(
-            "Invalid action '{action}'. Use: apply_patch, create_file, run_linter, verify_patch, auto_fix"
+            "Invalid action '{action}'. Use: apply_patch, create_file, run_linter, verify_patch, auto_fix, write_file, generate_inline_docs, propose_refactor"
         ))),
     }
+}
+
+/// Compute a hex-encoded SHA-256 hash of `data`.
+fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    hex::encode(hasher.finalize())
+}
+
+/// Write `content` to `path` atomically with a timestamped backup.
+///
+/// Steps:
+/// 1. Validate path via `PathGuard::Write`.
+/// 2. Enforce 1 MB content limit.
+/// 3. If the target exists, copy it to `{path}.bak.{unix_ts}`.
+/// 4. Write to `{path}.tmp` then rename atomically.
+/// 5. Append a `WriteLogEntry` to the server's write log.
+/// 6. Trigger re-indexing via `reload_watcher_tx`.
+async fn handle_write_file(server: &Server, params: &CallToolParams) -> Result<CallToolResult> {
+    let path = require_string_arg(params, "path")?;
+    let content = require_string_arg(params, "content")?;
+
+    // 1. PathGuard::Write validation.
+    let abs = match server.path_guard.validate(&path, PathOp::Write) {
+        Ok(p) => p,
+        Err(e) => return Ok(CallToolResult::error(format!("Write rejected: {e}"))),
+    };
+
+    // 2. 1 MB content limit.
+    const MAX_BYTES: usize = 1024 * 1024;
+    if content.len() > MAX_BYTES {
+        return Ok(CallToolResult::error(format!(
+            "Content too large: {} bytes (max {} bytes)",
+            content.len(),
+            MAX_BYTES
+        )));
+    }
+
+    // 3. Backup existing file.
+    let backup_path = if abs.exists() {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let bak = abs.with_extension(format!(
+            "{}.bak.{ts}",
+            abs.extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("bak")
+        ));
+        std::fs::copy(&abs, &bak)
+            .map_err(|e| anyhow::anyhow!("backup failed: {e}"))?;
+        Some(bak.to_string_lossy().to_string())
+    } else {
+        // Ensure parent directory exists.
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| anyhow::anyhow!("mkdir failed: {e}"))?;
+        }
+        None
+    };
+
+    // 4. Atomic write via temp file + rename.
+    let tmp_path = abs.with_extension(format!(
+        "{}.tmp",
+        abs.extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("tmp")
+    ));
+    tokio::fs::write(&tmp_path, content.as_bytes())
+        .await
+        .map_err(|e| anyhow::anyhow!("write to tmp failed: {e}"))?;
+    tokio::fs::rename(&tmp_path, &abs)
+        .await
+        .map_err(|e| anyhow::anyhow!("atomic rename failed: {e}"))?;
+
+    // 5. Append write log entry.
+    let hash = sha256_hex(content.as_bytes());
+    let entry = WriteLogEntry {
+        timestamp: chrono_now_rfc3339(),
+        path: path.clone(),
+        action: "write_file".to_string(),
+        backup_path: backup_path.clone(),
+        content_hash: hash,
+    };
+    if let Err(e) = server.write_log.append(&entry) {
+        tracing::warn!(path = %path, "Failed to append write log entry: {e}");
+    }
+
+    // 6. Trigger re-indexing.
+    let _ = server.reload_watcher_tx.send(path.clone()).await;
+
+    let msg = match backup_path {
+        Some(ref bak) => format!("✅ Written {path} (backup: {bak})"),
+        None => format!("✅ Written {path} (new file)"),
+    };
+    Ok(CallToolResult::text(msg))
+}
+
+/// Return the current UTC time as an RFC 3339 string.
+///
+/// Uses only `std::time` — no external crate required.
+/// The date arithmetic is a faithful Gregorian calendar implementation
+/// (handles leap years and variable month lengths correctly).
+fn chrono_now_rfc3339() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let total_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let s = (total_secs % 60) as u32;
+    let m = ((total_secs / 60) % 60) as u32;
+    let h = ((total_secs / 3600) % 24) as u32;
+
+    // Gregorian calendar from epoch days.
+    let mut days = (total_secs / 86400) as u32;
+    // Shift epoch from 1970-01-01 to the start of a 400-year Gregorian cycle.
+    // 146097 days per 400-year cycle; 719468 = days from year 0 to 1970-01-01.
+    days += 719468;
+    let era = days / 146097;
+    let doe = days - era * 146097; // day of era [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // year of era [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
+    let mp = (5 * doy + 2) / 153; // month of year [0, 11] (March-based)
+    let d = doy - (153 * mp + 2) / 5 + 1; // day [1, 31]
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 }; // month [1, 12]
+    let yr = if mo <= 2 { y + 1 } else { y };
+
+    format!("{yr:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+/// Format a generated doc string into the appropriate comment style for the
+/// given file extension.
+fn format_doc_comment(doc: &str, ext: &str) -> String {
+    match ext {
+        "rs" => {
+            // Rust: `/// ` prefix on each line
+            doc.lines()
+                .map(|l| format!("/// {l}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n"
+        }
+        "ts" | "tsx" | "js" | "jsx" => {
+            // TypeScript/JavaScript: JSDoc block
+            let body = doc
+                .lines()
+                .map(|l| format!(" * {l}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("/**\n{body}\n */\n")
+        }
+        "go" => {
+            // Go: `// ` prefix on each line
+            doc.lines()
+                .map(|l| format!("// {l}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n"
+        }
+        "py" => {
+            // Python: triple-quoted docstring
+            format!("\"\"\"\n{doc}\n\"\"\"\n")
+        }
+        _ => {
+            // Generic: `// ` prefix
+            doc.lines()
+                .map(|l| format!("// {l}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n"
+        }
+    }
+}
+
+/// Generate and prepend inline documentation for a named entity in a file.
+async fn handle_generate_inline_docs(
+    server: &Server,
+    params: &CallToolParams,
+) -> Result<CallToolResult> {
+    let path = require_string_arg(params, "path")?;
+    let entity_name = require_string_arg(params, "entity_name")?;
+
+    // 1. PathGuard::Write validation.
+    let abs = match server.path_guard.validate(&path, PathOp::Write) {
+        Ok(p) => p,
+        Err(e) => return Ok(CallToolResult::error(format!("Write rejected: {e}"))),
+    };
+
+    // 2. LLM must be available.
+    let worker = match &server.llm_worker {
+        Some(w) => Arc::clone(w),
+        None => {
+            return Ok(CallToolResult::error(
+                "LLM unavailable — cannot generate documentation",
+            ))
+        }
+    };
+
+    // 3. Find the chunk for entity_name.
+    let records = server.store.get_records_by_path(&path).await?;
+    let record = records.iter().find(|r| {
+        let meta = r.metadata_json();
+        meta["symbols"]
+            .as_array()
+            .map(|syms| syms.iter().any(|s| s.as_str() == Some(&entity_name)))
+            .unwrap_or(false)
+            || meta["name"].as_str() == Some(&entity_name)
+    });
+
+    let record = match record {
+        Some(r) => r.clone(),
+        None => {
+            return Ok(CallToolResult::error(format!(
+                "Entity '{entity_name}' not found in indexed records for '{path}'"
+            )))
+        }
+    };
+
+    // 4. Build prompt and call LLM.
+    let ext = std::path::Path::new(&path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_string();
+
+    let prompt = format!(
+        "Write a concise documentation comment for the following code entity '{entity_name}'.\n\
+         Return only the documentation text, no code fences.\n\n{}",
+        record.content
+    );
+
+    let doc = worker
+        .summarize(prompt)
+        .await
+        .map_err(|e| anyhow::anyhow!("LLM summarize failed: {e}"))?;
+
+    if doc.trim().is_empty() {
+        return Ok(CallToolResult::error(
+            "LLM returned empty documentation — no changes made",
+        ));
+    }
+
+    let doc_comment = format_doc_comment(doc.trim(), &ext);
+
+    // 5. Read file, find precise insertion point, build new content.
+    let content = tokio::fs::read_to_string(&abs)
+        .await
+        .map_err(|e| anyhow::anyhow!("read failed: {e}"))?;
+
+    // Prefer the start_line from indexed metadata for a precise match.
+    // Fall back to a word-boundary regex search to avoid matching substrings
+    // inside comments, strings, or longer identifiers.
+    let meta = record.metadata_json();
+    let start_line_hint = meta["start_line"].as_u64().map(|l| l as usize);
+
+    let insert_pos: Option<usize> = if let Some(line_no) = start_line_hint {
+        // line_no is 1-based; find the byte offset of that line.
+        let mut offset = 0usize;
+        for (idx, line) in content.lines().enumerate() {
+            if idx + 1 == line_no {
+                break;
+            }
+            offset += line.len() + 1; // +1 for '\n'
+        }
+        Some(offset)
+    } else {
+        // Word-boundary search: match entity_name not preceded/followed by \w.
+        let mut found = None;
+        let bytes = content.as_bytes();
+        let pat = entity_name.as_bytes();
+        let mut i = 0;
+        while i + pat.len() <= bytes.len() {
+            if bytes[i..i + pat.len()] == *pat {
+                let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_';
+                let after_ok = i + pat.len() >= bytes.len()
+                    || !bytes[i + pat.len()].is_ascii_alphanumeric() && bytes[i + pat.len()] != b'_';
+                if before_ok && after_ok {
+                    // Walk back to the start of this line.
+                    let line_start = content[..i].rfind('\n').map(|p| p + 1).unwrap_or(0);
+                    found = Some(line_start);
+                    break;
+                }
+            }
+            i += 1;
+        }
+        found
+    };
+
+    let new_content = if let Some(pos) = insert_pos {
+        let mut result = content[..pos].to_string();
+        result.push_str(&doc_comment);
+        result.push_str(&content[pos..]);
+        result
+    } else {
+        // Fallback: prepend at top of file.
+        format!("{doc_comment}\n{content}")
+    };
+
+    // 6. Atomic backup-and-write:
+    //    a) write new content to a .tmp file
+    //    b) rename original → .bak (atomic backup)
+    //    c) rename .tmp → original (atomic install)
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let bak = abs.with_extension(format!(
+        "{}.bak.{ts}",
+        abs.extension().and_then(|e| e.to_str()).unwrap_or("bak")
+    ));
+    let tmp = abs.with_extension(format!(
+        "{}.tmp",
+        abs.extension().and_then(|e| e.to_str()).unwrap_or("tmp")
+    ));
+
+    tokio::fs::write(&tmp, new_content.as_bytes())
+        .await
+        .map_err(|e| anyhow::anyhow!("write to tmp failed: {e}"))?;
+    std::fs::rename(&abs, &bak).map_err(|e| anyhow::anyhow!("backup rename failed: {e}"))?;
+    std::fs::rename(&tmp, &abs).map_err(|e| anyhow::anyhow!("atomic install failed: {e}"))?;
+
+    // 7. Log the operation.
+    let hash = sha256_hex(new_content.as_bytes());
+    let entry = WriteLogEntry {
+        timestamp: chrono_now_rfc3339(),
+        path: path.clone(),
+        action: "generate_inline_docs".to_string(),
+        backup_path: Some(bak.to_string_lossy().to_string()),
+        content_hash: hash,
+    };
+    if let Err(e) = server.write_log.append(&entry) {
+        tracing::warn!(path = %path, "Failed to append write log entry: {e}");
+    }
+
+    let _ = server.reload_watcher_tx.send(path.clone()).await;
+
+    Ok(CallToolResult::text(format!(
+        "✅ Inline docs generated for '{entity_name}' in {path}\n\nGenerated comment:\n{doc_comment}"
+    )))
+}
+
+/// Sanitise a refactoring instruction: enforce 500-char max and reject
+/// known prompt-injection markers.
+fn sanitise_instruction(s: &str) -> anyhow::Result<String> {
+    const MAX_LEN: usize = 500;
+    const BLOCKED: &[&str] = &[
+        "<|im_start|>",
+        "<|im_end|>",
+        "[INST]",
+        "[/INST]",
+        "<<SYS>>",
+    ];
+
+    if s.len() > MAX_LEN {
+        anyhow::bail!(
+            "instruction too long: {} chars (max {MAX_LEN})",
+            s.len()
+        );
+    }
+    for marker in BLOCKED {
+        if s.contains(marker) {
+            anyhow::bail!("instruction contains blocked marker: {marker}");
+        }
+    }
+    Ok(s.to_string())
+}
+
+/// Propose (or apply) a refactoring of a named entity in a file.
+async fn handle_propose_refactor(
+    server: &Server,
+    params: &CallToolParams,
+) -> Result<CallToolResult> {
+    let path = require_string_arg(params, "path")?;
+    let entity_name = require_string_arg(params, "entity_name")?;
+    let instruction_raw = require_string_arg(params, "instruction")?;
+    let apply = params
+        .arguments
+        .get("apply")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    // 1. Sanitise instruction.
+    let instruction = match sanitise_instruction(&instruction_raw) {
+        Ok(s) => s,
+        Err(e) => return Ok(CallToolResult::error(format!("Invalid instruction: {e}"))),
+    };
+
+    // 2. LLM must be available.
+    let worker = match &server.llm_worker {
+        Some(w) => Arc::clone(w),
+        None => {
+            return Ok(CallToolResult::error(
+                "LLM unavailable — cannot propose refactor",
+            ))
+        }
+    };
+
+    // 3. Find the chunk for entity_name.
+    let records = server.store.get_records_by_path(&path).await?;
+    let record = records.iter().find(|r| {
+        let meta = r.metadata_json();
+        meta["symbols"]
+            .as_array()
+            .map(|syms| syms.iter().any(|s| s.as_str() == Some(&entity_name)))
+            .unwrap_or(false)
+            || meta["name"].as_str() == Some(&entity_name)
+    });
+
+    let record = match record {
+        Some(r) => r.clone(),
+        None => {
+            return Ok(CallToolResult::error(format!(
+                "Entity '{entity_name}' not found in indexed records for '{path}'"
+            )))
+        }
+    };
+
+    // 4. Build prompt and call LLM.
+    let prompt = format!(
+        "Refactor the following code according to this instruction: {instruction}\n\n\
+         Return only the refactored code, no explanations or code fences.\n\n{}",
+        record.content
+    );
+
+    let proposed = worker
+        .summarize(prompt)
+        .await
+        .map_err(|e| anyhow::anyhow!("LLM summarize failed: {e}"))?;
+
+    if proposed.trim().is_empty() || proposed.trim() == record.content.trim() {
+        return Ok(CallToolResult::text("No changes proposed.".to_string()));
+    }
+
+    // 5. If apply=false (default), return as a proposal block.
+    if !apply {
+        return Ok(CallToolResult::text(format!(
+            "## Proposed Refactor for `{entity_name}` in `{path}`\n\n\
+             **Instruction**: {instruction}\n\n\
+             ```\n{}\n```",
+            proposed.trim()
+        )));
+    }
+
+    // 6. apply=true: validate write path, backup, and write.
+    let abs = match server.path_guard.validate(&path, PathOp::Write) {
+        Ok(p) => p,
+        Err(e) => return Ok(CallToolResult::error(format!("Write rejected: {e}"))),
+    };
+
+    let content = tokio::fs::read_to_string(&abs)
+        .await
+        .map_err(|e| anyhow::anyhow!("read failed: {e}"))?;
+
+    // Replace the original chunk content with the proposed refactor.
+    let new_content = if content.contains(record.content.as_str()) {
+        content.replacen(record.content.as_str(), proposed.trim(), 1)
+    } else {
+        return Ok(CallToolResult::error(
+            "Could not locate original chunk content in file — no changes applied",
+        ));
+    };
+
+    // Backup.
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let bak = abs.with_extension(format!(
+        "{}.bak.{ts}",
+        abs.extension().and_then(|e| e.to_str()).unwrap_or("bak")
+    ));
+    std::fs::copy(&abs, &bak).map_err(|e| anyhow::anyhow!("backup failed: {e}"))?;
+
+    // Atomic write.
+    let tmp = abs.with_extension(format!(
+        "{}.tmp",
+        abs.extension().and_then(|e| e.to_str()).unwrap_or("tmp")
+    ));
+    tokio::fs::write(&tmp, new_content.as_bytes())
+        .await
+        .map_err(|e| anyhow::anyhow!("write to tmp failed: {e}"))?;
+    tokio::fs::rename(&tmp, &abs)
+        .await
+        .map_err(|e| anyhow::anyhow!("atomic rename failed: {e}"))?;
+
+    // Log.
+    let hash = sha256_hex(new_content.as_bytes());
+    let entry = WriteLogEntry {
+        timestamp: chrono_now_rfc3339(),
+        path: path.clone(),
+        action: "propose_refactor".to_string(),
+        backup_path: Some(bak.to_string_lossy().to_string()),
+        content_hash: hash,
+    };
+    if let Err(e) = server.write_log.append(&entry) {
+        tracing::warn!(path = %path, "Failed to append write log entry: {e}");
+    }
+
+    let _ = server.reload_watcher_tx.send(path.clone()).await;
+
+    Ok(CallToolResult::text(format!(
+        "✅ Refactor applied to '{entity_name}' in {path} (backup: {})",
+        bak.display()
+    )))
 }
 
 /// Apply a search-and-replace patch with LSP diagnostic verification.

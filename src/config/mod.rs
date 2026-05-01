@@ -42,6 +42,16 @@ pub struct Config {
     pub embedder_pool_size: usize,
     pub api_port: String,
     pub feature_toggles: FeatureToggles,
+    /// Directory for KV-cache files (one `.kvcache` file per prompt hash).
+    /// Defaults to `models_dir/kv_cache/` when not set via `KV_CACHE_DIR`.
+    pub kv_cache_dir: PathBuf,
+    /// Maximum number of KV-cache entries to keep on disk (LRU eviction).
+    /// Defaults to 10. Configurable via `KV_CACHE_MAX_ENTRIES`.
+    pub kv_cache_max_entries: usize,
+    /// Path to the reranker GGUF model file.
+    /// Resolved from `RERANKER_MODEL_PATH` env var, or auto-detected from
+    /// `models_dir/bge-reranker-v2-m3-Q4_K_M.gguf` if the file exists.
+    pub reranker_model_path: Option<PathBuf>,
 }
 
 impl Config {
@@ -126,6 +136,29 @@ impl Config {
             enable_live_indexing: env_bool("ENABLE_LIVE_INDEXING"),
         };
 
+        // KV-cache directory — defaults to models_dir/kv_cache/
+        let kv_cache_dir = env::var("KV_CACHE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| models_dir.join("kv_cache"));
+
+        std::fs::create_dir_all(&kv_cache_dir)
+            .with_context(|| format!("creating kv_cache directory: {}", kv_cache_dir.display()))?;
+
+        let kv_cache_max_entries: usize = env::var("KV_CACHE_MAX_ENTRIES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10)
+            .max(1);
+
+        // Reranker model path — explicit env var, then auto-detect, then None.
+        let reranker_model_path = env::var("RERANKER_MODEL_PATH")
+            .ok()
+            .map(PathBuf::from)
+            .or_else(|| {
+                let candidate = models_dir.join("bge-reranker-v2-m3-Q4_K_M.gguf");
+                if candidate.exists() { Some(candidate) } else { None }
+            });
+
         Ok(Self {
             project_root: std::sync::RwLock::new(project_root),
             data_dir,
@@ -140,6 +173,9 @@ impl Config {
             embedder_pool_size,
             api_port,
             feature_toggles,
+            kv_cache_dir,
+            kv_cache_max_entries,
+            reranker_model_path,
         })
     }
 }

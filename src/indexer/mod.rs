@@ -115,7 +115,18 @@ pub async fn index_file(
     // Embed each chunk individually. llama.cpp creates a LlamaContext per call
     // which allocates large Vulkan buffers on the stack — batching multiple
     // contexts simultaneously causes stack overflows. One-at-a-time is correct.
-    let chunk_texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
+    // Use contextual_string for embedding when available — it includes section
+    // headings and file context which improves retrieval quality.
+    let chunk_texts: Vec<String> = chunks
+        .iter()
+        .map(|c| {
+            if c.contextual_string.is_empty() {
+                c.content.clone()
+            } else {
+                c.contextual_string.clone()
+            }
+        })
+        .collect();
     let mut all_vectors: Vec<Vec<f32>> = Vec::with_capacity(chunk_texts.len());
     for text in chunk_texts {
         let embedder = Arc::clone(&embedder);
@@ -136,6 +147,9 @@ pub async fn index_file(
             "symbols": chunk.symbols,
             "calls": chunk.calls,
             "relationships": chunk.relationships,
+            "callee_relationships": chunk.callee_relationships,
+            "impl_relationships": chunk.impl_relationships,
+            "extends_relationships": chunk.extends_relationships,
             "function_score": chunk.function_score,
             "summary": "",
         });

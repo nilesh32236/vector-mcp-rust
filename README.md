@@ -24,11 +24,24 @@ Please see the [Usage Guide](usage_guide.md) for full instructions on building, 
 
 ### Build Dependencies
 
-For optimal build performance on Linux, this project is configured to use the `mold` linker and `sccache`.
-- **mold**: Install via your package manager (e.g., `sudo apt install mold` or `brew install mold`).
-- **sccache**: Install via cargo: `cargo install sccache`.
+For optimal build performance, this project is configured to use the `mold` linker and `sccache`.
 
-If you do not have these tools installed, you can remove or comment out the `rustflags` and `rustc-wrapper` settings in `.cargo/config.toml` to use the default toolchain.
+#### Linux
+```bash
+sudo apt install mold
+```
+
+#### macOS
+```bash
+brew install mold
+```
+
+#### Cross-platform (Linux & macOS)
+```bash
+cargo install sccache
+```
+
+> **Alternative:** If you prefer not to install `mold` or `sccache`, comment out the `rustflags` and `rustc-wrapper` entries in `.cargo/config.toml` to use the default Rust toolchain without any additional linker or caching configuration.
 
 ## License
 MIT

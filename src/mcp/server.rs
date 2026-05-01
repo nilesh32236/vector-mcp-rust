@@ -11,7 +11,10 @@ use crate::config::Config;
 use crate::db::Store;
 use crate::llm::embedding::Embedder;
 use crate::llm::summarizer::Summarizer;
+use crate::llm::worker::LlmWorker;
 use crate::lsp::LspPool;
+use crate::mcp::router::SemanticRouter;
+use crate::mutation::write_log::WriteLog;
 use crate::security::pathguard::PathGuard;
 use crate::security::ratelimit::RateLimiter;
 
@@ -33,6 +36,8 @@ pub struct Server {
     pub config: Arc<Config>,
     pub embedder: Arc<Embedder>,
     pub summarizer: Arc<Summarizer>,
+    pub llm_worker: Option<Arc<LlmWorker>>,
+    pub semantic_router: Option<Arc<SemanticRouter>>,
     pub reload_watcher_tx: tokio::sync::mpsc::Sender<String>,
     pub indexing_progress: Arc<std::sync::RwLock<crate::indexer::scanner::ProgressState>>,
     /// session_id → SSE sender for `$/progress` notifications.
@@ -41,6 +46,8 @@ pub struct Server {
     pub path_guard: Arc<PathGuard>,
     pub rate_limiter: Arc<RateLimiter>,
     pub lsp_pool: Arc<LspPool>,
+    /// Append-only log of all file write operations.
+    pub write_log: Arc<WriteLog>,
 }
 
 impl Server {
@@ -49,7 +56,10 @@ impl Server {
         config: Arc<Config>,
         embedder: Arc<Embedder>,
         summarizer: Arc<Summarizer>,
+        llm_worker: Option<Arc<LlmWorker>>,
+        semantic_router: Option<Arc<SemanticRouter>>,
         reload_watcher_tx: tokio::sync::mpsc::Sender<String>,
+        write_log: Arc<WriteLog>,
     ) -> Self {
         let indexing_progress = Arc::new(std::sync::RwLock::new(
             crate::indexer::scanner::ProgressState::default(),
@@ -62,12 +72,15 @@ impl Server {
             config,
             embedder,
             summarizer,
+            llm_worker,
+            semantic_router,
             reload_watcher_tx,
             indexing_progress,
             progress_senders: Arc::new(dashmap::DashMap::new()),
             path_guard: Arc::new(path_guard),
             rate_limiter: Arc::new(RateLimiter::new(30.0, 60.0)),
             lsp_pool: Arc::new(LspPool::new(root)),
+            write_log,
         }
     }
 

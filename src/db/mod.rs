@@ -20,6 +20,16 @@ use tantivy::{Index as TantivyIndex, IndexReader, IndexWriter, ReloadPolicy, doc
 use tracing::info;
 
 // ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Number of seconds after which a Tantivy writer lock is considered stale.
+///
+/// If the lock file is older than this threshold, it is assumed to be left
+/// over from a crashed process and is removed so a new writer can be acquired.
+const TANTIVY_LOCK_STALE_SECS: u64 = 300;
+
+// ---------------------------------------------------------------------------
 // Tantivy Lexical Index
 // ---------------------------------------------------------------------------
 
@@ -66,8 +76,11 @@ impl LexicalIndex {
                     let lock_path = path.join(".tantivy-writer.lock");
                     if let Ok(meta) = std::fs::metadata(&lock_path) {
                         let elapsed = meta.modified()?.elapsed().unwrap_or_default();
-                        if elapsed.as_secs() > 300 {
-                            tracing::warn!("Tantivy lock stale (>5m), removing and retrying");
+                        if elapsed.as_secs() > TANTIVY_LOCK_STALE_SECS {
+                            tracing::warn!(
+                                "Tantivy lock stale (>{}s), removing and retrying",
+                                TANTIVY_LOCK_STALE_SECS
+                            );
                             let _ = std::fs::remove_file(&lock_path);
                             index.writer(50_000_000).context("Acquiring Tantivy writer after lock removal")?
                         } else {
@@ -693,7 +706,14 @@ async fn open_or_create_table(
                     name,
                     dimension
                 );
-                connection.drop_table(name, &[]).await.ok();
+                if let Err(e) = connection.drop_table(name, &[]).await {
+                    tracing::warn!(
+                        table = name,
+                        error = %e,
+                        "Failed to drop table during dimension mismatch recovery; \
+                         attempting to recreate anyway"
+                    );
+                }
                 return connection
                     .create_table(name, empty_batch)
                     .execute()

@@ -38,6 +38,14 @@ const BATCH_INSERT_THRESHOLD: usize = 500;
 /// Uses a dedicated blocking thread to walk the directory (no upfront Vec
 /// allocation) and streams paths to async workers via an mpsc channel.
 /// Records are accumulated and flushed to LanceDB in batches.
+///
+/// ## Startup skip
+///
+/// If the store already contains indexed records **and** `FORCE_REINDEX` is
+/// not set to `"true"`, the full directory walk is skipped.  The graph and
+/// Tantivy index are still rebuilt from the existing DB records so in-memory
+/// state is consistent.  Individual files that have changed on disk will be
+/// picked up by the file watcher (when `ENABLE_LIVE_INDEXING=true`).
 pub async fn scan_project(
     config: Arc<Config>,
     store: Arc<Store>,
@@ -46,6 +54,52 @@ pub async fn scan_project(
     progress: Arc<std::sync::RwLock<ProgressState>>,
     progress_tx: Option<tokio::sync::mpsc::Sender<ScanProgress>>,
 ) -> Result<()> {
+    let force_reindex = std::env::var("FORCE_REINDEX")
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false);
+
+    // Fast path: if the DB already has records and we're not forced to reindex,
+    // just rebuild in-memory state from the existing DB and return.
+    if !force_reindex {
+        let existing_count = store.code_vectors.count_rows(None).await.unwrap_or(0);
+        if existing_count > 0 {
+            info!(
+                "Startup: DB already contains {} records — skipping full scan. \
+                 Set FORCE_REINDEX=true to force a full re-index.",
+                existing_count
+            );
+            {
+                let mut p = progress.write().unwrap();
+                p.status = "Ready".into();
+                p.indexed_files = existing_count as u64;
+                p.total_files = existing_count as u64;
+            }
+            // Rebuild graph + enqueue summaries from existing records in background.
+            let store2 = Arc::clone(&store);
+            let summary_tx = spawn_summary_worker(
+                Arc::clone(&store),
+                Arc::clone(&summarizer),
+                Arc::clone(&config),
+            );
+            tokio::spawn(async move {
+                if let Ok(all) = store2.get_all_records().await {
+                    store2.graph.populate(&all);
+                    for r in &all {
+                        let meta = r.metadata_json();
+                        let already_summarized = meta["summary"]
+                            .as_str()
+                            .map(|s| !s.is_empty())
+                            .unwrap_or(false);
+                        if !already_summarized {
+                            let score = meta["function_score"].as_f64().unwrap_or(0.0) as f32;
+                            let _ = summary_tx.try_send((r.id.clone(), r.content.clone(), score));
+                        }
+                    }
+                }
+            });
+            return Ok(());
+        }
+    }
     // Spawn background summary worker — fills in summaries after the fast scan.
     let summary_tx = spawn_summary_worker(
         Arc::clone(&store),
@@ -228,7 +282,6 @@ pub async fn scan_project(
     // Rebuild knowledge graph and enqueue summaries in a background task so
     // the scan function returns promptly and the status stays "Ready".
     let store2 = Arc::clone(&store);
-    let progress2 = Arc::clone(&progress);
     tokio::spawn(async move {
         match store2.get_all_records().await {
             Ok(all) => {
@@ -239,10 +292,7 @@ pub async fn scan_project(
                 );
                 store2.graph.populate(&all);
 
-                {
-                    let mut p = progress2.write().unwrap();
-                    p.status = "Ready".into();
-                }
+                // Status was already set to "Ready" before this spawn — do not reset it here.
 
                 // Enqueue records that need summarization.
                 for r in &all {
@@ -260,8 +310,9 @@ pub async fn scan_project(
             }
             Err(e) => {
                 error!("Failed to fetch records for KnowledgeGraph rebuild: {:?}", e);
-                let mut p = progress2.write().unwrap();
-                p.status = "Ready".into(); // still mark ready — search still works
+                // Do NOT reset status here — the scan already completed successfully
+                // and status is already "Ready". Overwriting it would hide the fact
+                // that the graph rebuild failed while search still works.
             }
         }
     });
