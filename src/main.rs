@@ -12,6 +12,7 @@
 //!   starts a lightweight MCP server that delegates all AI/DB work to the master.
 
 mod api;
+mod benchmark;
 mod config;
 mod daemon;
 mod db;
@@ -96,6 +97,7 @@ fn init_llm_components(
         Some(&cfg.kv_cache_dir),
         Some(cfg.kv_cache_max_entries),
         cfg.reranker_model_path.as_deref(),
+        None, // embed_model_path (None means fallback to default in models.rs)
     ) {
         Ok(e) => {
             info!("LlamaEngine initialised ({mode}, Vulkan backend, n_gpu_layers=1000)");
@@ -189,6 +191,15 @@ async fn start_background_tasks(
 // ---------------------------------------------------------------------------
 
 fn main() -> Result<()> {
+    // 0. Silence internal llama.cpp logging.
+    std::env::set_var("LLAMA_LOG_VERBOSITY", "-1");
+    std::env::set_var("GGML_QUIET", "1");
+
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1] == "benchmark" {
+        return benchmark::run(args);
+    }
+
     // Build a custom Tokio runtime with 8MB stack size for blocking threads.
     // llama.cpp LlamaContext allocates large Vulkan compute buffers on the
     // stack — the default 2MB causes overflows during concurrent embedding.
@@ -201,6 +212,10 @@ fn main() -> Result<()> {
 }
 
 async fn async_main() -> Result<()> {
+    // 0. Silence internal llama.cpp logging.
+    std::env::set_var("LLAMA_LOG_VERBOSITY", "-1");
+    std::env::set_var("GGML_QUIET", "1");
+
     // 1. Load configuration first so we know the log path.
     let cfg = config::Config::load()?;
 

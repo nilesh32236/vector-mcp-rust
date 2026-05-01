@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use llama_cpp_2::{
-    context::params::LlamaContextParams,
+    context::params::{LlamaContextParams, LlamaPoolingType},
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
     model::{params::LlamaModelParams, AddBos, LlamaModel},
@@ -43,7 +43,7 @@ impl LlamaEngine {
     /// either GGUF is absent.
     #[allow(dead_code)]
     pub fn new(models_dir: &Path) -> Result<Self> {
-        Self::new_with_config(models_dir, None, None, None)
+        Self::new_with_config(models_dir, None, None, None, None)
     }
 
     /// Full constructor — used by `init_components` to pass KV-cache and
@@ -53,6 +53,7 @@ impl LlamaEngine {
         kv_cache_dir: Option<&Path>,
         kv_cache_max_entries: Option<usize>,
         reranker_model_path: Option<&Path>,
+        embed_model_path: Option<&Path>,
     ) -> Result<Self> {
         let backend = LlamaBackend::init()
             .map_err(|e| anyhow!("Failed to initialise LlamaBackend: {e}"))?;
@@ -67,14 +68,25 @@ impl LlamaEngine {
              add LimitMEMLOCK=infinity to the systemd unit to guarantee locking."
         );
 
-        let coder_path = models_dir.join("qwen2.5-coder-0.5b-instruct-q4_k_m.gguf");
+        let mut coder_path = models_dir.join("qwen2.5-coder-0.5b-instruct-q4_k_m.gguf");
+        if !coder_path.exists() {
+            if let Ok(home) = std::env::var("HOME") {
+                let fallback = Path::new(&home).join(".local/share/vector-mcp-rust/models/qwen2.5-coder-0.5b-instruct-q4_k_m.gguf");
+                if fallback.exists() {
+                    coder_path = fallback;
+                }
+            }
+        }
+
         anyhow::ensure!(
             coder_path.exists(),
             "Coder model not found at: {}",
             coder_path.display()
         );
 
-        let embed_path = models_dir.join("nomic-embed-text-v1.5.Q4_K_M.gguf");
+        let embed_path = embed_model_path.map(std::path::PathBuf::from).unwrap_or_else(|| {
+            models_dir.join("nomic-embed-text-v1.5.Q4_K_M.gguf")
+        });
         anyhow::ensure!(
             embed_path.exists(),
             "Embed model not found at: {}",
@@ -264,16 +276,27 @@ impl LlamaEngine {
         tokens.truncate(1024);
         let token_count = tokens.len();
 
-        // Dynamic n_ctx: next power-of-two >= token_count, floored at 64, capped at 1024.
+        // Dynamic n_ctx: next power-of-two >= token_count, floored at 64.
+        // Cap at the model's training context (e.g. 512 for BGE-small) or 1024.
+        let n_ctx_train = self.embed_model.n_ctx_train();
         let n_ctx = (token_count as u32)
             .next_power_of_two()
             .max(64)
+            .min(n_ctx_train)
             .min(1024);
 
+        // Crucial: Truncate tokens to the context size we actually allocated
+        // to avoid "Insufficient Space" errors in LlamaBatch.
+        tokens.truncate(n_ctx as usize);
+
+        // Only force Mean pooling if the model doesn't have internal pooling.
+        // For models like Jina, this is required. For others, it might override 
+        // to Mean instead of CLS, which is acceptable for benchmarking.
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(n_ctx))
             .with_n_batch(n_ctx)
             .with_n_ubatch(n_ctx)
+            .with_pooling_type(LlamaPoolingType::Mean)
             .with_embeddings(true);
 
         let mut ctx = self
