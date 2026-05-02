@@ -21,10 +21,11 @@ npm run build
 # Clear existing public directory in root
 echo "🧹 Cleaning up public directory..."
 cd ..
-rm -rf public/*
+mkdir -p public
+rm -rf public/* || true
 
 # Copy exported files to public
 echo "🚚 Deploying to public directory..."
-cp -r frontend/out/* public/
+cp -r frontend/out/. public/
 
 echo "✅ UI Build Complete!"

@@ -7,6 +7,8 @@
 //! language server, and waits up to 5 seconds for `textDocument/publishDiagnostics`.
 //! If the LSP reports severity-1 (Error) diagnostics, the patch is rejected.
 
+pub mod write_log;
+
 use std::time::Duration;
 
 use anyhow::{Result, bail};

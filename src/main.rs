@@ -12,6 +12,7 @@
 //!   starts a lightweight MCP server that delegates all AI/DB work to the master.
 
 mod api;
+mod benchmark;
 mod config;
 mod daemon;
 mod db;
@@ -29,20 +30,23 @@ use tracing::info;
 use crate::config::Config;
 use crate::db::Store;
 use crate::llm::embedding::Embedder;
+use crate::llm::models::LlamaEngine;
 use crate::llm::summarizer::Summarizer;
+use crate::llm::worker::LlmWorker;
+use crate::mcp::router::SemanticRouter;
+use crate::mutation::write_log::WriteLog;
 
 // ---------------------------------------------------------------------------
 // Logging & Telemetry
 // ---------------------------------------------------------------------------
 
-/// Initialise structured logging and OpenTelemetry.
+/// Initialise structured logging (file + stderr).
+///
+/// OpenTelemetry/gRPC tracing has been removed. Standard `tracing` subscriber
+/// with JSON file output and stderr console output is used instead.
 fn setup_logging(
     log_path: &std::path::Path,
 ) -> Result<tracing_appender::non_blocking::WorkerGuard> {
-    use opentelemetry::trace::TracerProvider as _;
-    use opentelemetry_otlp::WithExportConfig;
-    use opentelemetry_sdk::Resource;
-    use opentelemetry_sdk::trace::SdkTracerProvider;
     use tracing_subscriber::prelude::*;
 
     // Ensure the log directory exists.
@@ -67,35 +71,11 @@ fn setup_logging(
 
     let stderr_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
 
-    let registry = tracing_subscriber::registry()
+    tracing_subscriber::registry()
         .with(env_filter)
         .with(file_layer)
-        .with(stderr_layer);
-
-    let enable_otel = std::env::var("ENABLE_OTEL")
-        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-        .unwrap_or(false);
-    if enable_otel {
-        let exporter = opentelemetry_otlp::SpanExporter::builder()
-            .with_tonic()
-            .with_endpoint("http://localhost:4317")
-            .build()?;
-
-        let provider = SdkTracerProvider::builder()
-            .with_batch_exporter(exporter)
-            .with_resource(
-                Resource::builder()
-                    .with_service_name("vector-mcp-rust")
-                    .build(),
-            )
-            .build();
-
-        let tracer = provider.tracer("vector-mcp-rust");
-        let telemetry = tracing_opentelemetry::layer().with_tracer(tracer);
-        registry.with(telemetry).init();
-    } else {
-        registry.init();
-    }
+        .with(stderr_layer)
+        .init();
 
     Ok(guard)
 }
@@ -104,15 +84,74 @@ fn setup_logging(
 // Component initialisation
 // ---------------------------------------------------------------------------
 
-async fn init_components(cfg: &Config) -> Result<(Arc<Store>, Arc<Embedder>, Arc<Summarizer>)> {
+/// Initialise LlamaEngine, Embedder, and LlmWorker from config.
+///
+/// Degrades gracefully when GGUF model files are absent — returns
+/// `(None, disabled_embedder, None)` so the server starts in degraded mode.
+fn init_llm_components(
+    cfg: &Config,
+    mode: &str,
+) -> (Option<Arc<LlamaEngine>>, Arc<Embedder>, Option<Arc<LlmWorker>>) {
+    let engine_opt: Option<Arc<LlamaEngine>> = match LlamaEngine::new_with_config(
+        &cfg.models_dir,
+        Some(&cfg.kv_cache_dir),
+        Some(cfg.kv_cache_max_entries),
+        cfg.reranker_model_path.as_deref(),
+        None, // embed_model_path (None means fallback to default in models.rs)
+    ) {
+        Ok(e) => {
+            info!("LlamaEngine initialised ({mode}, Vulkan backend, n_gpu_layers=1000)");
+            Some(Arc::new(e))
+        }
+        Err(e) => {
+            tracing::error!(
+                models_dir = %cfg.models_dir.display(),
+                mode,
+                error = %e,
+                "Failed to initialise LlamaEngine — starting in degraded mode"
+            );
+            tracing::warn!(
+                "Degraded mode ({mode}): summarisation and local embedding are disabled. \
+                 Ensure GGUF model files are present in {} and restart to re-enable.",
+                cfg.models_dir.display()
+            );
+            None
+        }
+    };
+
+    let embedder = match &engine_opt {
+        Some(engine) => Arc::new(Embedder::new(Arc::clone(engine))),
+        None => Arc::new(Embedder::new_disabled()),
+    };
+
+    let worker_opt: Option<Arc<LlmWorker>> = engine_opt
+        .as_ref()
+        .map(|e| Arc::new(LlmWorker::spawn(Arc::clone(e))));
+
+    (engine_opt, embedder, worker_opt)
+}
+
+async fn init_components(
+    cfg: &Config,
+) -> Result<(Arc<Store>, Arc<Embedder>, Arc<Summarizer>, Option<Arc<LlmWorker>>, Option<Arc<SemanticRouter>>)> {
     let db_uri = cfg.db_path.display().to_string();
     let store = db::connect_store(&db_uri, cfg.dimension, false).await?;
     info!("LanceDB connected — tables initialised");
 
-    let embedder = Arc::new(Embedder::new(cfg).await?);
-    let summarizer = Arc::new(Summarizer::new(cfg).await?);
+    let (_engine_opt, embedder, worker_opt) = init_llm_components(cfg, "master");
 
-    Ok((Arc::new(store), embedder, summarizer))
+    let summarizer = Arc::new(Summarizer::new(
+        if cfg.feature_toggles.enable_local_llm {
+            worker_opt.clone()
+        } else {
+            None
+        },
+    ));
+
+    // Build SemanticRouter from prototype embeddings (non-fatal if embedder is degraded).
+    let semantic_router = Arc::new(SemanticRouter::build(&embedder));
+
+    Ok((Arc::new(store), embedder, summarizer, worker_opt, Some(semantic_router)))
 }
 
 async fn start_background_tasks(
@@ -151,8 +190,30 @@ async fn start_background_tasks(
 // Main
 // ---------------------------------------------------------------------------
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    // 0. Silence internal llama.cpp logging.
+    unsafe {
+        std::env::set_var("LLAMA_LOG_VERBOSITY", "-1");
+        std::env::set_var("GGML_QUIET", "1");
+    }
+
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() > 1 && args[1] == "benchmark" {
+        return benchmark::run(args);
+    }
+
+    // Build a custom Tokio runtime with 8MB stack size for blocking threads.
+    // llama.cpp LlamaContext allocates large Vulkan compute buffers on the
+    // stack — the default 2MB causes overflows during concurrent embedding.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024) // 8MB per blocking thread
+        .build()?;
+
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     // 1. Load configuration first so we know the log path.
     let cfg = config::Config::load()?;
 
@@ -189,7 +250,7 @@ async fn run_master(cfg: Config, socket_path: String) -> Result<()> {
     info!("Starting in MASTER mode");
 
     // Initialise heavy components.
-    let (store, embedder, summarizer) = init_components(&cfg).await?;
+    let (store, embedder, summarizer, worker_opt, semantic_router) = init_components(&cfg).await?;
     let config = Arc::new(cfg);
 
     // Shared indexing progress map.
@@ -247,7 +308,7 @@ async fn run_master(cfg: Config, socket_path: String) -> Result<()> {
     // Watcher reload channel — hold each new watcher alive by storing it.
     let (reload_tx, mut reload_rx) = tokio::sync::mpsc::channel::<String>(10);
     {
-        let cfg3 = Arc::clone(&config);
+        let cfg3: Arc<Config> = Arc::clone(&config);
         let store3 = Arc::clone(&store);
         let emb3 = Arc::clone(&embedder);
         let sum3 = Arc::clone(&summarizer);
@@ -273,7 +334,10 @@ async fn run_master(cfg: Config, socket_path: String) -> Result<()> {
         Arc::clone(&config),
         Arc::clone(&embedder),
         Arc::clone(&summarizer),
+        worker_opt,
+        semantic_router,
         reload_tx,
+        Arc::new(WriteLog::new(&config.data_dir)),
     ));
 
     start_servers(
@@ -302,10 +366,21 @@ async fn run_slave(cfg: Config, socket_path: String) -> Result<()> {
     let db_uri = config.db_path.display().to_string();
     let store = Arc::new(db::connect_store(&db_uri, config.dimension, true).await?);
 
-    // NOTE: Embedder is loaded locally until the Server struct is refactored to
-    // accept a trait object. RemoteEmbedder exists in daemon::slave for that future work.
-    let embedder = Arc::new(Embedder::new(&config).await?);
-    let summarizer = Arc::new(Summarizer::new(&config).await?);
+    // NOTE: LlamaEngine is loaded locally in slave mode too so the slave can
+    // serve embedding/summarisation requests without round-tripping to the master.
+    // Degrades gracefully if models are missing.
+    let (_engine_opt, embedder, worker_opt) = init_llm_components(&config, "slave");
+
+    let summarizer = Arc::new(Summarizer::new(
+        if config.feature_toggles.enable_local_llm {
+            worker_opt.clone()
+        } else {
+            None
+        },
+    ));
+
+    // Build SemanticRouter for slave mode too.
+    let semantic_router = Some(Arc::new(SemanticRouter::build(&embedder)));
 
     let (reload_tx, _reload_rx) = tokio::sync::mpsc::channel::<String>(10);
 
@@ -314,7 +389,10 @@ async fn run_slave(cfg: Config, socket_path: String) -> Result<()> {
         Arc::clone(&config),
         Arc::clone(&embedder),
         Arc::clone(&summarizer),
+        worker_opt,
+        semantic_router,
         reload_tx,
+        Arc::new(WriteLog::new(&config.data_dir)),
     ));
 
     // Slaves do NOT run the file watcher (master owns indexing).
@@ -350,9 +428,12 @@ async fn start_servers(
             rate_limiter: Arc::clone(&server.rate_limiter),
             progress,
             version: env!("CARGO_PKG_VERSION"),
+            kv_cache: None, // KvCacheStore is owned by LlamaEngine; expose via engine if needed
         });
 
         info!(mcp_port, api_port, "vector-mcp-rust ready ✓");
+
+        server.prewarm_lsp();
 
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -367,6 +448,7 @@ async fn start_servers(
         }
     } else {
         info!("vector-mcp-rust ready ✓ (stdio transport)");
+        server.prewarm_lsp();
         server.run().await?;
     }
 

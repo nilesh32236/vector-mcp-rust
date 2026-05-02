@@ -1,349 +1,391 @@
 "use client";
 
-import { useState, useEffect } from "react";
-import { 
-  Search, 
-  Settings, 
-  Terminal, 
-  FileCode, 
-  Activity, 
-  Database, 
-  Plus,
+import { useState, useEffect, useCallback } from "react";
+import { toast } from "sonner";
+import {
+  Search,
+  Settings,
+  Terminal,
+  Database,
   RefreshCw,
-  ExternalLink,
   ChevronRight,
-  Info
+  Command,
+  Sparkles,
 } from "lucide-react";
-import { cn } from "@/lib/utils";
+import { Sidebar } from "@/components/Sidebar";
+import { SearchResultCard } from "@/components/SearchResultCard";
+import { SearchResultSkeleton } from "@/components/SearchResultSkeleton";
+import { ContextModal } from "@/components/ContextModal";
+import { KEYBOARD_SHORTCUTS } from "@/lib/shortcuts";
 
 interface SearchResult {
   id: string;
   text: string;
   similarity: number;
   path: string;
-}
-
-interface IndexStatus {
-  status: string;
-  indexed_files: number;
-  total_files: number;
-  current_file: string;
+  summary?: string;
+  start_line?: number;
+  end_line?: number;
 }
 
 export default function WikiPage() {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SearchResult[]>([]);
   const [loading, setLoading] = useState(false);
-  const [status, setStatus] = useState<IndexStatus | null>(null);
   const [showContextModal, setShowContextModal] = useState(false);
-  const [contextText, setContextText] = useState("");
-  const [contextSource, setContextSource] = useState("");
+  const [recentSearches, setRecentSearches] = useState<string[]>([]);
+  const [suggestions, setSuggestions] = useState<string[]>([]);
 
-  // Poll status
+  // Load recent searches from localStorage
   useEffect(() => {
-    const fetchStatus = async () => {
+    try {
+      const saved = localStorage.getItem("recent_searches");
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        setRecentSearches(Array.isArray(parsed) ? parsed : []);
+      }
+    } catch {
+      localStorage.removeItem("recent_searches");
+      setRecentSearches([]);
+    }
+  }, []);
+
+  const handleSearch = useCallback(
+    async (q?: string, save = true) => {
+      const searchTerms = q || query;
+      if (!searchTerms.trim()) {
+        setResults([]);
+        return;
+      }
+
+      setLoading(true);
       try {
-        const res = await fetch("/api/tools/status");
-        if (res.ok) {
-          const data = await res.json();
-          setStatus(data);
+        const res = await fetch("/api/search", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ query: searchTerms, top_k: 10 }),
+        });
+        if (!res.ok) {
+          const errorBody = await res.text();
+          throw new Error(`Search failed: ${errorBody}`);
+        }
+        const data = await res.json();
+        setResults(data);
+
+        if (save && data.length > 0) {
+          setRecentSearches((prev) => {
+            const next = [
+              searchTerms,
+              ...prev.filter((s) => s !== searchTerms),
+            ].slice(0, 5);
+            localStorage.setItem("recent_searches", JSON.stringify(next));
+            return next;
+          });
         }
       } catch (e) {
-        console.error("Failed to fetch status", e);
+        toast.error(
+          e instanceof Error ? e.message : "Network error: Search failed"
+        );
+      } finally {
+        setLoading(false);
+      }
+    },
+    [query]
+  );
+
+  // Debounced autocomplete/suggestions
+  useEffect(() => {
+    if (query.length < 3) {
+      setSuggestions([]);
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      // TODO: Replace this placeholder with a real suggestions API call.
+      // Intended behavior: debounced fetch to GET /api/suggest?q=<query>,
+      // use an AbortController to cancel the in-flight request on cleanup,
+      // and call setSuggestions() with the returned string array.
+      // Example:
+      //   const controller = new AbortController();
+      //   fetch(`/api/suggest?q=${encodeURIComponent(query)}`, { signal: controller.signal })
+      //     .then(r => r.json()).then(setSuggestions).catch(() => {});
+      //   return () => controller.abort();
+      setSuggestions([
+        `Search for "${query}"`,
+        "Explain the indexing logic",
+        "Show MCP SSE handlers",
+      ]);
+    }, 300);
+
+    return () => clearTimeout(timer);
+  }, [query]);
+
+  // Unified keyboard shortcuts — single listener, priority-ordered Escape handling
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const active = document.activeElement;
+      const inInput =
+        active?.tagName === "INPUT" || active?.tagName === "TEXTAREA";
+
+      // ⌘K / Ctrl+K — focus search
+      if (
+        (e.metaKey || e.ctrlKey) &&
+        e.key === KEYBOARD_SHORTCUTS.FOCUS_SEARCH.key
+      ) {
+        e.preventDefault();
+        document.getElementById("main-search")?.focus();
+        return;
+      }
+
+      // / — focus search (when not in an input)
+      if (e.key === KEYBOARD_SHORTCUTS.FOCUS_SEARCH_SLASH.key && !inInput) {
+        e.preventDefault();
+        document.getElementById("main-search")?.focus();
+        return;
+      }
+
+      // ⌘Enter — submit current query
+      if (
+        (e.metaKey || e.ctrlKey) &&
+        e.key === KEYBOARD_SHORTCUTS.SUBMIT_SEARCH.key
+      ) {
+        e.preventDefault();
+        handleSearch(query);
+        return;
+      }
+
+      // Escape — priority: close modal > hide suggestions > clear query+results
+      if (e.key === KEYBOARD_SHORTCUTS.CLEAR_SEARCH.key) {
+        if (showContextModal) {
+          setShowContextModal(false);
+          return;
+        }
+        if (suggestions.length > 0) {
+          setSuggestions([]);
+          return;
+        }
+        if (query) {
+          setQuery("");
+          setResults([]);
+        }
       }
     };
 
-    fetchStatus();
-    const interval = setInterval(fetchStatus, 3000);
-    return () => clearInterval(interval);
-  }, []);
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [query, suggestions, showContextModal, handleSearch]);
 
-  const handleSearch = async (e?: React.FormEvent) => {
-    e?.preventDefault();
-    if (!query.trim()) return;
-
-    setLoading(true);
-    try {
-      const res = await fetch("/api/search", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query, top_k: 10 }),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        setResults(data);
-      }
-    } catch (e) {
-      console.error("Search failed", e);
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleAddContext = async () => {
-    try {
-      const res = await fetch("/api/context", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: contextText, source: contextSource }),
-      });
-      if (res.ok) {
-        setShowContextModal(false);
-        setContextText("");
-        setContextSource("");
-      }
-    } catch (e) {
-      console.error("Context addition failed", e);
+  const handleAddContext = async (text: string, source: string) => {
+    const res = await fetch("/api/context", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text, source }),
+    });
+    if (!res.ok) {
+      const errorText = await res.text();
+      const msg = `Failed to add context: ${errorText}`;
+      throw new Error(msg);
     }
   };
 
   const handleReindex = async () => {
+    toast.info("Re-indexing started…", { id: "reindex" });
     try {
-      await fetch("/api/tools/index", {
+      const res = await fetch("/api/tools/index", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ path: null }),
       });
-      // Status will update via polling
-    } catch (e) {
-      console.error("Re-index trigger failed", e);
+      if (!res.ok) {
+        const errorText = await res.text();
+        toast.error(`Re-index failed: ${errorText}`, { id: "reindex" });
+      }
+    } catch {
+      toast.error("Network error: Re-index trigger failed", { id: "reindex" });
     }
   };
 
   return (
-    <div className="flex h-screen overflow-hidden">
-      {/* Sidebar */}
-      <aside className="w-80 glass border-r flex flex-col">
-        <div className="p-6 border-b">
-          <div className="flex items-center gap-3 mb-2">
-            <div className="p-2 bg-cta/20 rounded-lg">
-              <Terminal className="w-6 h-6 text-cta" />
-            </div>
-            <h1 className="text-xl font-bold tracking-tight">VectorWiki</h1>
-          </div>
-          <p className="text-sm text-foreground/60">Local Code Intelligence</p>
-        </div>
+    <div className="flex h-screen overflow-hidden bg-background">
+      <Sidebar
+        onAddContext={() => setShowContextModal(true)}
+        onReindex={handleReindex}
+        recentSearches={recentSearches}
+        onSelectRecent={(q) => {
+          setQuery(q);
+          handleSearch(q, false);
+        }}
+      />
 
-        <div className="flex-1 overflow-y-auto p-4 space-y-6">
-          {/* Status Section */}
-          <section>
-            <h2 className="text-xs font-semibold text-foreground/40 uppercase tracking-wider mb-4 flex items-center gap-2">
-              <Activity className="w-3 h-3" /> System Status
-            </h2>
-            <div className="space-y-4">
-              <div className="glass-light p-4 rounded-xl space-y-3">
-                <div className="flex justify-between items-center text-sm">
-                  <span className="text-foreground/80">Indexing</span>
-                  <span className={cn(
-                    "px-2 py-0.5 rounded-full text-xs font-medium",
-                    status?.status === "Ready" ? "bg-cta/10 text-cta" : "bg-blue-500/10 text-blue-400"
-                  )}>
-                    {status?.status || "Idle"}
-                  </span>
-                </div>
-                {status && status.total_files > 0 && (
-                  <div className="space-y-1.5">
-                    <div className="flex justify-between text-xs text-foreground/60">
-                      <span>{status.indexed_files} / {status.total_files} files</span>
-                      <span>{Math.round((status.indexed_files / status.total_files) * 100)}%</span>
-                    </div>
-                    <div className="h-1.5 w-full bg-primary rounded-full overflow-hidden">
-                      <div 
-                        className="h-full bg-cta transition-all duration-500" 
-                        style={{ width: `${(status.indexed_files / status.total_files) * 100}%` }}
-                      />
-                    </div>
+      <main className="flex-1 flex flex-col relative overflow-hidden">
+        {/* Animated background */}
+        <div className="absolute top-[-15%] right-[-10%] w-[60%] h-[60%] bg-cta/10 blur-[150px] rounded-full pointer-events-none animate-pulse" />
+        <div className="absolute bottom-[-10%] left-[-10%] w-[50%] h-[50%] bg-blue-600/5 blur-[120px] rounded-full pointer-events-none" />
+
+        {/* Search Header */}
+        <header className="p-10 pb-6 relative z-10">
+          <div className="max-w-4xl mx-auto">
+            <div className="relative group">
+              <div className="absolute inset-0 bg-cta/20 blur-2xl opacity-0 group-focus-within:opacity-100 transition-opacity duration-500 rounded-3xl" />
+              <div className="relative flex items-center">
+                <Search className="absolute left-5 w-6 h-6 text-foreground/30 group-focus-within:text-cta transition-colors duration-300" />
+                <input
+                  id="main-search"
+                  type="text"
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && handleSearch(query)}
+                  placeholder="Query your codebase intelligence..."
+                  className="w-full bg-primary/40 border border-white/10 rounded-2xl py-5 pl-14 pr-32 outline-none focus:border-cta/40 transition-all font-sans text-xl glass shadow-2xl placeholder:text-foreground/20"
+                />
+                <div className="absolute right-5 flex items-center gap-3">
+                  {loading && (
+                    <RefreshCw className="w-5 h-5 animate-spin text-cta" />
+                  )}
+                  <div className="hidden md:flex items-center gap-1.5 px-2 py-1 bg-white/5 rounded-lg border border-white/10">
+                    <Command className="w-3 h-3 text-foreground/40" />
+                    <span className="text-[10px] font-bold text-foreground/40 tracking-widest">
+                      K
+                    </span>
                   </div>
-                )}
-                {status?.current_file && (
-                  <p className="text-[10px] text-foreground/40 truncate italic">
-                    {status.current_file}
-                  </p>
-                )}
+                </div>
               </div>
+
+              {/* Suggestions Dropdown */}
+              {suggestions.length > 0 && query && (
+                <div className="absolute top-full left-0 right-0 mt-2 glass rounded-2xl overflow-hidden shadow-2xl border-white/10 animate-in slide-in-from-top-2 duration-200 z-20">
+                  {suggestions.map((s, i) => (
+                    <button
+                      key={i}
+                      onClick={() => {
+                        const finalQ = s.includes('"') ? query : s;
+                        setQuery(finalQ);
+                        handleSearch(finalQ);
+                        setSuggestions([]);
+                      }}
+                      className="w-full text-left px-6 py-4 hover:bg-white/5 flex items-center gap-3 group transition-colors cursor-pointer"
+                    >
+                      <Sparkles className="w-4 h-4 text-cta/40 group-hover:text-cta transition-colors" />
+                      <span className="text-sm text-foreground/70 group-hover:text-foreground">
+                        {s}
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
-          </section>
-
-          {/* Actions */}
-          <section>
-            <h2 className="text-xs font-semibold text-foreground/40 uppercase tracking-wider mb-3 flex items-center gap-2">
-               Quick Actions
-            </h2>
-            <button 
-              onClick={() => setShowContextModal(true)}
-              className="w-full flex items-center gap-3 p-3 rounded-xl hover:bg-white/5 transition-colors text-sm group"
-            >
-              <div className="p-2 bg-primary rounded-lg group-hover:bg-secondary transition-colors">
-                <Plus className="w-4 h-4 text-cta" />
-              </div>
-              Add Context
-            </button>
-            <button 
-              onClick={handleReindex}
-              className="w-full flex items-center gap-3 p-3 rounded-xl hover:bg-white/5 transition-colors text-sm group"
-            >
-              <div className="p-2 bg-primary rounded-lg group-hover:bg-secondary transition-colors">
-                <RefreshCw className={cn("w-4 h-4 text-foreground/60", status?.status !== "Ready" && "animate-spin text-cta")} />
-              </div>
-              Re-index Repository
-            </button>
-          </section>
-        </div>
-
-        <div className="p-4 border-t glass">
-          <div className="flex items-center gap-3 text-xs text-foreground/40">
-            <Info className="w-4 h-4" />
-            <p>Powered by vector-mcp-rust</p>
           </div>
-        </div>
-      </aside>
-
-      {/* Main Content */}
-      <main className="flex-1 flex flex-col bg-background/50 relative overflow-hidden">
-        {/* Background blobs */}
-        <div className="absolute top-[-10%] right-[-10%] w-[50%] h-[50%] bg-cta/5 blur-[120px] rounded-full pointer-events-none" />
-        <div className="absolute bottom-[-10%] left-[-10%] w-[40%] h-[40%] bg-blue-500/5 blur-[100px] rounded-full pointer-events-none" />
-
-        {/* Header / Search */}
-        <header className="p-8 pb-4">
-          <form onSubmit={handleSearch} className="max-w-3xl mx-auto relative group">
-            <Search className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-foreground/30 group-focus-within:text-cta transition-colors" />
-            <input 
-              type="text"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="Ask anything about your codebase..."
-              className="w-full bg-primary/50 border border-white/10 rounded-2xl py-4 pl-12 pr-4 outline-none focus:border-cta/50 focus:ring-4 focus:ring-cta/10 transition-all font-sans text-lg glass"
-            />
-            <div className="absolute right-4 top-1/2 -translate-y-1/2 flex items-center gap-2">
-              {loading && <RefreshCw className="w-4 h-4 animate-spin text-cta" />}
-              <kbd className="hidden md:inline-flex h-5 select-none items-center gap-1 rounded border border-white/10 bg-white/5 px-1.5 font-mono text-[10px] font-medium text-foreground/40">
-                <span className="text-xs">⌘</span>K
-              </kbd>
-            </div>
-          </form>
         </header>
 
-        {/* Results */}
-        <div className="flex-1 overflow-y-auto p-8 pt-4">
+        {/* Results Area */}
+        <div className="flex-1 overflow-y-auto px-10 pb-10">
           <div className="max-w-4xl mx-auto space-y-6">
-            {results.length > 0 ? (
-              results.map((result) => (
-                <div key={result.id} className="glass p-6 rounded-2xl group hover:border-cta/30 transition-all">
-                  <div className="flex justify-between items-start mb-4">
-                    <div className="flex items-center gap-3">
-                      <div className="p-2 bg-primary rounded-lg">
-                        <FileCode className="w-5 h-5 text-foreground/60" />
-                      </div>
-                      <div>
-                        <h3 className="font-mono text-sm font-semibold truncate max-w-md">
-                          {result.path || "Manual Context"}
-                        </h3>
-                        <p className="text-xs text-foreground/40">ID: {result.id.substring(0, 12)}...</p>
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-4">
-                      <div className="text-right">
-                        <p className="text-[10px] uppercase font-bold text-foreground/30 mb-1">Relevance</p>
-                        <div className="h-1.5 w-24 bg-primary rounded-full overflow-hidden">
-                          <div 
-                            className="h-full bg-cta" 
-                            style={{ width: `${(result.similarity || 0.8) * 100}%` }}
-                          />
-                        </div>
-                      </div>
-                      <button className="p-2 hover:bg-white/5 rounded-lg transition-colors">
-                        <ExternalLink className="w-4 h-4 text-foreground/40" />
-                      </button>
-                    </div>
-                  </div>
-                  <div className="bg-black/20 rounded-xl p-4 font-mono text-sm text-foreground/80 overflow-x-auto border border-white/5 whitespace-pre-wrap">
-                    {result.text}
-                  </div>
-                </div>
-              ))
-            ) : query && !loading ? (
-              <div className="text-center py-20">
-                <div className="w-16 h-16 bg-primary rounded-full flex items-center justify-center mx-auto mb-4 border border-white/10">
-                  <Database className="w-8 h-8 text-foreground/20" />
-                </div>
-                <h3 className="text-lg font-semibold text-foreground/60">No results found</h3>
-                <p className="text-sm text-foreground/40">Try a different query or re-index your repository.</p>
-              </div>
-            ) : !query && (
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-12">
-                {[
-                  "How does the API authentication work?",
-                  "Show me the database schema for vectors",
-                  "Where is the MCP SSE logic implemented?",
-                  "Explain the codebase structure"
-                ].map((q) => (
-                  <button 
-                    key={q}
-                    onClick={() => { setQuery(q); handleSearch(); }}
-                    className="glass-light p-4 rounded-xl text-left text-sm hover:border-cta/40 transition-all flex items-center justify-between group"
-                  >
-                    <span className="text-foreground/70">{q}</span>
-                    <ChevronRight className="w-4 h-4 text-foreground/20 group-hover:text-cta group-hover:translate-x-1 transition-all" />
-                  </button>
+            {/* Skeleton loaders while searching */}
+            {loading ? (
+              <div
+                className="space-y-6"
+                aria-live="polite"
+                aria-label="Loading search results"
+              >
+                {[1, 2, 3].map((i) => (
+                  <SearchResultSkeleton key={i} />
                 ))}
+              </div>
+            ) : results.length > 0 ? (
+              <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500">
+                <div className="flex items-center justify-between px-2">
+                  <h2 className="text-[10px] font-black uppercase tracking-[0.3em] text-foreground/30">
+                    Search Results ({results.length})
+                  </h2>
+                  <div className="h-px flex-1 bg-white/5 mx-4" />
+                </div>
+                {results.map((result) => (
+                  <SearchResultCard key={result.id} result={result} />
+                ))}
+              </div>
+            ) : query ? (
+              <div className="text-center py-32 animate-in zoom-in duration-300">
+                <div className="w-20 h-20 bg-primary/40 rounded-3xl flex items-center justify-center mx-auto mb-6 border border-white/10 shadow-2xl">
+                  <Database className="w-10 h-10 text-foreground/10" />
+                </div>
+                <h3 className="text-xl font-bold text-foreground/60">
+                  No matching intel found
+                </h3>
+                <p className="text-sm text-foreground/30 mt-2 max-w-xs mx-auto">
+                  Try broadening your query or ensure the repository is fully
+                  indexed.
+                </p>
+                <div className="mt-8 flex flex-wrap justify-center gap-2">
+                  {[
+                    "API authentication",
+                    "SSE implementation",
+                    "Vector storage",
+                  ].map((t) => (
+                    <button
+                      key={t}
+                      onClick={() => {
+                        setQuery(t);
+                        handleSearch(t);
+                      }}
+                      className="px-4 py-2 rounded-full bg-white/5 border border-white/5 text-xs text-foreground/40 hover:border-cta/30 hover:text-cta transition-all cursor-pointer"
+                    >
+                      {t}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <div className="mt-12">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  {[
+                    {
+                      q: "How does the API authentication work?",
+                      icon: <Terminal className="w-4 h-4" />,
+                    },
+                    {
+                      q: "Show me the database schema for vectors",
+                      icon: <Database className="w-4 h-4" />,
+                    },
+                    {
+                      q: "Where is the MCP SSE logic implemented?",
+                      icon: <Settings className="w-4 h-4" />,
+                    },
+                    {
+                      q: "Explain the codebase structure",
+                      icon: <Terminal className="w-4 h-4" />,
+                    },
+                  ].map((item) => (
+                    <button
+                      key={item.q}
+                      onClick={() => {
+                        setQuery(item.q);
+                        handleSearch(item.q);
+                      }}
+                      className="glass-light p-5 rounded-2xl text-left hover:border-cta/40 hover:bg-white/5 transition-all flex items-center justify-between group cursor-pointer"
+                    >
+                      <div className="flex items-center gap-4">
+                        <div className="p-2 bg-primary rounded-lg text-foreground/30 group-hover:text-cta transition-colors">
+                          {item.icon}
+                        </div>
+                        <span className="text-sm font-medium text-foreground/60 group-hover:text-foreground transition-colors">
+                          {item.q}
+                        </span>
+                      </div>
+                      <ChevronRight className="w-4 h-4 text-foreground/10 group-hover:text-cta group-hover:translate-x-1 transition-all" />
+                    </button>
+                  ))}
+                </div>
               </div>
             )}
           </div>
         </div>
       </main>
 
-      {/* Context Modal */}
       {showContextModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-          <div 
-            className="absolute inset-0 bg-black/60 backdrop-blur-sm" 
-            onClick={() => setShowContextModal(false)}
-          />
-          <div className="glass w-full max-w-lg rounded-2xl overflow-hidden relative shadow-2xl animate-in fade-in zoom-in duration-200">
-            <div className="p-6 border-b">
-              <h2 className="text-lg font-bold">Add Manual Context</h2>
-              <p className="text-sm text-foreground/40">Inject external data into the vector store.</p>
-            </div>
-            <div className="p-6 space-y-4">
-              <div className="space-y-2">
-                <label className="text-xs font-semibold text-foreground/60 uppercase">Source / Path</label>
-                <input 
-                  type="text"
-                  value={contextSource}
-                  onChange={(e) => setContextSource(e.target.value)}
-                  placeholder="e.g. documentation/api.md"
-                  className="w-full bg-primary/50 border border-white/10 rounded-xl py-2 px-4 outline-none focus:border-cta/50 transition-all"
-                />
-              </div>
-              <div className="space-y-2">
-                <label className="text-xs font-semibold text-foreground/60 uppercase">Content</label>
-                <textarea 
-                  rows={6}
-                  value={contextText}
-                  onChange={(e) => setContextText(e.target.value)}
-                  placeholder="Paste context content here..."
-                  className="w-full bg-primary/50 border border-white/10 rounded-xl py-3 px-4 outline-none focus:border-cta/50 transition-all resize-none font-mono text-sm"
-                />
-              </div>
-            </div>
-            <div className="p-6 bg-white/5 flex justify-end gap-3">
-              <button 
-                onClick={() => setShowContextModal(false)}
-                className="px-4 py-2 text-sm font-medium hover:text-foreground transition-colors"
-              >
-                Cancel
-              </button>
-              <button 
-                onClick={handleAddContext}
-                disabled={!contextText}
-                className="px-6 py-2 bg-cta text-black font-bold rounded-xl text-sm hover:brightness-110 disabled:opacity-50 disabled:cursor-not-allowed transition-all shadow-lg shadow-cta/20"
-              >
-                Inject Context
-              </button>
-            </div>
-          </div>
-        </div>
+        <ContextModal
+          onClose={() => setShowContextModal(false)}
+          onSubmit={handleAddContext}
+        />
       )}
     </div>
   );
