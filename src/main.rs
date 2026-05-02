@@ -433,6 +433,8 @@ async fn start_servers(
 
         info!(mcp_port, api_port, "vector-mcp-rust ready ✓");
 
+        server.prewarm_lsp();
+
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 info!("Ctrl-C received — shutting down");
@@ -446,6 +448,7 @@ async fn start_servers(
         }
     } else {
         info!("vector-mcp-rust ready ✓ (stdio transport)");
+        server.prewarm_lsp();
         server.run().await?;
     }
 

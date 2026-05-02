@@ -69,7 +69,7 @@ impl Server {
             PathGuard::new(&root).unwrap_or_else(|_| PathGuard::new(std::env::temp_dir()).unwrap());
         Self {
             store,
-            config,
+            config: Arc::clone(&config),
             embedder,
             summarizer,
             llm_worker,
@@ -79,7 +79,7 @@ impl Server {
             progress_senders: Arc::new(dashmap::DashMap::new()),
             path_guard: Arc::new(path_guard),
             rate_limiter: Arc::new(RateLimiter::new(30.0, 60.0)),
-            lsp_pool: Arc::new(LspPool::new(root)),
+            lsp_pool: Arc::new(LspPool::new(Arc::clone(&config))),
             write_log,
         }
     }
@@ -267,6 +267,49 @@ impl Server {
             });
             let _ = tx.send(notification);
         }
+    }
+
+    /// Spawn background tasks that eagerly start one LSP session per
+    /// `tsconfig.json` found in the project root. This pays the cold-start
+    /// cost at server boot so the first real LSP query is instant.
+    pub fn prewarm_lsp(&self) {
+        let root = self.config.project_root.read().unwrap().clone();
+        let lsp_pool = Arc::clone(&self.lsp_pool);
+
+        tokio::spawn(async move {
+            let tsconfigs = tokio::task::spawn_blocking({
+                let root = root.clone();
+                move || {
+                    let walker = ignore::WalkBuilder::new(&root)
+                        .standard_filters(true)
+                        .hidden(true)
+                        .build();
+                    walker
+                        .filter_map(|e| e.ok())
+                        .filter(|e| {
+                            e.file_type().map(|ft| ft.is_file()).unwrap_or(false)
+                                && e.file_name() == "tsconfig.json"
+                                && !e.path().to_string_lossy().contains("node_modules")
+                        })
+                        .filter_map(|e| {
+                            e.path().parent().map(|p| p.to_string_lossy().to_string())
+                        })
+                        .collect::<Vec<_>>()
+                }
+            })
+            .await
+            .unwrap_or_default();
+
+            for pkg_root in tsconfigs {
+                if let Some(mgr) = lsp_pool.get_with_root(".ts", pkg_root.clone()) {
+                    tokio::spawn(async move {
+                        if let Err(e) = mgr.ensure_started().await {
+                            tracing::warn!(root = %pkg_root, "LSP prewarm failed: {e}");
+                        }
+                    });
+                }
+            }
+        });
     }
 }
 

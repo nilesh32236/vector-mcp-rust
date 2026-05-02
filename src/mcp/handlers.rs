@@ -199,6 +199,9 @@ async fn handle_set_project_root(
         *root = path.clone();
     }
 
+    // Invalidate cached LSP sessions so the next call creates fresh ones for the new root.
+    server.lsp_pool.invalidate_all();
+
     // Send signal to reload the watcher
     if let Err(e) = server.reload_watcher_tx.send(path.clone()).await {
         tracing::warn!("Failed to send watcher reload signal: {}", e);
@@ -234,25 +237,46 @@ async fn handle_find_duplicate_code(
     let target_path = require_string_arg(params, "target_path")?;
     let records = server.store.get_records_by_path(&target_path).await?;
 
-    if records.is_empty() {
-        return Ok(CallToolResult::text(format!(
-            "No indexed content found for: {target_path}"
-        )));
-    }
+    let (combined, is_fallback) = if records.is_empty() {
+        // Structural index empty — fall back to a vector search on the path string.
+        let fallback_vec =
+            embed_query_blocking(Arc::clone(&server.embedder), target_path.clone()).await?;
+        let fallback = server
+            .store
+            .hybrid_search(fallback_vec, &target_path, 5, None)
+            .await?;
+        if fallback.is_empty() {
+            return Ok(CallToolResult::text(format!(
+                "No indexed content found for: {target_path}"
+            )));
+        }
+        let text = fallback
+            .iter()
+            .map(|r| r.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        (text, true)
+    } else {
+        let text = records
+            .iter()
+            .map(|r| r.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        (text, false)
+    };
 
-    // Combine all chunk content and embed once instead of N separate searches.
-    let combined: String = records
-        .iter()
-        .map(|r| r.content.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
     let vector = embed_query_blocking(Arc::clone(&server.embedder), combined.clone()).await?;
     let matches = server
         .store
         .hybrid_search(vector, &combined, 10, None)
         .await?;
 
-    let mut out = format!("## Duplicate Code Analysis for {target_path}\n\n");
+    let label = if is_fallback {
+        format!("## Duplicate Code Analysis for {target_path} *(approximate — vector fallback)*\n\n")
+    } else {
+        format!("## Duplicate Code Analysis for {target_path}\n\n")
+    };
+    let mut out = label;
     let mut found = false;
     for m in matches {
         if m.metadata_str("path") != target_path {
@@ -764,6 +788,63 @@ async fn handle_analyze_architecture(
         }
     }
 
+    // Also read every package.json in the workspace directly so that
+    // devDependencies (and any deps not captured in indexed metadata) are included.
+    let root_clone = root.clone();
+    let pkg_jsons = tokio::task::spawn_blocking(move || {
+        let walker = ignore::WalkBuilder::new(&root_clone)
+            .standard_filters(true)
+            .hidden(true)
+            .build();
+        walker
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_type().map(|ft| ft.is_file()).unwrap_or(false)
+                    && e.file_name() == "package.json"
+                    && !e.path().to_string_lossy().contains("node_modules")
+            })
+            .map(|e| e.path().to_path_buf())
+            .collect::<Vec<_>>()
+    })
+    .await?;
+
+    for pkg_path in pkg_jsons {
+        let Ok(content) = std::fs::read_to_string(&pkg_path) else {
+            continue;
+        };
+        let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&content) else {
+            continue;
+        };
+
+        // Derive the package's own name / path segment.
+        let rel_pkg = pkg_path
+            .parent()
+            .and_then(|p| p.strip_prefix(&root).ok())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if rel_pkg.is_empty() {
+            continue;
+        }
+        let parts: Vec<&str> = rel_pkg.split('/').collect();
+        let src_pkg = if parts.len() >= 2 && (parts[0] == "apps" || parts[0] == "packages") {
+            format!("{}/{}", parts[0], parts[1])
+        } else {
+            parts[0].to_string()
+        };
+
+        for dep_key in ["dependencies", "devDependencies"] {
+            if let Some(deps) = manifest[dep_key].as_object() {
+                for dep_name in deps.keys() {
+                    if monorepo_prefix.is_empty() || dep_name.starts_with(&monorepo_prefix) {
+                        adj.entry(src_pkg.clone())
+                            .or_default()
+                            .insert(dep_name.clone());
+                    }
+                }
+            }
+        }
+    }
+
     if adj.is_empty() {
         return Ok(CallToolResult::text(
             "No inter-package dependencies found in the indexed codebase.",
@@ -802,6 +883,33 @@ fn is_source_file(path: &str) -> bool {
     SOURCE_EXTENSIONS.contains(&ext)
 }
 
+/// Returns `true` if `path` is a Next.js App Router framework entry point.
+///
+/// These files export symbols that are consumed by the framework itself, not
+/// by other application code, so they must be excluded from dead-code analysis.
+fn is_nextjs_framework_file(path: &str) -> bool {
+    let p = std::path::Path::new(path);
+    let file_stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let ext = p.extension().and_then(|s| s.to_str()).unwrap_or("");
+
+    // middleware.ts / middleware.js at any depth
+    if (file_stem == "middleware") && matches!(ext, "ts" | "js" | "tsx" | "jsx") {
+        return true;
+    }
+
+    // app/**/page.tsx, app/**/layout.tsx, app/**/route.ts, app/**/loading.tsx,
+    // app/**/error.tsx, app/**/not-found.tsx, app/**/template.tsx
+    let next_app_entries = [
+        "page", "layout", "route", "loading", "error", "not-found", "template",
+    ];
+    if next_app_entries.contains(&file_stem) && matches!(ext, "ts" | "tsx" | "js" | "jsx") {
+        // Check that the file lives under an `app/` directory segment.
+        return path.contains("/app/") || path.starts_with("app/");
+    }
+
+    false
+}
+
 async fn handle_find_dead_code(server: &Server, params: &CallToolParams) -> Result<CallToolResult> {
     let is_library = params
         .arguments
@@ -820,6 +928,10 @@ async fn handle_find_dead_code(server: &Server, params: &CallToolParams) -> Resu
         }
         source_record_count += 1;
         if path.contains("test") || path.contains("spec") {
+            continue;
+        }
+        // Next.js App Router entry points are consumed by the framework — not dead code.
+        if is_nextjs_framework_file(&path) {
             continue;
         }
         if is_library && !path.contains("internal") && !path.contains("private") {
@@ -981,6 +1093,7 @@ async fn handle_search_codebase(
 }
 
 async fn handle_get_indexing_diagnostics(server: &Server) -> Result<CallToolResult> {
+    let chunk_count = server.store.code_vectors.count_rows(None).await.unwrap_or(0);
     let p = server.indexing_progress.read().unwrap();
     let status = if p.status.is_empty() {
         "idle".to_string()
@@ -999,8 +1112,8 @@ async fn handle_get_indexing_diagnostics(server: &Server) -> Result<CallToolResu
     };
 
     let out = format!(
-        "## Indexing Diagnostics\n\n- **Status**: {}\n- **Current File**: {}\n- **Files Indexed**: {}\n- **Recent Errors**: {}",
-        status, current_file, p.indexed_files, errors_str
+        "## Indexing Diagnostics\n\n- **Status**: {}\n- **Current File**: {}\n- **Total Chunks (LanceDB)**: {}\n- **Files Indexed (session)**: {}\n- **Recent Errors**: {}",
+        status, current_file, chunk_count, p.indexed_files, errors_str
     );
     Ok(CallToolResult::text(out))
 }
@@ -1131,9 +1244,18 @@ async fn handle_list_api_endpoints(
         let matches = server.store.lexical_search(kw, 20, None).await?;
         for m in matches {
             let meta = m.metadata_json();
+            let path = meta["path"].as_str().unwrap_or("");
+            // Skip documentation files and non-source directories.
+            if path.ends_with(".md")
+                || path.contains("/docs/")
+                || path.contains("/node_modules/")
+                || path.contains("/.kiro/")
+            {
+                continue;
+            }
             let key = format!(
                 "{}:{}",
-                meta["path"].as_str().unwrap_or(""),
+                path,
                 meta["start_line"].as_u64().unwrap_or(0)
             );
             unique.insert(key, m);
@@ -2830,7 +2952,7 @@ pub async fn handle_lsp_query(server: &Server, params: &CallToolParams) -> Resul
         )));
     }
 
-    let lsp = match server.lsp_pool.get(&ext) {
+    let lsp = match server.lsp_pool.get_for_path(&path) {
         Some(l) => l,
         None => {
             return Ok(CallToolResult::error(format!(
@@ -2915,11 +3037,23 @@ pub async fn handle_distill_package_purpose(
     let pkg_path = require_string_arg(params, "path")?;
     let records = server.store.get_records_by_path(&pkg_path).await?;
 
-    if records.is_empty() {
-        return Ok(CallToolResult::error(format!(
-            "No indexed content for path: {pkg_path}"
-        )));
-    }
+    let (records, is_fallback) = if records.is_empty() {
+        // Structural index empty — fall back to vector search.
+        let fallback_vec =
+            embed_query_blocking(Arc::clone(&server.embedder), pkg_path.clone()).await?;
+        let fallback = server
+            .store
+            .hybrid_search(fallback_vec, &pkg_path, 10, None)
+            .await?;
+        if fallback.is_empty() {
+            return Ok(CallToolResult::error(format!(
+                "No indexed content for path: {pkg_path}"
+            )));
+        }
+        (fallback, true)
+    } else {
+        (records, false)
+    };
 
     let mut content = String::new();
     for r in &records {
@@ -2978,6 +3112,7 @@ pub async fn handle_distill_package_purpose(
     server.store.upsert_records(vec![record]).await?;
 
     Ok(CallToolResult::text(format!(
-        "### ✅ Package Distilled\n\n**Path**: {pkg_path}\n\n{summary}\n\n*Re-indexed with 2.0x priority.*"
+        "### ✅ Package Distilled{}\n\n**Path**: {pkg_path}\n\n{summary}\n\n*Re-indexed with 2.0x priority.*",
+        if is_fallback { " *(approximate — vector fallback)*" } else { "" }
     )))
 }
