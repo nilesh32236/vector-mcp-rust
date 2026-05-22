@@ -47,6 +47,9 @@ pub fn get_directory_tree(path: &std::path::Path, max_depth: usize) -> Result<St
             }
 
             item_count += 1;
+            // ⚡ Bolt Performance Optimization:
+            // Replaced out.push_str(&format!(...)) with write! macro to avoid allocating
+            // an intermediate String for every line appended to the directory tree.
             use std::fmt::Write;
             let _ = writeln!(&mut out, "{}├── {}", "│   ".repeat(depth - 1), name);
         }
