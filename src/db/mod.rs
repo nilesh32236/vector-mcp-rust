@@ -136,12 +136,6 @@ impl LexicalIndex {
         Ok(())
     }
 
-    /// Remove without committing — call `commit()` after a batch.
-    fn remove_no_commit(&self, doc_id: &str) -> Result<()> {
-        let writer = self.writer.write().unwrap();
-        writer.delete_term(Term::from_field_text(self.fields.id, doc_id));
-        Ok(())
-    }
 
     /// Add without committing — call `commit()` after a batch.
     fn add_no_commit(&self, doc_id: &str, text: &str) -> Result<()> {

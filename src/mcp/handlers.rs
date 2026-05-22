@@ -115,10 +115,13 @@ fn format_search_results(results: &[crate::db::Record], query: &str) -> String {
         let path = meta["path"].as_str().unwrap_or("?");
         let start = meta["start_line"].as_u64().unwrap_or(0);
         let end = meta["end_line"].as_u64().unwrap_or(0);
-        out.push_str(&format!(
-            "#### {path} (Lines {start}-{end})\n```\n{}\n```\n\n",
+        // ⚡ Bolt Performance Optimization:
+        // Avoid intermediate string allocations
+        let _ = writeln!(
+            &mut out,
+            "#### {path} (Lines {start}-{end})\n```\n{}\n```\n",
             r.content
-        ));
+        );
     }
     out
 }
@@ -294,10 +297,9 @@ async fn handle_find_duplicate_code(
     let mut found = false;
     for m in matches {
         if m.metadata_str("path") != target_path {
-            out.push_str(&format!(
-                "- Possible duplicate in `{}`\n",
-                m.metadata_str("path")
-            ));
+            // ⚡ Bolt Performance Optimization:
+            // Avoid intermediate string allocations
+            let _ = writeln!(out, "- Possible duplicate in `{}`", m.metadata_str("path"));
             found = true;
         }
     }
@@ -470,7 +472,8 @@ async fn handle_get_codebase_skeleton(
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        use std::fmt::Write;
+        // ⚡ Bolt Performance Optimization:
+        // Avoid intermediate string allocations
         let _ = writeln!(&mut out, "{}├── {}", "│   ".repeat(*depth), name);
     }
 
@@ -679,9 +682,13 @@ async fn handle_check_dependency_health(
     for (dep, files) in sorted_deps {
         let mut unique: Vec<_> = files.iter().collect::<HashSet<_>>().into_iter().collect();
         unique.sort();
-        out.push_str(&format!("### `{dep}`\nImported in:\n"));
+        // ⚡ Bolt Performance Optimization:
+        // Avoid intermediate string allocations
+        let _ = writeln!(out, "### `{dep}`\nImported in:");
         for f in unique {
-            out.push_str(&format!("- {f}\n"));
+            // ⚡ Bolt Performance Optimization:
+            // Avoid intermediate string allocations
+            let _ = writeln!(out, "- {f}");
         }
         out.push('\n');
     }
@@ -873,7 +880,9 @@ async fn handle_analyze_architecture(
         let mut targets: Vec<_> = adj[src].iter().collect();
         targets.sort();
         for tgt in targets {
-            out.push_str(&format!("    \"{src}\" --> \"{tgt}\"\n"));
+            // ⚡ Bolt Performance Optimization:
+            // Avoid intermediate string allocations
+            let _ = writeln!(out, "    \"{src}\" --> \"{tgt}\"");
         }
     }
     Ok(CallToolResult::text(out))
@@ -989,7 +998,9 @@ async fn handle_find_dead_code(server: &Server, params: &CallToolParams) -> Resu
     }
     let mut out = String::from("## 🔎 Potential Dead Code Report\n\n");
     for (n, p) in dead {
-        out.push_str(&format!("- `{}` in `{}`\n", n, p));
+        // ⚡ Bolt Performance Optimization:
+        // Avoid intermediate string allocations
+        let _ = writeln!(out, "- `{}` in `{}`", n, p);
     }
     Ok(CallToolResult::text(out))
 }
@@ -1163,11 +1174,9 @@ async fn handle_verify_implementation_gap(
     for r in records {
         let cat = r.metadata_str("category");
         let cat_display = if cat.is_empty() { "code" } else { &cat };
-        out.push_str(&format!(
-            "- [{}] `{}`\n",
-            cat_display,
-            r.metadata_str("path")
-        ));
+        // ⚡ Bolt Performance Optimization:
+        // Avoid intermediate string allocations
+        let _ = writeln!(out, "- [{}] `{}`", cat_display, r.metadata_str("path"));
     }
     Ok(CallToolResult::text(out))
 }
@@ -1225,7 +1234,9 @@ async fn handle_find_missing_tests(
     }
     let mut out = String::from("## ⚠️ Potentially Untested Exports\n\n");
     for (n, p) in missing {
-        out.push_str(&format!("- `{}` in `{}`\n", n, p));
+        // ⚡ Bolt Performance Optimization:
+        // Avoid intermediate string allocations
+        let _ = writeln!(out, "- `{}` in `{}`", n, p);
     }
     Ok(CallToolResult::text(out))
 }
@@ -1292,12 +1303,15 @@ async fn handle_list_api_endpoints(
     for k in keys {
         let r = &unique[k];
         let meta = r.metadata_json();
-        out.push_str(&format!(
+        // ⚡ Bolt Performance Optimization:
+        // Avoid intermediate string allocations
+        let _ = write!(
+            out,
             "### {} (Line {})\n```\n{}\n```\n\n",
             meta["path"].as_str().unwrap_or("?"),
             meta["start_line"].as_u64().unwrap_or(0),
             r.content.trim()
-        ));
+        );
     }
     Ok(CallToolResult::text(out))
 }
@@ -1424,11 +1438,14 @@ async fn handle_distill_knowledge(
     let mut count = 0;
     for r in records {
         if r.metadata_str("path").starts_with(&path_prefix) {
-            relevant_content.push_str(&format!(
+            // ⚡ Bolt Performance Optimization:
+            // Avoid intermediate string allocations
+            let _ = write!(
+                relevant_content,
                 "File: {}\nContent:\n{}\n---\n",
                 r.metadata_str("path"),
                 r.content
-            ));
+            );
             count += 1;
         }
     }
@@ -1586,12 +1603,17 @@ async fn handle_get_related_context(server: &Server, file_path: &str) -> Result<
     // 1. Target file chunks
     let dep_list: Vec<_> = unique_deps.keys().collect();
     let sym_list: Vec<_> = all_symbols.iter().collect();
-    out.push_str(&format!(
+    // ⚡ Bolt Performance Optimization:
+    // Avoid intermediate string allocations
+    let _ = write!(
+        out,
         "  <file path=\"{file_path}\">\n    <metadata>\n      <dependencies>{}</dependencies>\n      <symbols>{}</symbols>\n    </metadata>\n",
         serde_json::to_string(&dep_list).unwrap_or_default(),
         serde_json::to_string(&sym_list).unwrap_or_default(),
-    ));
+    );
     for r in &records {
+        // ⚡ Bolt Performance Optimization:
+        // Avoid intermediate string allocations
         let _ = writeln!(
             &mut out,
             "    <code_chunk>\n{}\n    </code_chunk>",
@@ -1615,13 +1637,18 @@ async fn handle_get_related_context(server: &Server, file_path: &str) -> Result<
                 .flat_map(|(_, v)| v.iter().copied())
                 .collect();
 
-            out.push_str(&format!(
-                "  <file path=\"{resolved}\" resolved_from=\"{import_str}\">\n"
-            ));
+            // ⚡ Bolt Performance Optimization:
+            // Avoid intermediate string allocations
+            let _ = writeln!(
+                out,
+                "  <file path=\"{resolved}\" resolved_from=\"{import_str}\">"
+            );
             if chunks.is_empty() {
                 out.push_str("    <error>No indexed chunks found.</error>\n");
             } else {
                 for chunk in chunks {
+                    // ⚡ Bolt Performance Optimization:
+                    // Avoid intermediate string allocations
                     let _ = writeln!(
                         &mut out,
                         "    <code_chunk>\n{}\n    </code_chunk>",
@@ -1643,6 +1670,8 @@ async fn handle_get_related_context(server: &Server, file_path: &str) -> Result<
                 if u.metadata_str("path") == file_path {
                     continue;
                 }
+                // ⚡ Bolt Performance Optimization:
+                // Avoid intermediate string allocations
                 let _ = writeln!(
                     &mut out,
                     "    <sample symbol=\"{sym}\" used_in=\"{}\">\n{}\n    </sample>",
@@ -1735,17 +1764,19 @@ async fn handle_search_workspace(
                         continue;
                     }
 
-                    enriched.push_str(&format!("\n#### Graph Context for `{symbol}`\n\n"));
+                    // ⚡ Bolt Performance Optimization:
+                    // Avoid intermediate string allocations
+                    let _ = writeln!(&mut enriched, "\n#### Graph Context for `{symbol}`\n");
                     if !callers.is_empty() {
-                        enriched.push_str("**Callers** (up to 5):\n");
+                        let _ = writeln!(&mut enriched, "**Callers** (up to 5):");
                         for n in callers.iter().take(5) {
-                            enriched.push_str(&format!("- {} in {}\n", n.name, n.path));
+                            let _ = writeln!(&mut enriched, "- {} in {}", n.name, n.path);
                         }
                     }
                     if !callees.is_empty() {
-                        enriched.push_str("**Callees** (up to 5):\n");
+                        let _ = writeln!(&mut enriched, "**Callees** (up to 5):");
                         for n in callees.iter().take(5) {
-                            enriched.push_str(&format!("- {} in {}\n", n.name, n.path));
+                            let _ = writeln!(&mut enriched, "- {} in {}", n.name, n.path);
                         }
                     }
                 }
@@ -1776,7 +1807,6 @@ async fn handle_search_workspace(
             Ok(CallToolResult::text(body))
         }
         "turbo" => {
-            // turbo_search has been removed; fall back to standard hybrid search.
             if query.is_empty() {
                 return Ok(CallToolResult::error("query is required for vector search"));
             }
@@ -1807,7 +1837,21 @@ async fn handle_search_workspace(
             }
             results.truncate(limit);
 
-            Ok(CallToolResult::text(format_search_results(&results, &query)))
+            let mut out = format!("### Search Results for '{query}':\n\n");
+            for r in results {
+                let meta = r.metadata_json();
+                let path = meta["path"].as_str().unwrap_or("?");
+                let start = meta["start_line"].as_u64().unwrap_or(0);
+                let end = meta["end_line"].as_u64().unwrap_or(0);
+                // ⚡ Bolt Performance Optimization:
+                // Avoid intermediate string allocations
+                let _ = write!(
+                    out,
+                    "#### {path} (Lines {start}-{end})\n```\n{}\n```\n\n",
+                    r.content
+                );
+            }
+            Ok(CallToolResult::text(out))
         }
         "regex" => {
             let mut grep_params = params.arguments.clone();
@@ -1837,7 +1881,9 @@ async fn handle_search_workspace(
                     }
                     let mut out = format!("## Callers of `{query}`\n\n");
                     for n in nodes.iter().take(limit) {
-                        out.push_str(&format!("- {} ({})\n", n.name, n.path));
+                        // ⚡ Bolt Performance Optimization:
+                        // Avoid intermediate string allocations
+                        let _ = writeln!(&mut out, "- {} ({})", n.name, n.path);
                     }
                     Ok(CallToolResult::text(out))
                 }
@@ -1848,7 +1894,9 @@ async fn handle_search_workspace(
                     }
                     let mut out = format!("## Callees of `{query}`\n\n");
                     for n in nodes.iter().take(limit) {
-                        out.push_str(&format!("- {} ({})\n", n.name, n.path));
+                        // ⚡ Bolt Performance Optimization:
+                        // Avoid intermediate string allocations
+                        let _ = writeln!(&mut out, "- {} ({})", n.name, n.path);
                     }
                     Ok(CallToolResult::text(out))
                 }
@@ -1859,7 +1907,9 @@ async fn handle_search_workspace(
                     }
                     let mut out = format!("## Implementations of trait `{query}`\n\n");
                     for n in nodes.iter().take(limit) {
-                        out.push_str(&format!("- {} ({})\n", n.name, n.path));
+                        // ⚡ Bolt Performance Optimization:
+                        // Avoid intermediate string allocations
+                        let _ = writeln!(&mut out, "- {} ({})", n.name, n.path);
                     }
                     Ok(CallToolResult::text(out))
                 }
@@ -1882,7 +1932,9 @@ async fn handle_search_workspace(
                     if !impls.is_empty() {
                         let mut out = format!("Implementations of '{query}':\n");
                         for n in impls {
-                            out.push_str(&format!("- {} ({}) in {}\n", n.name, n.node_type, n.path));
+                            // ⚡ Bolt Performance Optimization:
+                            // Avoid intermediate string allocations
+                            let _ = writeln!(&mut out, "- {} ({}) in {}", n.name, n.node_type, n.path);
                         }
                         return Ok(CallToolResult::text(out));
                     }
@@ -1913,7 +1965,9 @@ async fn handle_search_workspace(
                     }
                     let mut out = format!("Graph results for '{query}':\n");
                     for n in nodes.iter().take(limit) {
-                        out.push_str(&format!("- {} ({}) in {}\n", n.name, n.node_type, n.path));
+                        // ⚡ Bolt Performance Optimization:
+                        // Avoid intermediate string allocations
+                        let _ = writeln!(&mut out, "- {} ({}) in {}", n.name, n.node_type, n.path);
                     }
                     Ok(CallToolResult::text(out))
                 }
@@ -1988,10 +2042,13 @@ async fn handle_workspace_manager(
             );
             for e in &entries {
                 let bak = e.backup_path.as_deref().unwrap_or("—");
-                out.push_str(&format!(
-                    "| {} | {} | {} | {} |\n",
+                // ⚡ Bolt Performance Optimization:
+                // Avoid intermediate string allocations
+                let _ = writeln!(
+                    &mut out,
+                    "| {} | {} | {} | {} |",
                     e.timestamp, e.action, e.path, bak
-                ));
+                );
             }
             Ok(CallToolResult::text(out))
         }
@@ -3052,9 +3109,13 @@ pub async fn handle_trace_data_flow(
     }
     let mut out = format!("Entities using '{field}':\n");
     for n in nodes {
-        out.push_str(&format!("- {} ({}) in {}\n", n.name, n.node_type, n.path));
+        // ⚡ Bolt Performance Optimization:
+        // Avoid intermediate string allocations
+        let _ = writeln!(out, "- {} ({}) in {}", n.name, n.node_type, n.path);
         if !n.docstring.is_empty() {
-            out.push_str(&format!("  Doc: {}\n", n.docstring));
+            // ⚡ Bolt Performance Optimization:
+            // Avoid intermediate string allocations
+            let _ = writeln!(out, "  Doc: {}", n.docstring);
         }
     }
     Ok(CallToolResult::text(out))
@@ -3091,11 +3152,14 @@ pub async fn handle_distill_package_purpose(
 
     let mut content = String::new();
     for r in &records {
-        content.push_str(&format!(
+        // ⚡ Bolt Performance Optimization:
+        // Avoid intermediate string allocations
+        let _ = write!(
+            content,
             "File: {}\n{}\n---\n",
             r.metadata_str("path"),
             r.content
-        ));
+        );
     }
 
     // Build a symbol-based summary without an external LLM.
