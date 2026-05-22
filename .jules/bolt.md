@@ -14,3 +14,7 @@
 ## 2026-04-17 - [N+1 IO bottlenecks in IndexWriter deletions]
 **Learning:** Iterating over a collection of documents and calling `delete_term()` followed by `commit()` on a Tantivy `IndexWriter` inside the loop creates an N+1 IO bottleneck. Each `commit()` forces disk synchronization, which is severely slow for bulk operations.
 **Action:** Batch document deletions by exposing a `remove_no_commit()` method that only deletes the term. Call this method in the loop, and execute a single `commit()` on the writer after the loop finishes. Be careful not to hold a mutable reference (`let mut writer`) if the underlying `RwLockWriteGuard` allows mutation through `DerefMut` without it, to avoid unused mut warnings.
+
+## 2024-05-18 - [Avoid intermediate string allocations in loops with writeln!]
+**Learning:** Using `out.push_str(&format!(...))` inside loops, such as when building a directory tree recursively or iterating over many items, causes intermediate String allocations on the heap for every single iteration. For a directory tree with 1,000 items, this is 1,000 unnecessary allocations. Using the `write!` or `writeln!` macros from `std::fmt::Write` allows appending formatted content directly to the existing buffer, skipping the intermediate allocation entirely.
+**Action:** Always prefer `writeln!(&mut out, ...)` or `write!(&mut out, ...)` over `out.push_str(&format!(...))` inside loops or performance-sensitive areas to minimize heap allocations.
