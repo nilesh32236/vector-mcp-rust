@@ -91,7 +91,11 @@ fn setup_logging(
 fn init_llm_components(
     cfg: &Config,
     mode: &str,
-) -> (Option<Arc<LlamaEngine>>, Arc<Embedder>, Option<Arc<LlmWorker>>) {
+) -> (
+    Option<Arc<LlamaEngine>>,
+    Arc<Embedder>,
+    Option<Arc<LlmWorker>>,
+) {
     let engine_opt: Option<Arc<LlamaEngine>> = match LlamaEngine::new_with_config(
         &cfg.models_dir,
         Some(&cfg.kv_cache_dir),
@@ -133,25 +137,35 @@ fn init_llm_components(
 
 async fn init_components(
     cfg: &Config,
-) -> Result<(Arc<Store>, Arc<Embedder>, Arc<Summarizer>, Option<Arc<LlmWorker>>, Option<Arc<SemanticRouter>>)> {
+) -> Result<(
+    Arc<Store>,
+    Arc<Embedder>,
+    Arc<Summarizer>,
+    Option<Arc<LlmWorker>>,
+    Option<Arc<SemanticRouter>>,
+)> {
     let db_uri = cfg.db_path.display().to_string();
     let store = db::connect_store(&db_uri, cfg.dimension, false).await?;
     info!("LanceDB connected — tables initialised");
 
     let (_engine_opt, embedder, worker_opt) = init_llm_components(cfg, "master");
 
-    let summarizer = Arc::new(Summarizer::new(
-        if cfg.feature_toggles.enable_local_llm {
-            worker_opt.clone()
-        } else {
-            None
-        },
-    ));
+    let summarizer = Arc::new(Summarizer::new(if cfg.feature_toggles.enable_local_llm {
+        worker_opt.clone()
+    } else {
+        None
+    }));
 
     // Build SemanticRouter from prototype embeddings (non-fatal if embedder is degraded).
     let semantic_router = Arc::new(SemanticRouter::build(&embedder));
 
-    Ok((Arc::new(store), embedder, summarizer, worker_opt, Some(semantic_router)))
+    Ok((
+        Arc::new(store),
+        embedder,
+        summarizer,
+        worker_opt,
+        Some(semantic_router),
+    ))
 }
 
 async fn start_background_tasks(

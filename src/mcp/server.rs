@@ -51,6 +51,7 @@ pub struct Server {
 }
 
 impl Server {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store: Arc<Store>,
         config: Arc<Config>,
@@ -291,9 +292,7 @@ impl Server {
                                 && e.file_name() == "tsconfig.json"
                                 && !e.path().to_string_lossy().contains("node_modules")
                         })
-                        .filter_map(|e| {
-                            e.path().parent().map(|p| p.to_string_lossy().to_string())
-                        })
+                        .filter_map(|e| e.path().parent().map(|p| p.to_string_lossy().to_string()))
                         .collect::<Vec<_>>()
                 }
             })

@@ -309,7 +309,10 @@ pub async fn scan_project(
                 }
             }
             Err(e) => {
-                error!("Failed to fetch records for KnowledgeGraph rebuild: {:?}", e);
+                error!(
+                    "Failed to fetch records for KnowledgeGraph rebuild: {:?}",
+                    e
+                );
                 // Do NOT reset status here — the scan already completed successfully
                 // and status is already "Ready". Overwriting it would hide the fact
                 // that the graph rebuild failed while search still works.

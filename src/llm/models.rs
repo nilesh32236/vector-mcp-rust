@@ -1,9 +1,9 @@
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use llama_cpp_2::{
     context::params::{LlamaContextParams, LlamaPoolingType},
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
-    model::{params::LlamaModelParams, AddBos, LlamaModel},
+    model::{AddBos, LlamaModel, params::LlamaModelParams},
     sampling::LlamaSampler,
 };
 use sha2::{Digest, Sha256};
@@ -55,8 +55,8 @@ impl LlamaEngine {
         reranker_model_path: Option<&Path>,
         embed_model_path: Option<&Path>,
     ) -> Result<Self> {
-        let backend = LlamaBackend::init()
-            .map_err(|e| anyhow!("Failed to initialise LlamaBackend: {e}"))?;
+        let backend =
+            LlamaBackend::init().map_err(|e| anyhow!("Failed to initialise LlamaBackend: {e}"))?;
 
         let model_params = LlamaModelParams::default()
             .with_n_gpu_layers(1000)
@@ -71,7 +71,9 @@ impl LlamaEngine {
         let mut coder_path = models_dir.join("qwen2.5-coder-1.5b-instruct-q4_k_m.gguf");
         if !coder_path.exists() {
             if let Ok(home) = std::env::var("HOME") {
-                let fallback = Path::new(&home).join(".local/share/vector-mcp-rust/models/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf");
+                let fallback = Path::new(&home).join(
+                    ".local/share/vector-mcp-rust/models/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf",
+                );
                 if fallback.exists() {
                     coder_path = fallback;
                 }
@@ -84,9 +86,9 @@ impl LlamaEngine {
             coder_path.display()
         );
 
-        let embed_path = embed_model_path.map(std::path::PathBuf::from).unwrap_or_else(|| {
-            models_dir.join("e5-small-v2.Q8_0.gguf")
-        });
+        let embed_path = embed_model_path
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| models_dir.join("e5-small-v2.Q8_0.gguf"));
         anyhow::ensure!(
             embed_path.exists(),
             "Embed model not found at: {}",
@@ -94,10 +96,20 @@ impl LlamaEngine {
         );
 
         let coder_model = LlamaModel::load_from_file(&backend, &coder_path, &model_params)
-            .map_err(|e| anyhow!("Failed to load coder model from {}: {e}", coder_path.display()))?;
+            .map_err(|e| {
+                anyhow!(
+                    "Failed to load coder model from {}: {e}",
+                    coder_path.display()
+                )
+            })?;
 
         let embed_model = LlamaModel::load_from_file(&backend, &embed_path, &model_params)
-            .map_err(|e| anyhow!("Failed to load embed model from {}: {e}", embed_path.display()))?;
+            .map_err(|e| {
+                anyhow!(
+                    "Failed to load embed model from {}: {e}",
+                    embed_path.display()
+                )
+            })?;
 
         // Optionally load the reranker model — non-fatal if absent.
         let reranker_model = reranker_model_path.and_then(|p| {
@@ -171,8 +183,7 @@ impl LlamaEngine {
         // Dynamic n_ctx: next power-of-two >= token_count + 64 (generation budget), capped at 2048.
         let n_ctx = next_pow2_ctx(tokens.len() + 64, 512, 2048);
 
-        let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(n_ctx));
+        let ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(n_ctx));
 
         let mut ctx = self
             .coder_model
@@ -290,7 +301,7 @@ impl LlamaEngine {
         tokens.truncate(n_ctx as usize);
 
         // Only force Mean pooling if the model doesn't have internal pooling.
-        // For models like Jina, this is required. For others, it might override 
+        // For models like Jina, this is required. For others, it might override
         // to Mean instead of CLS, which is acceptable for benchmarking.
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(n_ctx))
@@ -338,13 +349,11 @@ impl LlamaEngine {
     /// When no reranker model is loaded, returns an identity ranking
     /// `[(0, 0.0), (1, 0.0), ...]` so callers can always use the result
     /// without special-casing the absent-model path.
-    pub fn rerank_results(
-        &self,
-        query: &str,
-        candidates: &[String],
-    ) -> Result<Vec<(usize, f32)>> {
+    pub fn rerank_results(&self, query: &str, candidates: &[String]) -> Result<Vec<(usize, f32)>> {
         if self.reranker_model.is_none() {
-            tracing::debug!("rerank_results: no reranker model loaded — returning identity ranking");
+            tracing::debug!(
+                "rerank_results: no reranker model loaded — returning identity ranking"
+            );
             return Ok((0..candidates.len()).map(|i| (i, 0.0_f32)).collect());
         }
 
@@ -353,9 +362,7 @@ impl LlamaEngine {
             .iter()
             .enumerate()
             .map(|(i, candidate)| {
-                let score = self
-                    .score_pair(query, candidate)
-                    .unwrap_or(0.0);
+                let score = self.score_pair(query, candidate).unwrap_or(0.0);
                 (i, score)
             })
             .collect();
@@ -382,7 +389,7 @@ impl LlamaEngine {
             .map_err(|e| anyhow!("Reranker tokenization failed: {e}"))?;
 
         let token_count = tokens.len().min(512);
-        let n_ctx = (token_count as u32).next_power_of_two().max(64).min(512);
+        let n_ctx = (token_count as u32).next_power_of_two().clamp(64, 512);
 
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(n_ctx))

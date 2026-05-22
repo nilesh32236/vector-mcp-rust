@@ -289,7 +289,9 @@ async fn handle_find_duplicate_code(
         .await?;
 
     let label = if is_fallback {
-        format!("## Duplicate Code Analysis for {target_path} *(approximate — vector fallback)*\n\n")
+        format!(
+            "## Duplicate Code Analysis for {target_path} *(approximate — vector fallback)*\n\n"
+        )
     } else {
         format!("## Duplicate Code Analysis for {target_path}\n\n")
     };
@@ -924,7 +926,13 @@ fn is_nextjs_framework_file(path: &str) -> bool {
     // app/**/page.tsx, app/**/layout.tsx, app/**/route.ts, app/**/loading.tsx,
     // app/**/error.tsx, app/**/not-found.tsx, app/**/template.tsx
     let next_app_entries = [
-        "page", "layout", "route", "loading", "error", "not-found", "template",
+        "page",
+        "layout",
+        "route",
+        "loading",
+        "error",
+        "not-found",
+        "template",
     ];
     if next_app_entries.contains(&file_stem) && matches!(ext, "ts" | "tsx" | "js" | "jsx") {
         // Check that the file lives under an `app/` directory segment.
@@ -1119,7 +1127,12 @@ async fn handle_search_codebase(
 }
 
 async fn handle_get_indexing_diagnostics(server: &Server) -> Result<CallToolResult> {
-    let chunk_count = server.store.code_vectors.count_rows(None).await.unwrap_or(0);
+    let chunk_count = server
+        .store
+        .code_vectors
+        .count_rows(None)
+        .await
+        .unwrap_or(0);
     let p = server.indexing_progress.read().unwrap();
     let status = if p.status.is_empty() {
         "idle".to_string()
@@ -1279,11 +1292,7 @@ async fn handle_list_api_endpoints(
             {
                 continue;
             }
-            let key = format!(
-                "{}:{}",
-                path,
-                meta["start_line"].as_u64().unwrap_or(0)
-            );
+            let key = format!("{}:{}", path, meta["start_line"].as_u64().unwrap_or(0));
             unique.insert(key, m);
         }
     }
@@ -1934,7 +1943,8 @@ async fn handle_search_workspace(
                         for n in impls {
                             // ⚡ Bolt Performance Optimization:
                             // Avoid intermediate string allocations
-                            let _ = writeln!(&mut out, "- {} ({}) in {}", n.name, n.node_type, n.path);
+                            let _ =
+                                writeln!(&mut out, "- {} ({}) in {}", n.name, n.node_type, n.path);
                         }
                         return Ok(CallToolResult::text(out));
                     }
@@ -2019,22 +2029,24 @@ async fn handle_workspace_manager(
         "get_indexing_diagnostics" => handle_get_indexing_diagnostics(server).await,
         "store_context" => handle_store_context(server, params).await,
         "delete_context" => handle_delete_context(server, params).await,
-        "clear_kv_cache" => {
-            match &server.llm_worker {
-                Some(worker) => {
-                    match worker.clear_kv_cache().await {
-                        Ok(_) => Ok(CallToolResult::text("KV cache cleared successfully")),
-                        Err(e) => Ok(CallToolResult::error(format!("Failed to clear KV cache: {e}"))),
-                    }
-                }
-                None => Ok(CallToolResult::text("KV cache not active (LLM engine not loaded)")),
-            }
-        }
+        "clear_kv_cache" => match &server.llm_worker {
+            Some(worker) => match worker.clear_kv_cache().await {
+                Ok(_) => Ok(CallToolResult::text("KV cache cleared successfully")),
+                Err(e) => Ok(CallToolResult::error(format!(
+                    "Failed to clear KV cache: {e}"
+                ))),
+            },
+            None => Ok(CallToolResult::text(
+                "KV cache not active (LLM engine not loaded)",
+            )),
+        },
         "list_write_ops" => {
             let n = optional_f64_arg(params, "limit").unwrap_or(20.0) as usize;
             let entries = server.write_log.last_n(n);
             if entries.is_empty() {
-                return Ok(CallToolResult::text("No write operations recorded yet.".to_string()));
+                return Ok(CallToolResult::text(
+                    "No write operations recorded yet.".to_string(),
+                ));
             }
             let mut out = String::from(
                 "| Timestamp | Action | Path | Backup |\n\
@@ -2063,7 +2075,11 @@ async fn handle_workspace_manager(
             };
             let abs_original = match server.path_guard.validate(&original_path, PathOp::Write) {
                 Ok(p) => p,
-                Err(e) => return Ok(CallToolResult::error(format!("Original path rejected: {e}"))),
+                Err(e) => {
+                    return Ok(CallToolResult::error(format!(
+                        "Original path rejected: {e}"
+                    )));
+                }
             };
 
             // Copy backup over original.
@@ -2212,18 +2228,14 @@ async fn handle_write_file(server: &Server, params: &CallToolParams) -> Result<C
             .as_secs();
         let bak = abs.with_extension(format!(
             "{}.bak.{ts}",
-            abs.extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("bak")
+            abs.extension().and_then(|e| e.to_str()).unwrap_or("bak")
         ));
-        std::fs::copy(&abs, &bak)
-            .map_err(|e| anyhow::anyhow!("backup failed: {e}"))?;
+        std::fs::copy(&abs, &bak).map_err(|e| anyhow::anyhow!("backup failed: {e}"))?;
         Some(bak.to_string_lossy().to_string())
     } else {
         // Ensure parent directory exists.
         if let Some(parent) = abs.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| anyhow::anyhow!("mkdir failed: {e}"))?;
+            std::fs::create_dir_all(parent).map_err(|e| anyhow::anyhow!("mkdir failed: {e}"))?;
         }
         None
     };
@@ -2231,9 +2243,7 @@ async fn handle_write_file(server: &Server, params: &CallToolParams) -> Result<C
     // 4. Atomic write via temp file + rename.
     let tmp_path = abs.with_extension(format!(
         "{}.tmp",
-        abs.extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("tmp")
+        abs.extension().and_then(|e| e.to_str()).unwrap_or("tmp")
     ));
     tokio::fs::write(&tmp_path, content.as_bytes())
         .await
@@ -2305,44 +2315,6 @@ fn secs_to_rfc3339(total_secs: u64) -> String {
     format!("{yr:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
 }
 
-#[cfg(test)]
-mod rfc3339_tests {
-    use super::secs_to_rfc3339;
-
-    #[test]
-    fn test_unix_epoch() {
-        assert_eq!(secs_to_rfc3339(0), "1970-01-01T00:00:00Z");
-    }
-
-    #[test]
-    fn test_leap_day_2020() {
-        // 2020-02-29T00:00:00Z = 1582934400
-        assert_eq!(secs_to_rfc3339(1_582_934_400), "2020-02-29T00:00:00Z");
-    }
-
-    #[test]
-    fn test_end_of_year_2020() {
-        // 2020-12-31T23:59:59Z = 1609459199
-        assert_eq!(secs_to_rfc3339(1_609_459_199), "2020-12-31T23:59:59Z");
-    }
-
-    #[test]
-    fn test_new_year_2021() {
-        // 2021-01-01T00:00:00Z = 1609459200
-        assert_eq!(secs_to_rfc3339(1_609_459_200), "2021-01-01T00:00:00Z");
-    }
-
-    #[test]
-    fn test_rfc3339_format() {
-        let s = secs_to_rfc3339(1_700_000_000);
-        // Must match YYYY-MM-DDTHH:MM:SSZ
-        assert!(
-            s.len() == 20 && s.ends_with('Z') && s.chars().nth(10) == Some('T'),
-            "unexpected format: {s}"
-        );
-    }
-}
-
 /// Format a generated doc string into the appropriate comment style for the
 /// given file extension.
 fn format_doc_comment(doc: &str, ext: &str) -> String {
@@ -2407,7 +2379,7 @@ async fn handle_generate_inline_docs(
         None => {
             return Ok(CallToolResult::error(
                 "LLM unavailable — cannot generate documentation",
-            ))
+            ));
         }
     };
 
@@ -2427,7 +2399,7 @@ async fn handle_generate_inline_docs(
         None => {
             return Ok(CallToolResult::error(format!(
                 "Entity '{entity_name}' not found in indexed records for '{path}'"
-            )))
+            )));
         }
     };
 
@@ -2490,8 +2462,8 @@ async fn handle_generate_inline_docs(
         let mut i = 0;
         while i + pat.len() <= bytes.len() {
             if bytes[i..i + pat.len()] == *pat {
-                let before_ok = i == 0
-                    || (!bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_');
+                let before_ok =
+                    i == 0 || (!bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_');
                 let after_ok = i + pat.len() >= bytes.len()
                     || (!bytes[i + pat.len()].is_ascii_alphanumeric()
                         && bytes[i + pat.len()] != b'_');
@@ -2582,19 +2554,10 @@ async fn handle_generate_inline_docs(
 /// known prompt-injection markers.
 fn sanitise_instruction(s: &str) -> anyhow::Result<String> {
     const MAX_LEN: usize = 500;
-    const BLOCKED: &[&str] = &[
-        "<|im_start|>",
-        "<|im_end|>",
-        "[INST]",
-        "[/INST]",
-        "<<SYS>>",
-    ];
+    const BLOCKED: &[&str] = &["<|im_start|>", "<|im_end|>", "[INST]", "[/INST]", "<<SYS>>"];
 
     if s.len() > MAX_LEN {
-        anyhow::bail!(
-            "instruction too long: {} chars (max {MAX_LEN})",
-            s.len()
-        );
+        anyhow::bail!("instruction too long: {} chars (max {MAX_LEN})", s.len());
     }
     for marker in BLOCKED {
         if s.contains(marker) {
@@ -2630,7 +2593,7 @@ async fn handle_propose_refactor(
         None => {
             return Ok(CallToolResult::error(
                 "LLM unavailable — cannot propose refactor",
-            ))
+            ));
         }
     };
 
@@ -2650,7 +2613,7 @@ async fn handle_propose_refactor(
         None => {
             return Ok(CallToolResult::error(format!(
                 "Entity '{entity_name}' not found in indexed records for '{path}'"
-            )))
+            )));
         }
     };
 
@@ -2976,9 +2939,7 @@ fn lsp_install_hint(ext: &str) -> &'static str {
     match ext {
         ".rs" => "rustup component add rust-analyzer",
         ".go" => "go install golang.org/x/tools/gopls@latest",
-        ".ts" | ".tsx" | ".js" | ".jsx" => {
-            "npm install -g typescript-language-server typescript"
-        }
+        ".ts" | ".tsx" | ".js" | ".jsx" => "npm install -g typescript-language-server typescript",
         ".py" => "pip install python-lsp-server",
         _ => "Install the appropriate language server for this file type",
     }
@@ -3211,6 +3172,48 @@ pub async fn handle_distill_package_purpose(
 
     Ok(CallToolResult::text(format!(
         "### ✅ Package Distilled{}\n\n**Path**: {pkg_path}\n\n{summary}\n\n*Re-indexed with 2.0x priority.*",
-        if is_fallback { " *(approximate — vector fallback)*" } else { "" }
+        if is_fallback {
+            " *(approximate — vector fallback)*"
+        } else {
+            ""
+        }
     )))
+}
+
+#[cfg(test)]
+mod rfc3339_tests {
+    use super::secs_to_rfc3339;
+
+    #[test]
+    fn test_unix_epoch() {
+        assert_eq!(secs_to_rfc3339(0), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn test_leap_day_2020() {
+        // 2020-02-29T00:00:00Z = 1582934400
+        assert_eq!(secs_to_rfc3339(1_582_934_400), "2020-02-29T00:00:00Z");
+    }
+
+    #[test]
+    fn test_end_of_year_2020() {
+        // 2020-12-31T23:59:59Z = 1609459199
+        assert_eq!(secs_to_rfc3339(1_609_459_199), "2020-12-31T23:59:59Z");
+    }
+
+    #[test]
+    fn test_new_year_2021() {
+        // 2021-01-01T00:00:00Z = 1609459200
+        assert_eq!(secs_to_rfc3339(1_609_459_200), "2021-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn test_rfc3339_format() {
+        let s = secs_to_rfc3339(1_700_000_000);
+        // Must match YYYY-MM-DDTHH:MM:SSZ
+        assert!(
+            s.len() == 20 && s.ends_with('Z') && s.chars().nth(10) == Some('T'),
+            "unexpected format: {s}"
+        );
+    }
 }

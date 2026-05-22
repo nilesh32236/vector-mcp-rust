@@ -9,8 +9,8 @@ use axum::{
     routing::{get, post},
 };
 use dashmap::DashMap;
-use futures::stream::Stream;
 use futures::StreamExt;
+use futures::stream::Stream;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -304,7 +304,10 @@ async fn stream_summarize_handler(
     };
 
     // Rate-limit streaming requests using the same limiter as message_handler.
-    let session_id = params.get("session_id").cloned().unwrap_or_else(|| "stream".to_string());
+    let session_id = params
+        .get("session_id")
+        .cloned()
+        .unwrap_or_else(|| "stream".to_string());
     if !manager.server.rate_limiter.allow(&session_id) {
         return (
             axum::http::StatusCode::TOO_MANY_REQUESTS,
@@ -328,9 +331,7 @@ async fn stream_summarize_handler(
     let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(token_rx)
         .map(|piece| Ok::<Event, std::convert::Infallible>(Event::default().data(piece)))
         .chain(futures::stream::once(async {
-            Ok::<Event, std::convert::Infallible>(
-                Event::default().event("done").data(""),
-            )
+            Ok::<Event, std::convert::Infallible>(Event::default().event("done").data(""))
         }));
 
     Sse::new(stream).into_response()

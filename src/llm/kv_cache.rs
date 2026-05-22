@@ -89,7 +89,10 @@ impl KvCacheStore {
     /// Deprecated: eviction is now handled atomically inside [`touch`](Self::touch).
     /// Call `touch` instead.
     #[allow(dead_code)]
-    #[deprecated(since = "0.1.0", note = "use `touch` instead — eviction is now handled atomically inside touch")]
+    #[deprecated(
+        since = "0.1.0",
+        note = "use `touch` instead — eviction is now handled atomically inside touch"
+    )]
     pub fn evict_if_needed(&self) {
         // No-op: eviction is now handled atomically inside `touch`.
     }
@@ -255,7 +258,10 @@ mod tests {
         fs::write(&path, b"data").unwrap();
         store.touch("ccc"); // eviction happens inside touch
 
-        assert!(store.cache_path("aaa").exists(), "aaa should remain (recently touched)");
+        assert!(
+            store.cache_path("aaa").exists(),
+            "aaa should remain (recently touched)"
+        );
         assert!(!store.cache_path("bbb").exists(), "bbb should be evicted");
         assert!(store.cache_path("ccc").exists(), "ccc should remain");
     }

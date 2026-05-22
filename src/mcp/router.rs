@@ -67,12 +67,7 @@ impl SemanticRouter {
     pub fn build(embedder: &Embedder) -> Self {
         let prototypes: Vec<(Intent, Vec<f32>)> = PROTOTYPE_PHRASES
             .iter()
-            .filter_map(|(phrase, intent)| {
-                embedder
-                    .embed_query(phrase)
-                    .ok()
-                    .map(|v| (*intent, v))
-            })
+            .filter_map(|(phrase, intent)| embedder.embed_query(phrase).ok().map(|v| (*intent, v)))
             .collect();
 
         tracing::info!(
@@ -127,9 +122,21 @@ impl SemanticRouter {
         }
 
         // Normalise to per-intent averages.
-        let search_avg = if search_count > 0 { search_score / search_count as f32 } else { 0.0 };
-        let summarize_avg = if summarize_count > 0 { summarize_score / summarize_count as f32 } else { 0.0 };
-        let analyze_avg = if analyze_count > 0 { analyze_score / analyze_count as f32 } else { 0.0 };
+        let search_avg = if search_count > 0 {
+            search_score / search_count as f32
+        } else {
+            0.0
+        };
+        let summarize_avg = if summarize_count > 0 {
+            summarize_score / summarize_count as f32
+        } else {
+            0.0
+        };
+        let analyze_avg = if analyze_count > 0 {
+            analyze_score / analyze_count as f32
+        } else {
+            0.0
+        };
 
         let intent = if summarize_avg >= search_avg && summarize_avg >= analyze_avg {
             Intent::Summarize

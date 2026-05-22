@@ -32,6 +32,12 @@ pub struct KnowledgeGraph {
     name_to_id: DashMap<String, Vec<String>>,
 }
 
+impl Default for KnowledgeGraph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl KnowledgeGraph {
     pub fn new() -> Self {
         Self {
@@ -138,9 +144,15 @@ impl KnowledgeGraph {
 
         for edge in &callee_rels {
             // O(1) dedup using a parallel seen-set keyed by (caller, callee).
-            let mut seen = self.call_edges_seen.entry(edge.caller_symbol.clone()).or_default();
+            let mut seen = self
+                .call_edges_seen
+                .entry(edge.caller_symbol.clone())
+                .or_default();
             if seen.insert(edge.callee_symbol.clone()) {
-                self.call_edges.entry(edge.caller_symbol.clone()).or_default().push(edge.clone());
+                self.call_edges
+                    .entry(edge.caller_symbol.clone())
+                    .or_default()
+                    .push(edge.clone());
             }
         }
 
@@ -156,9 +168,15 @@ impl KnowledgeGraph {
 
         for edge in &impl_rels {
             // O(1) dedup using a parallel seen-set keyed by (trait, struct).
-            let mut seen = self.trait_impls_seen.entry(edge.trait_name.clone()).or_default();
+            let mut seen = self
+                .trait_impls_seen
+                .entry(edge.trait_name.clone())
+                .or_default();
             if seen.insert(edge.struct_name.clone()) {
-                self.trait_impls.entry(edge.trait_name.clone()).or_default().push(edge.struct_name.clone());
+                self.trait_impls
+                    .entry(edge.trait_name.clone())
+                    .or_default()
+                    .push(edge.struct_name.clone());
             }
         }
     }

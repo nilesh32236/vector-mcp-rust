@@ -44,17 +44,15 @@ impl PathGuard {
         let write_allowlist = std::env::var_os("WRITE_ALLOWLIST").map(|val| {
             std::env::split_paths(&val)
                 .filter(|p| !p.as_os_str().is_empty())
-                .filter_map(|p| {
-                    match std::fs::canonicalize(&p) {
-                        Ok(canonical) => Some(canonical),
-                        Err(e) => {
-                            tracing::warn!(
-                                path = %p.display(),
-                                error = %e,
-                                "WRITE_ALLOWLIST: failed to canonicalize entry — ignoring"
-                            );
-                            None
-                        }
+                .filter_map(|p| match std::fs::canonicalize(&p) {
+                    Ok(canonical) => Some(canonical),
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %p.display(),
+                            error = %e,
+                            "WRITE_ALLOWLIST: failed to canonicalize entry — ignoring"
+                        );
+                        None
                     }
                 })
                 .collect::<Vec<_>>()
@@ -124,7 +122,10 @@ impl PathGuard {
                 // If the file already exists, canonicalize to catch symlink escapes.
                 let resolved = if normalized.exists() {
                     std::fs::canonicalize(&normalized).with_context(|| {
-                        format!("failed to canonicalize write target: {}", normalized.display())
+                        format!(
+                            "failed to canonicalize write target: {}",
+                            normalized.display()
+                        )
                     })?
                 } else {
                     // File doesn't exist yet — validate the parent exists and is safe.
@@ -140,7 +141,10 @@ impl PathGuard {
                         }
                     }
                     let resolved_parent = std::fs::canonicalize(current).with_context(|| {
-                        format!("failed to canonicalize write ancestor: {}", current.display())
+                        format!(
+                            "failed to canonicalize write ancestor: {}",
+                            current.display()
+                        )
                     })?;
                     if !resolved_parent.starts_with(&self.base) {
                         bail!("path traversal attempt via ancestor detected (write)");
@@ -157,10 +161,7 @@ impl PathGuard {
                 }
 
                 // Check extension allowlist.
-                let ext = resolved
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("");
+                let ext = resolved.extension().and_then(|e| e.to_str()).unwrap_or("");
                 if !WRITE_ALLOWED_EXTENSIONS.contains(&ext) {
                     bail!(
                         "write blocked: extension '.{ext}' is not in the write allowlist \
@@ -171,11 +172,11 @@ impl PathGuard {
 
                 // Check explicit allowlist if configured.
                 if let Some(ref allowlist) = self.write_allowlist {
-                    let permitted = allowlist.iter().any(|allowed| resolved.starts_with(allowed));
+                    let permitted = allowlist
+                        .iter()
+                        .any(|allowed| resolved.starts_with(allowed));
                     if !permitted {
-                        bail!(
-                            "write blocked: path is not in the configured WRITE_ALLOWLIST"
-                        );
+                        bail!("write blocked: path is not in the configured WRITE_ALLOWLIST");
                     }
                 }
 
@@ -304,8 +305,16 @@ mod tests {
 
         // Blocked segments should be rejected
         assert!(guard.validate(".git/config", PathOp::Write).is_err());
-        assert!(guard.validate("node_modules/pkg/index.js", PathOp::Write).is_err());
-        assert!(guard.validate("target/debug/build.rs", PathOp::Write).is_err());
+        assert!(
+            guard
+                .validate("node_modules/pkg/index.js", PathOp::Write)
+                .is_err()
+        );
+        assert!(
+            guard
+                .validate("target/debug/build.rs", PathOp::Write)
+                .is_err()
+        );
 
         Ok(())
     }

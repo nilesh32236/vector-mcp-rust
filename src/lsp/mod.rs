@@ -458,6 +458,7 @@ impl LspPool {
     ///
     /// Always reads the current root from `Config` so stale sessions are
     /// replaced when the root changes.
+    #[allow(dead_code)]
     pub fn get(&self, ext: &str) -> Option<Arc<LspManager>> {
         let cmd = server_command(ext)?;
         let root = self.config.project_root.read().unwrap().clone();

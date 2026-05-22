@@ -193,9 +193,8 @@ const PYTHON_QUERIES: &[&str] = &[
 pub fn parse_markdown(content: &str, file_path: &str) -> Vec<Chunk> {
     static HEADING_RE: LazyLock<regex::Regex> =
         LazyLock::new(|| regex::Regex::new(r"(?m)^(#{1,6})\s+(.+)$").unwrap());
-    static FENCE_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r"(?s)```(\w*)\n(.*?)```").unwrap()
-    });
+    static FENCE_RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"(?s)```(\w*)\n(.*?)```").unwrap());
 
     let mut chunks: Vec<Chunk> = Vec::new();
     let lines: Vec<&str> = content.lines().collect();
@@ -244,11 +243,17 @@ pub fn parse_markdown(content: &str, file_path: &str) -> Vec<Chunk> {
             code_ranges.push((match_start, match_end));
 
             let code_start_line = start_line
-                + section_text[..match_start].chars().filter(|&c| c == '\n').count();
-            let code_end_line =
-                code_start_line + code.chars().filter(|&c| c == '\n').count() + 2; // +2 for fence lines
+                + section_text[..match_start]
+                    .chars()
+                    .filter(|&c| c == '\n')
+                    .count();
+            let code_end_line = code_start_line + code.chars().filter(|&c| c == '\n').count() + 2; // +2 for fence lines
 
-            let lang_tag = if lang.is_empty() { "text".to_string() } else { lang };
+            let lang_tag = if lang.is_empty() {
+                "text".to_string()
+            } else {
+                lang
+            };
             let symbol = format!("{title} [{lang_tag} example]");
 
             chunks.push(Chunk {
@@ -405,10 +410,7 @@ fn extract_raw_chunks(source: &[u8], spec: &LangSpec, tree: &tree_sitter::Tree) 
             .capture_names()
             .iter()
             .position(|n| *n == "trait_name");
-        let base_idx = query
-            .capture_names()
-            .iter()
-            .position(|n| *n == "base_name");
+        let base_idx = query.capture_names().iter().position(|n| *n == "base_name");
 
         let mut cursor = QueryCursor::new();
         let mut matches = cursor.matches(&query, root, source);
@@ -464,10 +466,7 @@ fn extract_raw_chunks(source: &[u8], spec: &LangSpec, tree: &tree_sitter::Tree) 
 
             // Build ImplEdge when both @trait_name and @name are captured.
             let impl_relationships = if let Some(trait_node) = trait_node {
-                let trait_name = trait_node
-                    .utf8_text(source)
-                    .unwrap_or("")
-                    .to_owned();
+                let trait_name = trait_node.utf8_text(source).unwrap_or("").to_owned();
                 if !trait_name.is_empty() && symbol_name != "Unknown" {
                     vec![ImplEdge {
                         struct_name: symbol_name.clone(),

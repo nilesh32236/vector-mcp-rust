@@ -58,7 +58,10 @@ impl LexicalIndex {
             path.exists() && path.is_dir() && std::fs::read_dir(path)?.next().is_some();
 
         let (index, in_ram) = if index_exists {
-            (TantivyIndex::open_in_dir(path).context("Opening Tantivy index")?, false)
+            (
+                TantivyIndex::open_in_dir(path).context("Opening Tantivy index")?,
+                false,
+            )
         } else if read_only {
             // Slave mode: index hasn't been created by the master yet.
             // Build an in-RAM index so searches return empty results
@@ -70,7 +73,10 @@ impl LexicalIndex {
             (TantivyIndex::create_in_ram(schema), true)
         } else {
             std::fs::create_dir_all(path).context("Creating index directory")?;
-            (TantivyIndex::create_in_dir(path, schema).context("Creating Tantivy index")?, false)
+            (
+                TantivyIndex::create_in_dir(path, schema).context("Creating Tantivy index")?,
+                false,
+            )
         };
 
         let reader = index
@@ -84,7 +90,9 @@ impl LexicalIndex {
             // In-RAM index: create a writer so we can populate it from existing
             // LanceDB records during startup, then keep it for future in-memory
             // updates. No data is ever written to disk.
-            let w = index.writer(15_000_000).context("Acquiring in-RAM Tantivy writer")?;
+            let w = index
+                .writer(15_000_000)
+                .context("Acquiring in-RAM Tantivy writer")?;
             Some(Arc::new(RwLock::new(w)))
         } else {
             let w = match index.writer(50_000_000) {
@@ -99,13 +107,20 @@ impl LexicalIndex {
                                 TANTIVY_LOCK_STALE_SECS
                             );
                             let _ = std::fs::remove_file(&lock_path);
-                            index.writer(50_000_000).context("Acquiring Tantivy writer after lock removal")?
+                            index
+                                .writer(50_000_000)
+                                .context("Acquiring Tantivy writer after lock removal")?
                         } else {
-                            bail!("Tantivy index is currently locked by another process (modified {}s ago)", elapsed.as_secs());
+                            bail!(
+                                "Tantivy index is currently locked by another process (modified {}s ago)",
+                                elapsed.as_secs()
+                            );
                         }
                     } else {
                         // Lock file doesn't exist but we got LockFailure? Retry once.
-                        index.writer(50_000_000).context("Acquiring Tantivy writer (retry)")?
+                        index
+                            .writer(50_000_000)
+                            .context("Acquiring Tantivy writer (retry)")?
                     }
                 }
                 Err(e) => return Err(e).context("Acquiring Tantivy writer"),
@@ -135,7 +150,6 @@ impl LexicalIndex {
         writer.commit()?;
         Ok(())
     }
-
 
     /// Add without committing — call `commit()` after a batch.
     fn add_no_commit(&self, doc_id: &str, text: &str) -> Result<()> {

@@ -1,18 +1,20 @@
+use crate::indexer::chunker;
+use crate::llm::models::LlamaEngine;
 use anyhow::Result;
 use std::path::PathBuf;
 use std::time::Instant;
-use crate::indexer::chunker;
-use crate::llm::models::LlamaEngine;
 
 pub fn run(args: Vec<String>) -> Result<()> {
     let mut model_path = PathBuf::new();
     let mut test_file = PathBuf::new();
     let mut output_path = None;
-    
+
     // Parse args
     let mut iter = args.into_iter().skip(1);
     while let Some(arg) = iter.next() {
-        if arg == "benchmark" { continue; }
+        if arg == "benchmark" {
+            continue;
+        }
         match arg.as_str() {
             "--model" => {
                 if let Some(val) = iter.next() {
@@ -47,7 +49,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
 
     let mut report = String::new();
     let line = "=========================================================";
-    
+
     report.push_str(&format!("{}\nEmbedding Benchmark Report\n", line));
     report.push_str(&format!("Model: {}\n", model_path.display()));
     report.push_str(&format!("Test File: {}\n", test_file.display()));
@@ -55,21 +57,17 @@ pub fn run(args: Vec<String>) -> Result<()> {
 
     println!("{}", report);
 
-    let models_dir = model_path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let models_dir = model_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
 
     println!("[1/5] Initialising LlamaEngine...");
     let start_init = Instant::now();
-    let engine = LlamaEngine::new_with_config(
-        models_dir,
-        None,
-        None,
-        None,
-        Some(&model_path),
-    )?;
+    let engine = LlamaEngine::new_with_config(models_dir, None, None, None, Some(&model_path))?;
     let init_dur = start_init.elapsed();
     println!("✓ Engine initialised in {:?}", init_dur);
     report.push_str(&format!("Initialization Time: {:?}\n\n", init_dur));
-    
+
     println!("      Model loaded into memory. Check your peak RAM usage now!");
     println!("      Resuming in 3 seconds...\n");
     std::thread::sleep(std::time::Duration::from_secs(3));
@@ -77,9 +75,13 @@ pub fn run(args: Vec<String>) -> Result<()> {
     // Chunking the test file
     println!("[2/5] Parsing Test File...");
     let content = std::fs::read_to_string(&test_file)?;
-    let extension = test_file.extension().and_then(|s| s.to_str()).map(|ext| format!(".{}", ext)).unwrap_or_default();
+    let extension = test_file
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|ext| format!(".{}", ext))
+        .unwrap_or_default();
     let mut chunks = chunker::parse_file(&content, test_file.to_str().unwrap(), &extension)?;
-    
+
     if chunks.is_empty() {
         chunks.push(chunker::Chunk {
             content: content.clone(),
@@ -104,7 +106,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
     // Phase 1: Speed Tests
     println!("[3/5] Speed (Latency & Throughput)");
     report.push_str("[Speed Results]\n");
-    
+
     // Cold Start
     let cold_start = Instant::now();
     let _ = engine.generate_embedding(&chunks[0].content)?;
@@ -148,35 +150,61 @@ pub fn run(args: Vec<String>) -> Result<()> {
         println!("Query: \"{}\"", query);
         report.push_str(&format!("Query: \"{}\"\n", query));
         let query_vec = engine.generate_embedding(query)?;
-        
-        let mut scores: Vec<(f32, &chunker::Chunk)> = embedded_chunks.iter().map(|(chunk, emb)| {
-            let score = cosine_similarity(&query_vec, emb);
-            (score, chunk)
-        }).collect();
+
+        let mut scores: Vec<(f32, &chunker::Chunk)> = embedded_chunks
+            .iter()
+            .map(|(chunk, emb)| {
+                let score = cosine_similarity(&query_vec, emb);
+                (score, chunk)
+            })
+            .collect();
 
         scores.sort_by(|a, b| b.0.total_cmp(&a.0));
 
         for (i, (score, chunk)) in scores.iter().take(3).enumerate() {
             let preview: String = chunk.content.lines().take(3).collect::<Vec<_>>().join("\n");
-            let output = format!("  #{}: Score {:.4} | Lines {}-{} | Preview: {}...", i+1, score, chunk.start_line, chunk.end_line, preview.replace("\n", " "));
+            let output = format!(
+                "  #{}: Score {:.4} | Lines {}-{} | Preview: {}...",
+                i + 1,
+                score,
+                chunk.start_line,
+                chunk.end_line,
+                preview.replace("\n", " ")
+            );
             println!("{}", output);
             report.push_str(&format!("{}\n", output));
         }
-        report.push_str("\n");
+        report.push('\n');
     }
 
     // Phase 5: Ground Truth Audit (Golden Standard)
     println!("[5/5] Ground Truth Audit (Accuracy Scoring)");
     report.push_str("[Ground Truth Accuracy]\n");
-    
+
     let mut total_points = 0.0;
     let mut possible_points = 0.0;
 
     let golden_tests = vec![
-        ("How is distance between points calculated?", "math_utils.go", "math.Sqrt"),
-        ("How to load configuration from JSON?", "config_manager.py", "json.load"),
-        ("How are Tree-sitter chunks extracted?", "chunker.rs", "fn tree_sitter_chunk"),
-        ("Where is email validation logic?", "config_manager.py", "def validate_email"),
+        (
+            "How is distance between points calculated?",
+            "math_utils.go",
+            "math.Sqrt",
+        ),
+        (
+            "How to load configuration from JSON?",
+            "config_manager.py",
+            "json.load",
+        ),
+        (
+            "How are Tree-sitter chunks extracted?",
+            "chunker.rs",
+            "fn tree_sitter_chunk",
+        ),
+        (
+            "Where is email validation logic?",
+            "config_manager.py",
+            "def validate_email",
+        ),
     ];
 
     for (query, file_name, marker) in golden_tests {
@@ -189,18 +217,25 @@ pub fn run(args: Vec<String>) -> Result<()> {
             .map(|stem| stem == "all")
             .unwrap_or(false);
         if !is_general_audit && !test_file_str.contains(file_name) {
-            tracing::debug!("Skipping golden test '{}' (file '{}' not matched by test_file)", query, file_name);
+            tracing::debug!(
+                "Skipping golden test '{}' (file '{}' not matched by test_file)",
+                query,
+                file_name
+            );
             continue;
         }
 
         println!("Audit: \"{}\"", query);
         possible_points += 1.0;
-        
+
         let query_vec = engine.generate_embedding(query)?;
-        let mut scores: Vec<(f32, &chunker::Chunk)> = embedded_chunks.iter().map(|(chunk, emb)| {
-            let score = cosine_similarity(&query_vec, emb);
-            (score, chunk)
-        }).collect();
+        let mut scores: Vec<(f32, &chunker::Chunk)> = embedded_chunks
+            .iter()
+            .map(|(chunk, emb)| {
+                let score = cosine_similarity(&query_vec, emb);
+                (score, chunk)
+            })
+            .collect();
         scores.sort_by(|a, b| b.0.total_cmp(&a.0));
 
         // Check Top-3
@@ -235,7 +270,7 @@ pub fn run(args: Vec<String>) -> Result<()> {
         println!("\nFinal Accuracy Score: {:.1}%\n", accuracy);
         report.push_str(&format!("\nFINAL ACCURACY SCORE: {:.1}%\n\n", accuracy));
     }
-    
+
     let footer = "=========================================================";
     println!("{}", footer);
     println!("Benchmark Complete!");
@@ -253,9 +288,5 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
     let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
     let denom = norm_a * norm_b;
-    if denom == 0.0 {
-        0.0
-    } else {
-        dot / denom
-    }
+    if denom == 0.0 { 0.0 } else { dot / denom }
 }

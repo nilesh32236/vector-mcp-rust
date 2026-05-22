@@ -46,9 +46,7 @@ pub enum LlmRequest {
         reply: oneshot::Sender<Result<Vec<(usize, f32)>>>,
     },
     /// Clear all on-disk KV-cache files and reset the LRU state.
-    ClearKvCache {
-        reply: oneshot::Sender<Result<()>>,
-    },
+    ClearKvCache { reply: oneshot::Sender<Result<()>> },
     /// Graceful shutdown — the worker loop exits after processing this message.
     #[allow(dead_code)]
     Shutdown,
@@ -136,7 +134,12 @@ impl LlmWorker {
 
         tokio::time::timeout(WORKER_REQUEST_TIMEOUT, reply_rx)
             .await
-            .map_err(|_| anyhow!("LlmWorker: summarize timed out after {:?}", WORKER_REQUEST_TIMEOUT))?
+            .map_err(|_| {
+                anyhow!(
+                    "LlmWorker: summarize timed out after {:?}",
+                    WORKER_REQUEST_TIMEOUT
+                )
+            })?
             .map_err(|_| anyhow!("LlmWorker dropped reply sender"))?
     }
 
@@ -161,7 +164,12 @@ impl LlmWorker {
 
         tokio::time::timeout(WORKER_REQUEST_TIMEOUT, reply_rx)
             .await
-            .map_err(|_| anyhow!("LlmWorker: summarize_streaming timed out after {:?}", WORKER_REQUEST_TIMEOUT))?
+            .map_err(|_| {
+                anyhow!(
+                    "LlmWorker: summarize_streaming timed out after {:?}",
+                    WORKER_REQUEST_TIMEOUT
+                )
+            })?
             .map_err(|_| anyhow!("LlmWorker dropped reply sender"))?
     }
 
@@ -186,7 +194,12 @@ impl LlmWorker {
 
         tokio::time::timeout(WORKER_REQUEST_TIMEOUT, reply_rx)
             .await
-            .map_err(|_| anyhow!("LlmWorker: rerank timed out after {:?}", WORKER_REQUEST_TIMEOUT))?
+            .map_err(|_| {
+                anyhow!(
+                    "LlmWorker: rerank timed out after {:?}",
+                    WORKER_REQUEST_TIMEOUT
+                )
+            })?
             .map_err(|_| anyhow!("LlmWorker dropped reply sender"))?
     }
 

@@ -99,8 +99,7 @@ impl Config {
 
         let home = dirs_home()?;
 
-        let (data_dir, db_path, models_dir, log_path, project_root) =
-            Self::resolve_paths(&home)?;
+        let (data_dir, db_path, models_dir, log_path, project_root) = Self::resolve_paths(&home)?;
 
         // Ensure directories exist.
         std::fs::create_dir_all(&db_path)
@@ -156,7 +155,11 @@ impl Config {
             .map(PathBuf::from)
             .or_else(|| {
                 let candidate = models_dir.join("bge-reranker-v2-m3-Q4_K_M.gguf");
-                if candidate.exists() { Some(candidate) } else { None }
+                if candidate.exists() {
+                    Some(candidate)
+                } else {
+                    None
+                }
             });
 
         Ok(Self {
