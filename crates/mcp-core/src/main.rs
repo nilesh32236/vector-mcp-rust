@@ -12,7 +12,6 @@
 //!   starts a lightweight MCP server that delegates all AI/DB work to the master.
 
 mod api;
-mod benchmark;
 mod config;
 mod daemon;
 mod db;
@@ -209,11 +208,6 @@ fn main() -> Result<()> {
     unsafe {
         std::env::set_var("LLAMA_LOG_VERBOSITY", "-1");
         std::env::set_var("GGML_QUIET", "1");
-    }
-
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() > 1 && args[1] == "benchmark" {
-        return benchmark::run(args);
     }
 
     // Build a custom Tokio runtime with 8MB stack size for blocking threads.

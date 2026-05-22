@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use std::num::NonZeroU32;
 use std::path::Path;
 
-use crate::llm::kv_cache::KvCacheStore;
+use crate::kv_cache::KvCacheStore;
 
 // ---------------------------------------------------------------------------
 // LlamaEngine — unified inference engine for embeddings + summarisation
@@ -329,6 +329,81 @@ impl LlamaEngine {
             .map_err(|e| anyhow!("Failed to extract embeddings: {e}"))?;
 
         Ok(l2_normalize(raw.to_vec()))
+    }
+
+    /// Generate L2-normalised embedding vectors for a batch of input texts
+    /// using the nomic-embed-text-v1.5 model in a single dispatch.
+    ///
+    /// Returns `Err` for empty batch or if any of the input strings is empty.
+    pub fn generate_embeddings_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut tokenized = Vec::with_capacity(texts.len());
+        let mut total_tokens = 0usize;
+        let max_seq_len = (self.embed_model.n_ctx_train() as usize).min(1024);
+
+        for text in texts {
+            if text.is_empty() {
+                return Err(anyhow!(
+                    "generate_embeddings_batch: empty input is not supported"
+                ));
+            }
+
+            // Apply nomic-embed prefix idempotently
+            let prefixed =
+                if text.starts_with("search_document: ") || text.starts_with("search_query: ") {
+                    text.to_string()
+                } else {
+                    format!("search_document: {text}")
+                };
+
+            let mut tokens = self
+                .embed_model
+                .str_to_token(&prefixed, AddBos::Always)
+                .map_err(|e| anyhow!("Tokenization failed: {e}"))?;
+
+            tokens.truncate(max_seq_len);
+            total_tokens += tokens.len();
+            tokenized.push(tokens);
+        }
+
+        // Dynamic n_ctx: next power-of-two >= total_tokens, floored at 64.
+        let n_ctx = (total_tokens as u32).next_power_of_two().max(64);
+
+        let ctx_params = LlamaContextParams::default()
+            .with_n_ctx(NonZeroU32::new(n_ctx))
+            .with_n_batch(n_ctx)
+            .with_n_ubatch(n_ctx)
+            .with_pooling_type(LlamaPoolingType::Mean)
+            .with_embeddings(true);
+
+        let mut ctx = self
+            .embed_model
+            .new_context(&self._backend, ctx_params)
+            .map_err(|e| anyhow!("Failed to create embedding context: {e}"))?;
+
+        let mut batch = LlamaBatch::new(total_tokens, texts.len() as i32);
+        for (seq_id, tokens) in tokenized.iter().enumerate() {
+            batch
+                .add_sequence(tokens, seq_id as i32, false)
+                .map_err(|e| anyhow!("Batch add_sequence failed for sequence {seq_id}: {e}"))?;
+        }
+
+        ctx.clear_kv_cache();
+        ctx.decode(&mut batch)
+            .map_err(|e| anyhow!("Embedding decode failed: {e}"))?;
+
+        let mut embeddings = Vec::with_capacity(texts.len());
+        for seq_id in 0..texts.len() {
+            let raw = ctx
+                .embeddings_seq_ith(seq_id as i32)
+                .map_err(|e| anyhow!("Failed to extract embedding for sequence {seq_id}: {e}"))?;
+            embeddings.push(l2_normalize(raw.to_vec()));
+        }
+
+        Ok(embeddings)
     }
 
     /// Clear the on-disk KV-cache (called from `LlmWorker`).

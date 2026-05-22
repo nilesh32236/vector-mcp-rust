@@ -3505,6 +3505,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "mcp-llm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "encoding_rs",
+ "hex",
+ "llama-cpp-2",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "md-5"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5714,7 +5730,7 @@ dependencies = [
  "lance-arrow",
  "lancedb",
  "libc",
- "llama-cpp-2",
+ "mcp-llm",
  "notify",
  "pdf-extract",
  "regex",

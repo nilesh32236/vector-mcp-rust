@@ -379,6 +379,65 @@ impl Store {
         Ok(all_records)
     }
 
+    pub async fn get_lightweight_records(
+        &self,
+        ids: &[String],
+        need_metadata: bool,
+    ) -> Result<HashMap<String, Option<String>>> {
+        if ids.is_empty() || self.code_vectors.count_rows(None).await? == 0 {
+            return Ok(HashMap::new());
+        }
+
+        let mut map = HashMap::new();
+        let fields = if need_metadata {
+            vec!["id".to_string(), "metadata".to_string()]
+        } else {
+            vec!["id".to_string()]
+        };
+
+        for chunk in ids.chunks(500) {
+            let predicate = chunk
+                .iter()
+                .map(|id| format!("id = '{}'", sql_escape(id)))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+
+            let results = self
+                .code_vectors
+                .query()
+                .select(lancedb::query::Select::Columns(fields.clone()))
+                .only_if(predicate)
+                .execute()
+                .await?;
+            let batches = results.try_collect::<Vec<_>>().await?;
+            for batch in batches {
+                let id_col = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+                    .context("id column")?;
+                if need_metadata {
+                    let meta_col = batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<arrow_array::StringArray>()
+                        .context("metadata column")?;
+                    for i in 0..batch.num_rows() {
+                        map.insert(
+                            id_col.value(i).to_string(),
+                            Some(meta_col.value(i).to_string()),
+                        );
+                    }
+                } else {
+                    for i in 0..batch.num_rows() {
+                        map.insert(id_col.value(i).to_string(), None);
+                    }
+                }
+            }
+        }
+        Ok(map)
+    }
+
     pub async fn update_record_metadata(&self, record_id: &str, new_metadata: &str) -> Result<()> {
         let escaped_id = sql_escape(record_id);
         let escaped_meta = sql_escape(new_metadata);
@@ -486,6 +545,46 @@ impl Store {
         batches_to_records(batches)
     }
 
+    pub async fn lightweight_vector_search(
+        &self,
+        vector: Vec<f32>,
+        limit: usize,
+        project_ids: Option<&[String]>,
+    ) -> Result<Vec<String>> {
+        let mut query = self
+            .code_vectors
+            .query()
+            .nearest_to(vector)?
+            .select(lancedb::query::Select::Columns(vec!["id".to_string()]))
+            .limit(limit);
+
+        if let Some(pids) = project_ids
+            && !pids.is_empty()
+        {
+            let parts: Vec<String> = pids
+                .iter()
+                .map(|p| format!("metadata LIKE '%\"project_id\":\"{}\"%'", sql_escape(p)))
+                .collect();
+            let predicate = parts.join(" OR ");
+            query = query.only_if(predicate);
+        }
+
+        let results = query.execute().await?;
+        let batches = results.try_collect::<Vec<_>>().await?;
+        let mut ids = Vec::new();
+        for batch in batches {
+            let id_col = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .context("id column")?;
+            for i in 0..batch.num_rows() {
+                ids.push(id_col.value(i).to_string());
+            }
+        }
+        Ok(ids)
+    }
+
     pub async fn lexical_search(
         &self,
         query: &str,
@@ -544,35 +643,68 @@ impl Store {
     ) -> Result<Vec<(Record, f32)>> {
         let fetch = limit * 3;
 
-        let (vec_res, lex_res) = tokio::join!(
-            self.vector_search(vector, fetch, project_ids),
-            self.lexical_search(query, fetch, project_ids),
+        let lexical_index = Arc::clone(&self.lexical);
+        let query_str = query.to_string();
+        let (vec_res, lex_hits_res) = tokio::join!(
+            self.lightweight_vector_search(vector, fetch, project_ids),
+            tokio::task::spawn_blocking(move || { lexical_index.search(&query_str, fetch) })
         );
 
-        let vec_results = vec_res.unwrap_or_default();
-        let lex_results = lex_res.unwrap_or_default();
+        let vec_ids = vec_res.unwrap_or_default();
+        let lex_hits = lex_hits_res.unwrap_or_default();
+
+        let lex_ids: Vec<String> = lex_hits.iter().map(|(id, _)| id.clone()).collect();
+        let need_metadata = project_ids.is_some() && !project_ids.unwrap().is_empty();
+        let lw_records = self
+            .get_lightweight_records(&lex_ids, need_metadata)
+            .await
+            .unwrap_or_default();
+
+        let mut lex_ids_filtered = Vec::new();
+        for (id, _score) in lex_hits {
+            if let Some(meta_opt) = lw_records.get(&id) {
+                if let Some(pids) = project_ids {
+                    if !pids.is_empty() {
+                        if let Some(meta_str) = meta_opt {
+                            let meta_json: serde_json::Value =
+                                serde_json::from_str(meta_str).unwrap_or(serde_json::Value::Null);
+                            let pid = meta_json["project_id"].as_str().unwrap_or("").to_string();
+                            if !pids.contains(&pid) {
+                                continue;
+                            }
+                        } else {
+                            continue;
+                        }
+                    }
+                }
+                lex_ids_filtered.push(id);
+            }
+        }
 
         let k = 60.0_f64;
         let mut scores: HashMap<String, f64> = HashMap::new();
-        let mut record_map: HashMap<String, Record> = HashMap::new();
 
-        for (i, r) in vec_results.into_iter().enumerate() {
-            *scores.entry(r.id.clone()).or_default() += 1.0 / (k + (i + 1) as f64);
-            record_map.insert(r.id.clone(), r);
+        for (i, id) in vec_ids.iter().enumerate() {
+            *scores.entry(id.clone()).or_default() += 1.0 / (k + (i + 1) as f64);
         }
-        for (i, r) in lex_results.into_iter().enumerate() {
-            *scores.entry(r.id.clone()).or_default() += 1.0 / (k + (i + 1) as f64);
-            record_map.entry(r.id.clone()).or_insert(r);
+        for (i, id) in lex_ids_filtered.iter().enumerate() {
+            *scores.entry(id.clone()).or_default() += 1.0 / (k + (i + 1) as f64);
         }
 
         let mut ranked: Vec<(String, f64)> = scores.into_iter().collect();
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         ranked.truncate(limit);
 
-        Ok(ranked
-            .into_iter()
-            .filter_map(|(id, score)| record_map.remove(&id).map(|r| (r, score as f32)))
-            .collect())
+        let final_ids: Vec<String> = ranked.iter().map(|(id, _)| id.clone()).collect();
+        let mut heavy_records = self.get_records_by_ids(&final_ids).await?;
+
+        let mut result = Vec::new();
+        for (id, score) in ranked {
+            if let Some(record) = heavy_records.remove(&id) {
+                result.push((record, score as f32));
+            }
+        }
+        Ok(result)
     }
 
     // -----------------------------------------------------------------------

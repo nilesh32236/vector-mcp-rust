@@ -1,4 +1,4 @@
-use crate::llm::models::LlamaEngine;
+use crate::models::LlamaEngine;
 use anyhow::Result;
 use std::sync::Arc;
 
@@ -59,16 +59,12 @@ impl Embedder {
         engine.generate_embedding(&prefixed)
     }
 
-    /// Embed a batch of texts sequentially (one vector per input string).
-    ///
-    /// # Why sequential?
-    /// `LlamaEngine::generate_embedding` allocates a `LlamaContext` and submits
-    /// Vulkan compute work on each call. Parallelising with rayon would cause
-    /// multiple contexts to contend for the shared APU VRAM simultaneously,
-    /// exhausting memory and hanging the Vulkan driver. Sequential processing
-    /// keeps the memory footprint stable regardless of batch size.
-    #[allow(dead_code)]
+    /// Embed a batch of texts natively on the GPU in a single dispatch.
     pub fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
-        texts.iter().map(|t| self.embed_text(t)).collect()
+        let engine = self
+            .engine
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("LLM engine not available (degraded mode)"))?;
+        engine.generate_embeddings_batch(texts)
     }
 }
