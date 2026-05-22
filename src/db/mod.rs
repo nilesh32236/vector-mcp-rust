@@ -171,6 +171,9 @@ impl LexicalIndex {
         Ok(())
     }
 
+    /// ⚡ Bolt Performance Optimization:
+    /// Remove a document without committing immediately to avoid N+1 IO bottlenecks.
+    /// Call `commit()` manually after processing a batch.
     fn remove_no_commit(&self, doc_id: &str) -> Result<()> {
         let Some(w) = &self.writer else {
             return Ok(());
@@ -430,11 +433,10 @@ impl Store {
             .context("Deleting records by path")?;
 
         for r in to_delete {
-            if commit {
-                let _ = self.lexical.remove(&r.id);
-            } else {
-                let _ = self.lexical.remove_no_commit(&r.id);
-            }
+            let _ = self.lexical.remove_no_commit(&r.id);
+        }
+        if commit {
+            let _ = self.lexical.commit();
         }
 
         Ok(())
