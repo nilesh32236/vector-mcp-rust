@@ -11,6 +11,10 @@
 **Learning:** `out.push_str(&format!(...))` inside loops creates an intermediate `String` allocation for every formatted line before pushing it to the main string buffer, leading to high heap allocation overhead.
 **Action:** Replace `out.push_str(&format!(...))` with the `std::fmt::Write` macro (`write!(&mut out, ...)` or `writeln!(&mut out, ...)`), which appends formatted data directly into the existing buffer, eliminating intermediate allocations.
 
+## 2026-04-10 - [Batch IO operations to prevent N+1 bottleneck]
+**Learning:** In the Tantivy index, calling `commit()` inside a loop for each document removal causes an N+1 IO bottleneck, severely degrading performance when deleting multiple items (like during `delete_by_path`).
+**Action:** Always batch related IO additions and removals within loops using `_no_commit` variants, then execute a single `commit()` afterward to minimize disk synchronization overhead.
+
 ## 2026-04-14 - [Avoid intermediate string allocations using fmt::Write]
 **Learning:** Using `string_buffer.push_str(&format!(...))` inside loops creates intermediate `String` allocations for every iteration on the heap before being copied and dropped. We can use `std::fmt::Write` to let the formatting macros (`write!`, `writeln!`) push chunks directly into the existing string buffer, eliminating temporary heap allocations.
 **Action:** When building large strings dynamically within tight loops, prefer using `write!(&mut string_buffer, ...)` or `writeln!(&mut string_buffer, ...)` instead of `string_buffer.push_str(&format!(...))`. Remember to use `writeln!` instead of `write!` for strings ending with a newline to avoid `clippy::write_with_newline` CI build failures.

@@ -136,6 +136,13 @@ impl LexicalIndex {
         Ok(())
     }
 
+    /// Remove without committing — call `commit()` after a batch.
+    fn remove_no_commit(&self, doc_id: &str) -> Result<()> {
+        let writer = self.writer.write().unwrap();
+        writer.delete_term(Term::from_field_text(self.fields.id, doc_id));
+        Ok(())
+    }
+
     /// Add without committing — call `commit()` after a batch.
     fn add_no_commit(&self, doc_id: &str, text: &str) -> Result<()> {
         let Some(w) = &self.writer else {
@@ -432,6 +439,7 @@ impl Store {
             .await
             .context("Deleting records by path")?;
 
+        // Bolt: Batch deletions using remove_no_commit to eliminate N+1 IO bottleneck
         for r in to_delete {
             let _ = self.lexical.remove_no_commit(&r.id);
         }
