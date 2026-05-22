@@ -457,6 +457,7 @@ async fn start_servers(
             progress,
             version: env!("CARGO_PKG_VERSION"),
             kv_cache: None, // KvCacheStore is owned by LlamaEngine; expose via engine if needed
+            mcp_server: Arc::clone(&server),
         });
 
         info!(mcp_port, api_port, "vector-mcp-rust ready ✓");

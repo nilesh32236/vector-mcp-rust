@@ -3,3 +3,6 @@
 .data
 .agent/
 .kiro/
+/data
+/skill
+.opencode

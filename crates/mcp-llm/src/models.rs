@@ -26,7 +26,8 @@ pub struct LlamaEngine {
     /// Keeps the backend alive for the process lifetime (must outlive models).
     _backend: LlamaBackend,
     /// Qwen2.5-Coder 0.5B Q4_K_M — used for code summarisation.
-    coder_model: LlamaModel,
+    /// `None` when the GGUF file is absent; summarisation degrades gracefully.
+    coder_model: Option<LlamaModel>,
     /// nomic-embed-text-v1.5 Q4_K_M — used for vector embeddings.
     embed_model: LlamaModel,
     /// Optional reranker model (e.g. bge-reranker-v2-m3-Q4_K_M).
@@ -80,11 +81,25 @@ impl LlamaEngine {
             }
         }
 
-        anyhow::ensure!(
-            coder_path.exists(),
-            "Coder model not found at: {}",
-            coder_path.display()
-        );
+        let coder_model = if coder_path.exists() {
+            match LlamaModel::load_from_file(&backend, &coder_path, &model_params) {
+                Ok(m) => {
+                    tracing::info!(path = %coder_path.display(), "Coder model loaded");
+                    Some(m)
+                }
+                Err(e) => {
+                    tracing::warn!(path = %coder_path.display(), error = %e, "Failed to load coder model — summarisation disabled");
+                    None
+                }
+            }
+        } else {
+            tracing::warn!(
+                "Coder model not found at {} — summarisation disabled. \
+                 Download it from https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF",
+                coder_path.display()
+            );
+            None
+        };
 
         let embed_path = embed_model_path
             .map(std::path::PathBuf::from)
@@ -94,14 +109,6 @@ impl LlamaEngine {
             "Embed model not found at: {}",
             embed_path.display()
         );
-
-        let coder_model = LlamaModel::load_from_file(&backend, &coder_path, &model_params)
-            .map_err(|e| {
-                anyhow!(
-                    "Failed to load coder model from {}: {e}",
-                    coder_path.display()
-                )
-            })?;
 
         let embed_model = LlamaModel::load_from_file(&backend, &embed_path, &model_params)
             .map_err(|e| {
@@ -175,8 +182,11 @@ impl LlamaEngine {
         );
 
         // Tokenize first to determine the minimum context size needed.
-        let tokens = self
-            .coder_model
+        let coder = self.coder_model.as_ref().ok_or_else(|| {
+            anyhow!("Coder model not available — summarisation is disabled")
+        })?;
+
+        let tokens = coder
             .str_to_token(&prompt, AddBos::Always)
             .map_err(|e| anyhow!("Tokenization failed: {e}"))?;
 
@@ -185,8 +195,7 @@ impl LlamaEngine {
 
         let ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(n_ctx));
 
-        let mut ctx = self
-            .coder_model
+        let mut ctx = coder
             .new_context(&self._backend, ctx_params)
             .map_err(|e| anyhow!("Failed to create summariser context: {e}"))?;
 
@@ -223,14 +232,13 @@ impl LlamaEngine {
         for i in 0..64_i32 {
             let token = sampler.sample(&ctx, batch.n_tokens() - 1);
 
-            if self.coder_model.is_eog_token(token) {
+            if coder.is_eog_token(token) {
                 break;
             }
 
             sampler.accept(token);
 
-            let piece = self
-                .coder_model
+            let piece = coder
                 .token_to_piece(token, &mut decoder, true, None)
                 .map_err(|e| anyhow!("Detokenization failed: {e}"))?;
 
@@ -520,13 +528,6 @@ fn l2_normalize(mut v: Vec<f32>) -> Vec<f32> {
 ///
 /// Used for dynamic context sizing: allocate only as much VRAM as the prompt
 /// actually needs, leaving headroom for other operations on the shared APU.
-///
-/// # Examples
-/// ```
-/// assert_eq!(next_pow2_ctx(100, 512, 2048), 512);  // small chunk → floor
-/// assert_eq!(next_pow2_ctx(600, 512, 2048), 1024); // medium chunk → 1024
-/// assert_eq!(next_pow2_ctx(2000, 512, 2048), 2048); // large chunk → cap
-/// ```
 fn next_pow2_ctx(min: usize, floor: u32, cap: u32) -> u32 {
     if min <= floor as usize {
         return floor;
@@ -549,4 +550,16 @@ fn sha256_hex(text: &str) -> String {
     let mut h = Sha256::new();
     h.update(text.as_bytes());
     hex::encode(h.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_next_pow2_ctx() {
+        assert_eq!(next_pow2_ctx(100, 512, 2048), 512);
+        assert_eq!(next_pow2_ctx(600, 512, 2048), 1024);
+        assert_eq!(next_pow2_ctx(2000, 512, 2048), 2048);
+    }
 }
