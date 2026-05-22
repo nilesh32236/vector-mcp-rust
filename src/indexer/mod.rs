@@ -112,34 +112,30 @@ pub async fn index_file(
         .as_secs()
         .to_string();
 
-    // Batch-embed all chunks in one ONNX forward pass.
-    const EMBED_BATCH_SIZE: usize = 32;
-    let chunk_texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
-    let mut all_vectors: Vec<Vec<f32>> = Vec::with_capacity(chunk_texts.len());
-    for batch in chunk_texts.chunks(EMBED_BATCH_SIZE) {
-        let batch = batch.to_vec();
-        let embedder = Arc::clone(&embedder);
-        let vecs = tokio::task::spawn_blocking(move || embedder.embed_batch(&batch)).await??;
-        all_vectors.extend(vecs);
-    }
-    let quantized_codes: Vec<Option<Vec<u8>>> = all_vectors
+    // Embed each chunk individually. llama.cpp creates a LlamaContext per call
+    // which allocates large Vulkan buffers on the stack — batching multiple
+    // contexts simultaneously causes stack overflows. One-at-a-time is correct.
+    // Use contextual_string for embedding when available — it includes section
+    // headings and file context which improves retrieval quality.
+    let chunk_texts: Vec<String> = chunks
         .iter()
-        .map(|vector| embedder.quantize(vector).ok())
+        .map(|c| {
+            if c.contextual_string.is_empty() {
+                c.content.clone()
+            } else {
+                c.contextual_string.clone()
+            }
+        })
         .collect();
-
+    let mut all_vectors: Vec<Vec<f32>> = Vec::with_capacity(chunk_texts.len());
+    for text in chunk_texts {
+        let embedder = Arc::clone(&embedder);
+        let vec = tokio::task::spawn_blocking(move || embedder.embed_text(&text)).await??;
+        all_vectors.push(vec);
+    }
     // Summaries are intentionally deferred to the scanner's background worker.
-    // Running local LLM generation inline makes initial indexing and API
-    // readiness compete for the same CPU budget.
-    let summaries = vec![String::new(); chunks.len()];
-
     let mut records = Vec::with_capacity(chunks.len());
-    for (i, (((chunk, vector), quantized_code), ai_summary)) in chunks
-        .into_iter()
-        .zip(all_vectors)
-        .zip(quantized_codes)
-        .zip(summaries)
-        .enumerate()
-    {
+    for (i, (chunk, vector)) in chunks.into_iter().zip(all_vectors).enumerate() {
         let metadata = json!({
             "path": path,
             "project_id": config.project_root.read().unwrap().clone(),
@@ -151,8 +147,11 @@ pub async fn index_file(
             "symbols": chunk.symbols,
             "calls": chunk.calls,
             "relationships": chunk.relationships,
+            "callee_relationships": chunk.callee_relationships,
+            "impl_relationships": chunk.impl_relationships,
+            "extends_relationships": chunk.extends_relationships,
             "function_score": chunk.function_score,
-            "summary": ai_summary,
+            "summary": "",
         });
 
         records.push(Record {
@@ -165,7 +164,6 @@ pub async fn index_file(
             content: chunk.content,
             vector,
             metadata: metadata.to_string(),
-            quantized_code,
         });
     }
 

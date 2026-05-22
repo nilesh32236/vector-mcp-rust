@@ -279,7 +279,6 @@ async fn distill_package_internal(
     let record = crate::db::Record {
         id: format!("distill-{}", uuid::Uuid::new_v4()),
         content: summary,
-        quantized_code: embedder.quantize(&vector).ok(),
         vector,
         metadata: metadata.to_string(),
     };
@@ -300,6 +299,7 @@ fn is_interesting_event(event: &Event) -> bool {
             !path_str.contains("/node_modules/")
                 && !path_str.contains("/dist/")
                 && !path_str.contains("/build/")
+                && !path_str.contains("/out/")
                 && !path_str.contains("/.next/")
                 && !path_str.contains("/generated/prisma/")
                 && !path_str.contains("/target/")

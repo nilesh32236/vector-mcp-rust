@@ -10,12 +10,12 @@ use axum::{
 };
 use dashmap::DashMap;
 use futures::stream::Stream;
+use futures::StreamExt;
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::sync::mpsc;
-use tokio_stream::StreamExt;
 use tower_http::cors::CorsLayer;
 use tracing::info;
 use uuid::Uuid;
@@ -249,6 +249,94 @@ async fn sse_handler(
 }
 
 // ---------------------------------------------------------------------------
+// Token Streaming — GET /stream/summarize
+// ---------------------------------------------------------------------------
+
+/// GET /stream/summarize?session_id=<id>&record_id=<id>
+///
+/// Opens an SSE stream that emits each generated token piece as it is produced
+/// by `LlmWorker::summarize_streaming`.  A final `event: done` is sent when
+/// generation completes or the channel closes.
+async fn stream_summarize_handler(
+    State(manager): State<Arc<SseManager>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let record_id = match params.get("record_id").cloned() {
+        Some(id) => id,
+        None => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                "record_id query param is required",
+            )
+                .into_response();
+        }
+    };
+
+    // Look up the record content from the store.
+    let store = Arc::clone(&manager.server.store);
+    let record = match store.get_record_by_id(&record_id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return (
+                axum::http::StatusCode::NOT_FOUND,
+                format!("Record {record_id} not found"),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Store error: {e}"),
+            )
+                .into_response();
+        }
+    };
+
+    let worker = match &manager.server.llm_worker {
+        Some(w) => Arc::clone(w),
+        None => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "LLM worker not available (degraded mode)",
+            )
+                .into_response();
+        }
+    };
+
+    // Rate-limit streaming requests using the same limiter as message_handler.
+    let session_id = params.get("session_id").cloned().unwrap_or_else(|| "stream".to_string());
+    if !manager.server.rate_limiter.allow(&session_id) {
+        return (
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            "Rate limit exceeded (30 requests/min). Please slow down.",
+        )
+            .into_response();
+    }
+
+    let (token_tx, token_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let text = record.content.clone();
+
+    // Spawn the summarisation on the LLM worker thread and propagate errors.
+    tokio::spawn(async move {
+        if let Err(e) = worker.summarize_streaming(text, token_tx.clone()).await {
+            // Send an error event so the client receives a clear signal.
+            let _ = token_tx.send(format!("[ERROR] {e}"));
+        }
+    });
+
+    // Convert the token receiver into an SSE stream.
+    let stream = tokio_stream::wrappers::UnboundedReceiverStream::new(token_rx)
+        .map(|piece| Ok::<Event, std::convert::Infallible>(Event::default().data(piece)))
+        .chain(futures::stream::once(async {
+            Ok::<Event, std::convert::Infallible>(
+                Event::default().event("done").data(""),
+            )
+        }));
+
+    Sse::new(stream).into_response()
+}
+
+// ---------------------------------------------------------------------------
 // Server Bootstrap
 // ---------------------------------------------------------------------------
 
@@ -263,6 +351,7 @@ pub async fn start_sse_server(server: Arc<Server>, port: u16) -> anyhow::Result<
                 .delete(delete_session_handler),
         )
         .route("/message", post(message_handler))
+        .route("/stream/summarize", get(stream_summarize_handler))
         .route(
             "/.well-known/oauth-protected-resource",
             get(oauth_not_required),

@@ -1,32 +1,16 @@
-use anyhow::Result;
-use std::time::Instant;
-use tokio::fs;
+#[path = "../api/mod.rs"] pub mod api;
+#[path = "../config/mod.rs"] pub mod config;
+#[path = "../daemon/mod.rs"] pub mod daemon;
+#[path = "../db/mod.rs"] pub mod db;
+#[path = "../indexer/mod.rs"] pub mod indexer;
+#[path = "../llm/mod.rs"] pub mod llm;
+#[path = "../lsp/mod.rs"] pub mod lsp;
+#[path = "../mcp/mod.rs"] pub mod mcp;
+#[path = "../mutation/mod.rs"] pub mod mutation;
+#[path = "../security/mod.rs"] pub mod security;
+#[path = "../benchmark.rs"] pub mod benchmark;
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let path = "dummy_large_file.txt";
-    // 50 MB
-    let size = 50 * 1024 * 1024;
-    let dummy_data = vec![0u8; size];
-    fs::write(path, &dummy_data).await?;
-
-    let iterations = 100;
-
-    let start = Instant::now();
-    for _ in 0..iterations {
-        let _ = std::fs::read(path).unwrap();
-    }
-    let duration_sync = start.elapsed();
-    println!("Sync Read Duration: {:?}", duration_sync);
-
-    let start_async = Instant::now();
-    for _ in 0..iterations {
-        let _ = tokio::fs::read(path).await.unwrap();
-    }
-    let duration_async = start_async.elapsed();
-    println!("Async Read Duration: {:?}", duration_async);
-
-    fs::remove_file(path).await?;
-
-    Ok(())
+fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    benchmark::run(args)
 }

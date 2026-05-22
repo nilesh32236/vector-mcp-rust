@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 /// Controls optional subsystems that can be disabled on constrained hardware.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct FeatureToggles {
-    /// When `true`, the server loads and uses a local LLM for embeddings.
+    /// When `true`, the server loads and uses a local LLM for embeddings and
+    /// summarisation via `LlamaEngine`.
     pub enable_local_llm: bool,
     /// When `true`, the file-watcher triggers live re-indexing on save.
     pub enable_live_indexing: bool,
@@ -21,10 +22,8 @@ pub struct FeatureToggles {
 // Application Configuration
 // ---------------------------------------------------------------------------
 
-/// Central configuration mirroring the Go `config.Config` struct.
-///
-/// All fields are resolved once at startup via [`Config::load`] and then
-/// shared immutably (wrapped in `Arc`) with every subsystem.
+/// Central configuration resolved once at startup and shared immutably via
+/// `Arc<Config>` with every subsystem.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
     pub project_root: std::sync::RwLock<String>,
@@ -32,18 +31,27 @@ pub struct Config {
     pub db_path: PathBuf,
     pub models_dir: PathBuf,
     pub log_path: PathBuf,
+    /// Retained for future extensibility; not used to drive model loading.
     pub model_name: String,
+    /// Retained for future extensibility; not used to drive model loading.
     pub reranker_model_name: String,
     pub hf_token: String,
+    /// Embedding output dimension.  Defaults to 384 (e5-small-v2).
     pub dimension: usize,
     pub disable_watcher: bool,
     pub embedder_pool_size: usize,
     pub api_port: String,
-    pub gemini_api_key: String,
-    pub default_gemini_model: String,
-    // Kept for backward compat; Gemini integration removed — values are ignored.
-    pub model_path: String,
     pub feature_toggles: FeatureToggles,
+    /// Directory for KV-cache files (one `.kvcache` file per prompt hash).
+    /// Defaults to `models_dir/kv_cache/` when not set via `KV_CACHE_DIR`.
+    pub kv_cache_dir: PathBuf,
+    /// Maximum number of KV-cache entries to keep on disk (LRU eviction).
+    /// Defaults to 10. Configurable via `KV_CACHE_MAX_ENTRIES`.
+    pub kv_cache_max_entries: usize,
+    /// Path to the reranker GGUF model file.
+    /// Resolved from `RERANKER_MODEL_PATH` env var, or auto-detected from
+    /// `models_dir/bge-reranker-v2-m3-Q4_K_M.gguf` if the file exists.
+    pub reranker_model_path: Option<PathBuf>,
 }
 
 impl Config {
@@ -80,7 +88,7 @@ impl Config {
     }
 
     /// Load configuration from environment variables (and an optional `.env`
-    /// file).  Mirrors the Go `LoadConfig` function:
+    /// file).
     ///
     /// 1. Attempt to load `.env` (ignore if absent).
     /// 2. Resolve paths with the same fallback chain as the Go version.
@@ -91,20 +99,19 @@ impl Config {
 
         let home = dirs_home()?;
 
-        // --- path resolution (same chain as Go) --------------------------
-        let (data_dir, db_path, models_dir, log_path, project_root) = Self::resolve_paths(&home)?;
+        let (data_dir, db_path, models_dir, log_path, project_root) =
+            Self::resolve_paths(&home)?;
 
-        // Ensure directories exist (match Go's `os.MkdirAll`)
+        // Ensure directories exist.
         std::fs::create_dir_all(&db_path)
             .with_context(|| format!("creating db directory: {}", db_path.display()))?;
         std::fs::create_dir_all(&models_dir)
             .with_context(|| format!("creating models directory: {}", models_dir.display()))?;
 
         let model_name =
-            env::var("MODEL_NAME").unwrap_or_else(|_| "BAAI/bge-small-en-v1.5".to_string());
+            env::var("MODEL_NAME").unwrap_or_else(|_| "nomic-embed-text-v1.5".to_string());
 
-        let reranker_model_name = env::var("RERANKER_MODEL_NAME")
-            .unwrap_or_else(|_| "cross-encoder/ms-marco-MiniLM-L-6-v2".to_string());
+        let reranker_model_name = env::var("RERANKER_MODEL_NAME").unwrap_or_default();
 
         let disable_watcher = env::var("DISABLE_FILE_WATCHER")
             .map(|v| v.eq_ignore_ascii_case("true"))
@@ -118,30 +125,39 @@ impl Config {
 
         let api_port = env::var("API_PORT").unwrap_or_else(|_| "47821".to_string());
 
-        let default_gemini_model =
-            env::var("GEMINI_DEFAULT_MODEL").unwrap_or_else(|_| "gemini-2.5-flash".to_string());
+        // Default to 384 — the output dimension of e5-small-v2.
+        let dimension = env::var("EMBEDDING_DIM")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(384);
 
-        // --- feature toggles ----------------------------------------------
         let feature_toggles = FeatureToggles {
             enable_local_llm: env_bool("ENABLE_LOCAL_LLM"),
             enable_live_indexing: env_bool("ENABLE_LIVE_INDEXING"),
         };
 
-        let model_path = models_dir
-            .join(model_name.replace('/', "_"))
-            .join("model.onnx")
-            .display()
-            .to_string();
+        // KV-cache directory — defaults to models_dir/kv_cache/
+        let kv_cache_dir = env::var("KV_CACHE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| models_dir.join("kv_cache"));
 
-        let dimension = env::var("EMBEDDING_DIM")
+        std::fs::create_dir_all(&kv_cache_dir)
+            .with_context(|| format!("creating kv_cache directory: {}", kv_cache_dir.display()))?;
+
+        let kv_cache_max_entries: usize = env::var("KV_CACHE_MAX_ENTRIES")
             .ok()
-            .and_then(|v| v.parse::<usize>().ok())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10)
+            .max(1);
+
+        // Reranker model path — explicit env var, then auto-detect, then None.
+        let reranker_model_path = env::var("RERANKER_MODEL_PATH")
+            .ok()
+            .map(PathBuf::from)
             .or_else(|| {
-                crate::llm::models::get_model_registry()
-                    .get(model_name.as_str())
-                    .map(|m| m.dimension)
-            })
-            .unwrap_or(384);
+                let candidate = models_dir.join("bge-reranker-v2-m3-Q4_K_M.gguf");
+                if candidate.exists() { Some(candidate) } else { None }
+            });
 
         Ok(Self {
             project_root: std::sync::RwLock::new(project_root),
@@ -156,10 +172,10 @@ impl Config {
             disable_watcher,
             embedder_pool_size,
             api_port,
-            gemini_api_key: env::var("GEMINI_API_KEY").unwrap_or_default(),
-            default_gemini_model,
-            model_path,
             feature_toggles,
+            kv_cache_dir,
+            kv_cache_max_entries,
+            reranker_model_path,
         })
     }
 }
@@ -168,15 +184,12 @@ impl Config {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Returns the user's home directory, falling back to the system temp dir.
 fn dirs_home() -> Result<PathBuf> {
     env::var("HOME")
         .map(PathBuf::from)
         .or_else(|_| Ok(env::temp_dir()))
 }
 
-/// Read an env var; if unset or empty, call `default_fn` and convert to
-/// `String` via `Display`.
 fn env_or_default<F, P>(key: &str, default_fn: F) -> String
 where
     F: FnOnce() -> P,
@@ -188,8 +201,6 @@ where
     }
 }
 
-/// Parse a boolean-ish env var (`"true"` / `"1"` → `true`, anything else →
-/// `false`).
 fn env_bool(key: &str) -> bool {
     env::var(key)
         .map(|v| v.eq_ignore_ascii_case("true") || v == "1")

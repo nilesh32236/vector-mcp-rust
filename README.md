@@ -22,5 +22,26 @@ This Rust implementation is the successor to the original Go version (`vector-mc
 
 Please see the [Usage Guide](usage_guide.md) for full instructions on building, configuring, and attaching the server to your favorite MCP client.
 
+### Build Dependencies
+
+For optimal build performance, this project is configured to use the `mold` linker and `sccache`.
+
+#### Linux
+```bash
+sudo apt install mold
+```
+
+#### macOS
+```bash
+brew install mold
+```
+
+#### Cross-platform (Linux & macOS)
+```bash
+cargo install sccache
+```
+
+> **Alternative:** If you prefer not to install `mold` or `sccache`, comment out the `rustflags` and `rustc-wrapper` entries in `.cargo/config.toml` to use the default Rust toolchain without any additional linker or caching configuration.
+
 ## License
 MIT

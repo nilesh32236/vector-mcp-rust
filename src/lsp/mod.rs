@@ -11,6 +11,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::config::Config;
+
 use anyhow::{Result, bail};
 use dashmap::DashMap;
 use serde_json::Value;
@@ -25,10 +27,10 @@ use tracing::info;
 // ---------------------------------------------------------------------------
 
 /// Idle TTL before the language server process is killed.
-const IDLE_TTL: Duration = Duration::from_secs(600); // 10 minutes
+const IDLE_TTL: Duration = Duration::from_secs(86400); // 24 hours
 
 /// Maximum time to wait for a single LSP response.
-const CALL_TIMEOUT: Duration = Duration::from_secs(10);
+const CALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ---------------------------------------------------------------------------
 // Language server command map (mirrors Go's LanguageServerMapping)
@@ -38,8 +40,18 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 pub fn server_command(ext: &str) -> Option<Vec<&'static str>> {
     match ext.to_lowercase().trim_start_matches('.') {
         "go" => Some(vec!["gopls"]),
-        "js" | "jsx" => Some(vec!["typescript-language-server", "--stdio"]),
-        "ts" | "tsx" => Some(vec!["typescript-language-server", "--stdio"]),
+        "js" | "jsx" => Some(vec![
+            "typescript-language-server",
+            "--stdio",
+            "--tsserver-log-verbosity",
+            "off",
+        ]),
+        "ts" | "tsx" => Some(vec![
+            "typescript-language-server",
+            "--stdio",
+            "--tsserver-log-verbosity",
+            "off",
+        ]),
         "rs" => Some(vec!["rust-analyzer"]),
         "py" => Some(vec!["pylsp"]),
         _ => None,
@@ -133,6 +145,41 @@ impl LspManager {
     /// Send a JSON-RPC request and await the response (up to [`CALL_TIMEOUT`]).
     pub async fn call(&self, method: &str, params: Value) -> Result<Value> {
         self.ensure_started().await?;
+
+        // Open the document first so tsserver loads it into its semantic index.
+        if let Some(uri) = params
+            .get("textDocument")
+            .and_then(|td| td.get("uri"))
+            .and_then(|u| u.as_str())
+        {
+            let file_path = uri.trim_start_matches("file://");
+            if let Ok(content) = std::fs::read_to_string(file_path) {
+                let ext = std::path::Path::new(file_path)
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("");
+                let lang_id = match ext {
+                    "ts" | "tsx" => "typescript",
+                    "js" | "jsx" => "javascript",
+                    _ => ext,
+                };
+                let _ = self
+                    .notify(
+                        "textDocument/didOpen",
+                        serde_json::json!({
+                            "textDocument": {
+                                "uri": uri,
+                                "languageId": lang_id,
+                                "version": 1,
+                                "text": content
+                            }
+                        }),
+                    )
+                    .await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+
         self.call_inner(method, params).await
     }
 
@@ -195,9 +242,19 @@ impl LspManager {
     /// Ensure the language server is running, starting it if necessary.
     pub async fn ensure_started(&self) -> Result<()> {
         let mut g = self.inner.lock().await;
-        if g.child.is_some() {
-            g.last_used = Instant::now();
-            return Ok(());
+        if let Some(ref mut child) = g.child {
+            // Check whether the child is still alive before reusing it.
+            match child.try_wait() {
+                Ok(None) => {
+                    // Still running.
+                    g.last_used = Instant::now();
+                    return Ok(());
+                }
+                _ => {
+                    // Exited or error — reset so we respawn below.
+                    kill_child(&mut g);
+                }
+            }
         }
         if self.cmd.is_empty() {
             bail!("no LSP command configured");
@@ -211,6 +268,7 @@ impl LspManager {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
             .spawn()?;
 
         let stdin: ChildStdin = child.stdin.take().unwrap();
@@ -373,48 +431,97 @@ async fn write_message(stdin: &mut ChildStdin, msg: &Value) -> Result<()> {
 // Session pool
 // ---------------------------------------------------------------------------
 
-/// Per-(extension, root) pool of [`LspManager`] instances.
+/// Per-extension pool of [`LspManager`] instances.
 ///
-/// Lazily creates one manager per file extension. Managers are kept alive
-/// until their idle TTL expires.
+/// Reads the current project root from `Arc<Config>` at session-creation time
+/// so that `set_project_root` is always reflected without restarting the server.
 pub struct LspPool {
     sessions: DashMap<String, Arc<LspManager>>,
-    root: String,
+    config: Arc<Config>,
 }
 
 impl LspPool {
-    /// Create a new pool rooted at `root`.
-    pub fn new(root: String) -> Self {
+    pub fn new(config: Arc<Config>) -> Self {
         Self {
             sessions: DashMap::new(),
-            root,
+            config,
         }
+    }
+
+    /// Drop all cached sessions. Call this after `set_project_root` so the
+    /// next `get` creates a fresh manager pointed at the new root.
+    pub fn invalidate_all(&self) {
+        self.sessions.clear();
     }
 
     /// Get or create an [`LspManager`] for the given file extension.
     ///
-    /// Returns `None` if no LSP server is configured for that extension.
+    /// Always reads the current root from `Config` so stale sessions are
+    /// replaced when the root changes.
     pub fn get(&self, ext: &str) -> Option<Arc<LspManager>> {
         let cmd = server_command(ext)?;
-        Some(
-            self.sessions
-                .entry(ext.to_string())
-                .or_insert_with(|| {
-                    Arc::new(LspManager::new(
-                        cmd.iter().map(|s| s.to_string()).collect(),
-                        self.root.clone(),
-                    ))
-                })
-                .clone(),
-        )
+        let root = self.config.project_root.read().unwrap().clone();
+
+        // If a cached session exists but was started for a different root, evict it.
+        if let Some(existing) = self.sessions.get(ext) {
+            if existing.root == root {
+                return Some(existing.clone());
+            }
+            drop(existing);
+            self.sessions.remove(ext);
+        }
+
+        let manager = Arc::new(LspManager::new(
+            cmd.iter().map(|s| s.to_string()).collect(),
+            root,
+        ));
+        self.sessions.insert(ext.to_string(), Arc::clone(&manager));
+        Some(manager)
     }
 
-    /// Derive the file extension from a path and return the matching manager.
+    /// Derive the file extension from a path and return the matching manager,
+    /// rooted at the nearest `tsconfig.json` directory for that file.
     pub fn get_for_path(&self, path: &str) -> Option<Arc<LspManager>> {
         let ext = Path::new(path)
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| format!(".{e}"))?;
-        self.get(&ext)
+
+        // Use the nearest tsconfig.json directory so cross-package resolution
+        // works correctly in monorepos (each package gets its own LSP session).
+        let root = find_nearest_tsconfig(path)
+            .unwrap_or_else(|| self.config.project_root.read().unwrap().clone());
+
+        self.get_with_root(&ext, root)
+    }
+
+    /// Get or create a session for a specific (extension, root) pair.
+    /// Used by `get_for_path` and by pre-warming.
+    pub fn get_with_root(&self, ext: &str, root: String) -> Option<Arc<LspManager>> {
+        let cmd = server_command(ext)?;
+        let cache_key = format!("{}:{}", ext, root);
+
+        if let Some(existing) = self.sessions.get(&cache_key) {
+            return Some(existing.clone());
+        }
+
+        let manager = Arc::new(LspManager::new(
+            cmd.iter().map(|s| s.to_string()).collect(),
+            root,
+        ));
+        self.sessions.insert(cache_key, Arc::clone(&manager));
+        Some(manager)
+    }
+}
+
+/// Walk up from `file_path` to find the nearest directory containing a
+/// `tsconfig.json`. Returns `None` if none is found before the filesystem root.
+fn find_nearest_tsconfig(file_path: &str) -> Option<String> {
+    let mut dir = Path::new(file_path).parent()?;
+    loop {
+        if dir.join("tsconfig.json").exists() {
+            return Some(dir.to_string_lossy().to_string());
+        }
+        dir = dir.parent()?;
     }
 }
