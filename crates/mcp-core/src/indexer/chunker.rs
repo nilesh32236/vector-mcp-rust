@@ -650,6 +650,17 @@ static PHP_USE_RE: LazyLock<regex::Regex> =
 static RUST_USE_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"use\s+([^;]+);").unwrap());
 
+static LINE_COMMENT_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"//[^\n]*").unwrap());
+static BLOCK_COMMENT_RE: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"/\*[\s\S]*?\*/").unwrap());
+
+fn strip_rust_comments(text: &str) -> String {
+    let without_line = LINE_COMMENT_RE.replace_all(text, "");
+    let without_block = BLOCK_COMMENT_RE.replace_all(&without_line, "");
+    without_block.to_string()
+}
+
 fn parse_js_relationships(text: &str, relations: &mut Vec<String>) {
     // import/from/require paths
     for cap in JS_PATH_RE.captures_iter(text) {
@@ -708,9 +719,20 @@ fn parse_php_relationships(text: &str, relations: &mut Vec<String>) {
 }
 
 fn parse_rust_relationships(text: &str, relations: &mut Vec<String>) {
-    for cap in RUST_USE_RE.captures_iter(text) {
+    let cleaned = strip_rust_comments(text);
+    for cap in RUST_USE_RE.captures_iter(&cleaned) {
         if let Some(m) = cap.get(1) {
-            relations.push(m.as_str().trim().to_owned());
+            let captured = m.as_str().trim().to_owned();
+            if captured.contains(' ') {
+                if let Some((_, alias)) = captured.split_once(" as ") {
+                    if alias.contains(' ') || alias.is_empty() {
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            }
+            relations.push(captured);
         }
     }
 }
@@ -872,11 +894,18 @@ mod tests {
         let code = r#"
             use std::collections::HashMap;
             use crate::db::Store;
+            // use inside a comment;
+            /// Use the value from config;
         "#;
         let mut relations = Vec::new();
         parse_rust_relationships(code, &mut relations);
         assert!(relations.contains(&"std::collections::HashMap".to_string()));
         assert!(relations.contains(&"crate::db::Store".to_string()));
+        assert!(!relations.contains(&"inside a comment".to_string()));
+        assert!(!relations.contains(&"inside".to_string()));
+        assert!(!relations.contains(&"the value from config".to_string()));
+        assert!(!relations.contains(&"the".to_string()));
+        assert!(!relations.contains(&"value".to_string()));
     }
 
     #[test]

@@ -23,6 +23,9 @@ use crate::db::Store;
 use crate::llm::embedding::Embedder;
 use crate::llm::kv_cache::KvCacheStore;
 use crate::llm::summarizer::Summarizer;
+use crate::mcp::handlers;
+use crate::mcp::protocol::CallToolParams;
+use crate::mcp::server::Server as McpServer;
 use crate::security::ratelimit::RateLimiter;
 
 // ---------------------------------------------------------------------------
@@ -42,6 +45,8 @@ pub struct ApiState {
     pub version: &'static str,
     /// Optional KV-cache store reference for the /api/cache/status endpoint.
     pub kv_cache: Option<Arc<KvCacheStore>>,
+    /// MCP server reference for proxying tool calls via REST.
+    pub mcp_server: Arc<McpServer>,
 }
 
 // ---------------------------------------------------------------------------
@@ -316,6 +321,37 @@ async fn handle_context(
 }
 
 // ---------------------------------------------------------------------------
+// MCP proxy — exposes MCP tool calls via the REST API
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct McpCallRequest {
+    tool: String,
+    arguments: serde_json::Value,
+}
+
+async fn handle_mcp_call(
+    State(s): State<Arc<ApiState>>,
+    Json(req): Json<McpCallRequest>,
+) -> impl IntoResponse {
+    let params = CallToolParams {
+        name: req.tool,
+        arguments: req.arguments,
+    };
+    match handlers::dispatch(&s.mcp_server, &params, None).await {
+        Ok(result) => {
+            let text = result.content.first().map(|c| c.text.as_str()).unwrap_or("");
+            Json(serde_json::json!({ "result": text })).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Router
 // ---------------------------------------------------------------------------
 
@@ -331,6 +367,7 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/tools/skeleton", get(handle_tools_skeleton))
         .route("/cache/status", get(handle_cache_status))
         .route("/graph/stats", get(handle_graph_stats))
+        .route("/mcp/call", post(handle_mcp_call))
         .route("/search", post(handle_search))
         .route("/context", post(handle_context));
 

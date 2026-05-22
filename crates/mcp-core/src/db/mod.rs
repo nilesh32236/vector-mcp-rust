@@ -753,6 +753,15 @@ impl Store {
         Ok(())
     }
 
+    /// Delete all rows from the project_context table.
+    pub async fn clear_project_context(&self) -> Result<()> {
+        self.project_context
+            .delete("true")
+            .await
+            .context("Clearing project context table")?;
+        Ok(())
+    }
+
     pub async fn get_project_context(&self, project_id: &str) -> Result<Vec<String>> {
         let predicate = format!("project_id = '{}'", sql_escape(project_id));
         let stream = self

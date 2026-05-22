@@ -4,7 +4,7 @@ import { ThemeProvider } from "next-themes";
 import { ToasterClient } from "@/components/ToasterClient";
 
 export const metadata: Metadata = {
-  title: "VectorWiki - Local Code Intelligence",
+  title: "VectorMCP - Code Intelligence Dashboard",
   description: "Semantic search and documentation explorer for your codebase",
 };
 

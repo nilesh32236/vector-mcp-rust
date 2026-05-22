@@ -313,10 +313,15 @@ async fn handle_find_duplicate_code(
 
 async fn handle_delete_context(server: &Server, params: &CallToolParams) -> Result<CallToolResult> {
     let target_path = require_string_arg(params, "target_path")?;
-    server.store.delete_by_path(&target_path).await?;
-    Ok(CallToolResult::text(format!(
-        "Deleted context for {target_path}"
-    )))
+    if target_path == "ALL" {
+        server.store.clear_project_context().await?;
+        Ok(CallToolResult::text("Cleared all project context entries."))
+    } else {
+        server.store.delete_by_path(&target_path).await?;
+        Ok(CallToolResult::text(format!(
+            "Deleted context for {target_path}"
+        )))
+    }
 }
 
 async fn handle_index_status(server: &Server) -> Result<CallToolResult> {
@@ -771,6 +776,8 @@ async fn handle_analyze_architecture(
     // adjacency: src_pkg -> set of target_pkgs
     let mut adj: HashMap<String, HashSet<String>> = HashMap::new();
 
+    let valid_crate_re = regex::Regex::new(r"^[a-zA-Z_][a-zA-Z0-9_-]*$").unwrap();
+
     for r in records {
         let meta = r.metadata_json();
         let path = meta["path"].as_str().unwrap_or("").to_string();
@@ -778,8 +785,6 @@ async fn handle_analyze_architecture(
             continue;
         }
 
-        // Strip the project root prefix so we work with relative paths.
-        // trim_start_matches('/') handles the case where root does not end with '/'.
         let rel_path = if path.starts_with(&root) {
             path[root.len()..].trim_start_matches('/').to_string()
         } else {
@@ -796,6 +801,11 @@ async fn handle_analyze_architecture(
             parts[0].to_string()
         };
 
+        // Only extract imports from Rust source files
+        if !path.ends_with(".rs") {
+            continue;
+        }
+
         let rels: Vec<String> = meta["relationships"]
             .as_array()
             .map(|a| {
@@ -806,9 +816,22 @@ async fn handle_analyze_architecture(
             .unwrap_or_default();
 
         for rel in rels {
-            if monorepo_prefix.is_empty() || rel.starts_with(&monorepo_prefix) {
-                adj.entry(src_pkg.clone()).or_default().insert(rel);
+            if !monorepo_prefix.is_empty() && !rel.starts_with(&monorepo_prefix) {
+                continue;
             }
+            let crate_name = rel
+                .split(|c: char| c == ':' || c == '/' || c == ' ')
+                .next()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&rel)
+                .to_string();
+            if matches!(crate_name.as_str(), "crate" | "super" | "self" | "." | "..") {
+                continue;
+            }
+            if !valid_crate_re.is_match(&crate_name) {
+                continue;
+            }
+            adj.entry(src_pkg.clone()).or_default().insert(crate_name);
         }
     }
 
@@ -1017,7 +1040,26 @@ async fn handle_filesystem_grep(
     server: &Server,
     params: &CallToolParams,
 ) -> Result<CallToolResult> {
-    let query = require_string_arg(params, "query")?.to_lowercase();
+    let query = require_string_arg(params, "query")?;
+    let is_regex = params
+        .arguments
+        .get("is_regex")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let regex = if is_regex {
+        match regex::Regex::new(&query) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                return Ok(CallToolResult::error(format!(
+                    "Invalid regex pattern '{query}': {e}"
+                )));
+            }
+        }
+    } else {
+        None
+    };
+
     let root = server.config.project_root.read().clone();
 
     // Collect file paths in a blocking task to avoid blocking the async runtime.
@@ -1039,7 +1081,11 @@ async fn handle_filesystem_grep(
     'outer: for path in paths {
         if let Ok(content) = tokio::fs::read_to_string(&path).await {
             for (i, line) in content.lines().enumerate() {
-                if line.to_lowercase().contains(&query) {
+                let matched = match &regex {
+                    Some(re) => re.is_match(line),
+                    None => line.to_lowercase().contains(&query.to_lowercase()),
+                };
+                if matched {
                     results.push(format!("{}:{}: {}", path.display(), i + 1, line.trim()));
                     if results.len() >= 100 {
                         break 'outer;
@@ -1258,69 +1304,69 @@ async fn handle_list_api_endpoints(
     server: &Server,
     _params: &CallToolParams,
 ) -> Result<CallToolResult> {
-    let keywords = [
-        // Existing patterns — Go, Express, Flask
-        "HandleFunc",
-        "mux.Handle",
-        "app.GET",
-        "app.POST",
-        "router.Register",
-        "Route(",
-        "@app.route",
-        // Axum patterns — both forms to handle rustfmt line-breaking.
-        // `.route(` (without the quote) catches `.route("/path", ...)` on one line
-        // and the multi-line formatted form where the path string is on the next line.
-        ".route(",
-        "routing::get",
-        "routing::post",
-        "routing::put",
-        "routing::delete",
-        "routing::patch",
-    ];
+    // Scan source files for route patterns instead of relying on indexed chunks.
+    let root = server.config.project_root.read().clone();
 
-    let mut unique: HashMap<String, crate::db::Record> = HashMap::new();
-    for kw in keywords {
-        let matches = server.store.lexical_search(kw, 20, None).await?;
-        for m in matches {
-            let meta = m.metadata_json();
-            let path = meta["path"].as_str().unwrap_or("");
-            // Skip documentation files and non-source directories.
-            if path.ends_with(".md")
-                || path.contains("/docs/")
-                || path.contains("/node_modules/")
-                || path.contains("/.kiro/")
-            {
-                continue;
+    let route_re = regex::Regex::new(
+        r#"(?:\.route\s*\(\s*"([^"]+)")|(?:app\.(GET|POST|PUT|DELETE|PATCH)\s*\(\s*"([^"]+)")|(?:@app\.route\s*\(\s*['"]([^'"]+))"#,
+    )
+    .expect("static route regex");
+
+    let paths = tokio::task::spawn_blocking(move || {
+        let walker = ignore::WalkBuilder::new(&root)
+            .standard_filters(true)
+            .hidden(true)
+            .add_custom_ignore_filename(".vector-ignore")
+            .build();
+        walker
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|ft| ft.is_file()).unwrap_or(false))
+            .map(|e| e.path().to_path_buf())
+            .filter(|p| {
+                let s = p.to_string_lossy();
+                !s.ends_with(".md") && !s.contains("/docs/") && !s.contains("/node_modules/")
+            })
+            .collect::<Vec<_>>()
+    })
+    .await?;
+
+    let mut file_entries: HashMap<String, Vec<(usize, String)>> = HashMap::new();
+
+    for path in paths {
+        let Ok(content) = tokio::fs::read_to_string(&path).await else { continue };
+        for (i, line) in content.lines().enumerate() {
+            if let Some(caps) = route_re.captures(line) {
+                let route = caps
+                    .get(1)
+                    .or_else(|| caps.get(2))
+                    .or_else(|| caps.get(3))
+                    .or_else(|| caps.get(4))
+                    .map(|m| m.as_str())
+                    .unwrap_or(line.trim());
+                file_entries
+                    .entry(path.to_string_lossy().to_string())
+                    .or_default()
+                    .push((i + 1, route.to_string()));
             }
-            let key = format!("{}:{}", path, meta["start_line"].as_u64().unwrap_or(0));
-            unique.insert(key, m);
         }
     }
 
-    if unique.is_empty() {
+    if file_entries.is_empty() {
         return Ok(CallToolResult::text("No API routing patterns detected."));
     }
 
-    // ⚡ Bolt Performance Optimization:
-    // Avoid allocating and cloning strings into a new vector.
-    // We can just collect references to the keys and use sort_unstable
-    // which is faster and allocates less memory.
-    let mut keys: Vec<_> = unique.keys().collect();
-    keys.sort_unstable();
-
     let mut out = String::from("## 🌐 Detected API Endpoints / Routes\n\n");
-    for k in keys {
-        let r = &unique[k];
-        let meta = r.metadata_json();
-        // ⚡ Bolt Performance Optimization:
-        // Avoid intermediate string allocations
-        let _ = write!(
-            out,
-            "### {} (Line {})\n```\n{}\n```\n\n",
-            meta["path"].as_str().unwrap_or("?"),
-            meta["start_line"].as_u64().unwrap_or(0),
-            r.content.trim()
-        );
+    let mut files: Vec<_> = file_entries.keys().collect();
+    files.sort();
+    for file in files {
+        let entries = &file_entries[file];
+        let mut sorted = entries.clone();
+        sorted.sort_by_key(|(line, _)| *line);
+        let _ = writeln!(out, "### {file}");
+        for (line, route) in &sorted {
+            let _ = writeln!(out, "- Line {line}: `{route}`");
+        }
+        out.push('\n');
     }
     Ok(CallToolResult::text(out))
 }
@@ -2730,6 +2776,7 @@ async fn handle_apply_patch(server: &Server, params: &CallToolParams) -> Result<
     let abs_str = abs.to_string_lossy().to_string();
 
     // --- LSP safety verification (if a server is available for this language) ---
+    let mut lsp_warning = String::new();
     if let Some(lsp) = server.lsp_pool.get_for_path(&abs_str) {
         match crate::mutation::SafetyChecker::verify_patch(&lsp, &abs_str, &search, &replace).await
         {
@@ -2745,11 +2792,13 @@ async fn handle_apply_patch(server: &Server, params: &CallToolParams) -> Result<
                 tracing::warn!(path = %path, "LSP warnings on patch: {report}");
             }
             Err(e) => {
-                // LSP unavailable or timed out — fall through and apply anyway.
+                lsp_warning = format!("\n⚠️  LSP verification unavailable: {e}");
                 tracing::warn!(path = %path, "LSP verification skipped: {e}");
             }
             _ => {} // No diagnostics — safe to proceed.
         }
+    } else {
+        lsp_warning = "\n⚠️  No LSP server found for this file type — patch applied without verification.".to_string();
     }
 
     // --- Apply patch to disk ---
@@ -2766,7 +2815,7 @@ async fn handle_apply_patch(server: &Server, params: &CallToolParams) -> Result<
         .await
         .map_err(|e| anyhow::anyhow!("write failed: {e}"))?;
 
-    Ok(CallToolResult::text(format!("✅ Patched {path}")))
+    Ok(CallToolResult::text(format!("✅ Patched {path}{lsp_warning}")))
 }
 
 fn handle_create_file(server: &Server, params: &CallToolParams) -> Result<CallToolResult> {
