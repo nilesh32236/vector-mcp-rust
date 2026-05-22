@@ -26,7 +26,8 @@ pub struct FeatureToggles {
 /// `Arc<Config>` with every subsystem.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {
-    pub project_root: std::sync::RwLock<String>,
+    #[serde(skip, default = "default_project_root")]
+    pub project_root: parking_lot::RwLock<String>,
     pub data_dir: PathBuf,
     pub db_path: PathBuf,
     pub models_dir: PathBuf,
@@ -163,7 +164,7 @@ impl Config {
             });
 
         Ok(Self {
-            project_root: std::sync::RwLock::new(project_root),
+            project_root: parking_lot::RwLock::new(project_root),
             data_dir,
             db_path,
             models_dir,
@@ -202,6 +203,10 @@ where
         Ok(v) if !v.is_empty() => v,
         _ => default_fn().to_string(),
     }
+}
+
+fn default_project_root() -> parking_lot::RwLock<String> {
+    parking_lot::RwLock::new(String::new())
 }
 
 fn env_bool(key: &str) -> bool {

@@ -6,14 +6,17 @@ rust-version = "1.87"
 
 [dependencies]
 anyhow = "1"
-llama-cpp-2 = { version = "0.1.145", features = ["vulkan"] }
+llama-cpp-2 = { version = "0.1.145" }
 sha2 = "0.10"
 hex = "0.4"
 tracing = "0.1"
 tokio = { version = "1", features = ["sync"] }
 encoding_rs = "0.8"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 
 [dev-dependencies]
 tempfile = "3"
+
+[features]
+default = ["vulkan"]
+vulkan = ["llama-cpp-2/vulkan"]
+cuda = ["llama-cpp-2/cuda"]

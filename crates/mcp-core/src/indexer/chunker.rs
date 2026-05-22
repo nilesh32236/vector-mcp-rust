@@ -238,8 +238,8 @@ pub fn parse_markdown(content: &str, file_path: &str) -> Vec<Chunk> {
             }
 
             // Find the line numbers of this code block within the section.
-            let match_start = cap.get(0).unwrap().start();
-            let match_end = cap.get(0).unwrap().end();
+            let match_start = cap.get(0).map(|m| m.start()).unwrap_or(0);
+            let match_end = cap.get(0).map(|m| m.end()).unwrap_or(0);
             code_ranges.push((match_start, match_end));
 
             let code_start_line = start_line

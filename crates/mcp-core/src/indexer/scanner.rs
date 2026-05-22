@@ -1,6 +1,7 @@
 use anyhow::Result;
 use futures::StreamExt;
 use ignore::{DirEntry, WalkBuilder};
+use parking_lot::RwLock;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
@@ -51,7 +52,7 @@ pub async fn scan_project(
     store: Arc<Store>,
     embedder: Arc<Embedder>,
     summarizer: Arc<Summarizer>,
-    progress: Arc<std::sync::RwLock<ProgressState>>,
+    progress: Arc<RwLock<ProgressState>>,
     progress_tx: Option<tokio::sync::mpsc::Sender<ScanProgress>>,
 ) -> Result<()> {
     let force_reindex = std::env::var("FORCE_REINDEX")
@@ -69,7 +70,7 @@ pub async fn scan_project(
                 existing_count
             );
             {
-                let mut p = progress.write().unwrap();
+                let mut p = progress.write();
                 p.status = "Ready".into();
                 p.indexed_files = existing_count as u64;
                 p.total_files = existing_count as u64;
@@ -106,11 +107,11 @@ pub async fn scan_project(
         Arc::clone(&summarizer),
         Arc::clone(&config),
     );
-    let root = config.project_root.read().unwrap().clone();
+    let root = config.project_root.read().clone();
     info!("Starting initial project scan: {}", root);
 
     {
-        let mut p = progress.write().unwrap();
+        let mut p = progress.write();
         *p = ProgressState {
             status: "scanning".into(),
             ..Default::default()
@@ -178,7 +179,7 @@ pub async fn scan_project(
             async move {
                 let n = discovered.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 {
-                    let mut p = progress.write().unwrap();
+                    let mut p = progress.write();
                     p.current_file = path_str.clone();
                     p.total_files = n;
                 }
@@ -197,12 +198,12 @@ pub async fn scan_project(
                             let _ = record_tx.send((path_str, records)).await;
                         }
                         let c = indexed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                        let mut p = progress.write().unwrap();
+                        let mut p = progress.write();
                         p.indexed_files = c;
                     }
                     Err(e) => {
                         warn!("Failed to index {}: {:?}", path_str, e);
-                        let mut p = progress.write().unwrap();
+                        let mut p = progress.write();
                         p.errors.push(format!("{}: {}", path_str, e));
                     }
                 }
@@ -260,7 +261,7 @@ pub async fn scan_project(
 
     // Mark status as Ready immediately — don't block on the graph rebuild.
     {
-        let mut p = progress.write().unwrap();
+        let mut p = progress.write();
         p.status = "Ready".into();
         p.indexed_files = final_count;
         p.total_files = total;

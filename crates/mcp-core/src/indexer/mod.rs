@@ -142,7 +142,7 @@ pub async fn index_file(
     for (i, (chunk, vector)) in chunks.into_iter().zip(all_vectors).enumerate() {
         let metadata = json!({
             "path": path,
-            "project_id": config.project_root.read().unwrap().clone(),
+            "project_id": config.project_root.read().clone(),
             "type": chunk.node_type,
             "updated_at": updated_at,
             "content_hash": current_hash,
@@ -159,12 +159,7 @@ pub async fn index_file(
         });
 
         records.push(Record {
-            id: format!(
-                "{}-{}-{}",
-                config.project_root.read().unwrap().clone(),
-                path,
-                i
-            ),
+            id: format!("{}-{}-{}", config.project_root.read().clone(), path, i),
             content: chunk.content,
             vector,
             metadata: metadata.to_string(),

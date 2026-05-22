@@ -33,7 +33,7 @@ pub struct SseManager {
     sessions: DashMap<String, SessionSender>,
     server: Arc<Server>,
     /// Most recently active session (fallback for clients that don't send mcp-session-id)
-    last_session: Arc<std::sync::RwLock<Option<String>>>,
+    last_session: Arc<parking_lot::RwLock<Option<String>>>,
 }
 
 impl SseManager {
@@ -41,7 +41,7 @@ impl SseManager {
         Self {
             sessions: DashMap::new(),
             server,
-            last_session: Arc::new(std::sync::RwLock::new(None)),
+            last_session: Arc::new(parking_lot::RwLock::new(None)),
         }
     }
 }
@@ -114,7 +114,8 @@ async fn message_handler(
         // Pre-register a placeholder progress sender (replaced when GET /sse opens the stream)
         let (val_tx, _) = mpsc::unbounded_channel::<serde_json::Value>();
         manager.server.progress_senders.insert(sid.clone(), val_tx);
-        if let Ok(mut last) = manager.last_session.write() {
+        {
+            let mut last = manager.last_session.write();
             *last = Some(sid.clone());
         }
         let response = manager
@@ -134,7 +135,7 @@ async fn message_handler(
 
     // All other requests require a valid session ID — fall back to last known session
     let sid = provided_sid
-        .or_else(|| manager.last_session.read().ok().and_then(|g| g.clone()))
+        .or_else(|| manager.last_session.read().clone())
         .unwrap_or_default();
 
     let server = Arc::clone(&manager.server);
@@ -203,7 +204,8 @@ async fn sse_handler(
 
     let (tx, rx) = mpsc::unbounded_channel::<Event>();
     manager.sessions.insert(session_id.clone(), tx.clone());
-    if let Ok(mut last) = manager.last_session.write() {
+    {
+        let mut last = manager.last_session.write();
         *last = Some(session_id.clone());
     }
 
@@ -243,7 +245,8 @@ async fn sse_handler(
     let mut response = Sse::new(cleanup).into_response();
     response.headers_mut().insert(
         header::HeaderName::from_static("mcp-session-id"),
-        header::HeaderValue::from_str(&session_id).unwrap(),
+        header::HeaderValue::from_str(&session_id)
+            .unwrap_or_else(|_| header::HeaderValue::from_static("fallback")),
     );
     response
 }

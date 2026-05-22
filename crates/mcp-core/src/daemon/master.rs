@@ -85,7 +85,7 @@ pub struct MasterServer {
     /// Channel for enqueuing paths to the background indexer.
     index_tx: tokio::sync::mpsc::Sender<String>,
     /// Live indexing progress (shared with the scanner).
-    progress: Arc<std::sync::RwLock<crate::indexer::scanner::ProgressState>>,
+    progress: Arc<parking_lot::RwLock<crate::indexer::scanner::ProgressState>>,
 }
 
 impl MasterServer {
@@ -97,7 +97,7 @@ impl MasterServer {
         store: Arc<Store>,
         embedder: Arc<Embedder>,
         index_tx: tokio::sync::mpsc::Sender<String>,
-        progress: Arc<std::sync::RwLock<crate::indexer::scanner::ProgressState>>,
+        progress: Arc<parking_lot::RwLock<crate::indexer::scanner::ProgressState>>,
     ) -> Self {
         Self {
             socket_path: socket_path.into(),
@@ -182,15 +182,23 @@ impl MasterServer {
 
     async fn dispatch(&self, req: Request) -> Response {
         match req {
-            Request::Embed { text } => match self.embedder.embed_text(&text) {
-                Ok(v) => Response::ok(serde_json::json!({ "embedding": v })),
-                Err(e) => Response::err(e.to_string()),
-            },
+            Request::Embed { text } => {
+                let embedder = Arc::clone(&self.embedder);
+                match tokio::task::spawn_blocking(move || embedder.embed_text(&text)).await {
+                    Ok(Ok(v)) => Response::ok(serde_json::json!({ "embedding": v })),
+                    Ok(Err(e)) => Response::err(e.to_string()),
+                    Err(e) => Response::err(format!("embedding task panicked: {e}")),
+                }
+            }
 
-            Request::EmbedQuery { text } => match self.embedder.embed_query(&text) {
-                Ok(v) => Response::ok(serde_json::json!({ "embedding": v })),
-                Err(e) => Response::err(e.to_string()),
-            },
+            Request::EmbedQuery { text } => {
+                let embedder = Arc::clone(&self.embedder);
+                match tokio::task::spawn_blocking(move || embedder.embed_query(&text)).await {
+                    Ok(Ok(v)) => Response::ok(serde_json::json!({ "embedding": v })),
+                    Ok(Err(e)) => Response::err(e.to_string()),
+                    Err(e) => Response::err(format!("embedding task panicked: {e}")),
+                }
+            }
 
             Request::HybridSearch {
                 query,
@@ -207,7 +215,7 @@ impl MasterServer {
             },
 
             Request::GetProgress => {
-                let p = self.progress.read().unwrap();
+                let p = self.progress.read();
                 Response::ok(serde_json::to_value(&*p).unwrap_or_default())
             }
 

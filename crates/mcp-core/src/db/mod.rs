@@ -6,10 +6,11 @@ use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema};
 use futures::TryStreamExt;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::{Connection, Table as LanceTable, connect};
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tantivy::collector::TopDocs;
 use tantivy::query::QueryParser;
 use tantivy::schema::{
@@ -51,7 +52,7 @@ impl LexicalIndex {
     fn open_or_create(path: &Path, read_only: bool) -> Result<Self> {
         let mut schema_builder = TantivySchema::builder();
         let id = schema_builder.add_text_field("id", STRING | STORED);
-        let text = schema_builder.add_text_field("text", TEXT | STORED);
+        let text = schema_builder.add_text_field("text", TEXT);
         let schema = schema_builder.build();
 
         let index_exists =
@@ -141,7 +142,7 @@ impl LexicalIndex {
         let Some(w) = &self.writer else {
             return Ok(());
         };
-        let mut writer = w.write().unwrap();
+        let mut writer = w.write();
         writer.delete_term(Term::from_field_text(self.fields.id, doc_id));
         writer.add_document(doc!(
             self.fields.id => doc_id,
@@ -156,7 +157,7 @@ impl LexicalIndex {
         let Some(w) = &self.writer else {
             return Ok(());
         };
-        let writer = w.write().unwrap();
+        let writer = w.write();
         writer.delete_term(Term::from_field_text(self.fields.id, doc_id));
         writer.add_document(doc!(
             self.fields.id => doc_id,
@@ -167,7 +168,7 @@ impl LexicalIndex {
 
     fn commit(&self) -> Result<()> {
         if let Some(w) = &self.writer {
-            w.write().unwrap().commit()?;
+            w.write().commit()?;
         }
         Ok(())
     }
@@ -180,7 +181,7 @@ impl LexicalIndex {
         let Some(w) = &self.writer else {
             return Ok(());
         };
-        let mut writer = w.write().unwrap();
+        let mut writer = w.write();
         writer.delete_term(Term::from_field_text(self.fields.id, doc_id));
         writer.commit()?;
         Ok(())
@@ -193,7 +194,7 @@ impl LexicalIndex {
         let Some(w) = &self.writer else {
             return Ok(());
         };
-        let writer = w.write().unwrap();
+        let writer = w.write();
         writer.delete_term(Term::from_field_text(self.fields.id, doc_id));
         Ok(())
     }
@@ -388,7 +389,7 @@ impl Store {
             return Ok(HashMap::new());
         }
 
-        let mut map = HashMap::new();
+        let mut map = HashMap::with_capacity(ids.len());
         let fields = if need_metadata {
             vec!["id".to_string(), "metadata".to_string()]
         } else {
@@ -571,7 +572,7 @@ impl Store {
 
         let results = query.execute().await?;
         let batches = results.try_collect::<Vec<_>>().await?;
-        let mut ids = Vec::new();
+        let mut ids = Vec::with_capacity(limit);
         for batch in batches {
             let id_col = batch
                 .column(0)
@@ -597,11 +598,10 @@ impl Store {
         }
 
         let ids = hits.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
-        let records = self.get_records_by_ids(&ids).await?;
-        let mut matched: Vec<(Record, f32)> = Vec::new();
+        let mut records = self.get_records_by_ids(&ids).await?;
+        let mut matched: Vec<(Record, f32)> = Vec::with_capacity(hits.len());
         for (id, score) in hits {
-            if let Some(r) = records.get(&id) {
-                let r = r.clone();
+            if let Some(r) = records.remove(&id) {
                 if let Some(pids) = project_ids {
                     if !pids.is_empty() {
                         let pid = r.metadata_str("project_id");
@@ -614,7 +614,6 @@ impl Store {
             }
         }
 
-        matched.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         matched.truncate(limit);
         Ok(matched.into_iter().map(|(r, _)| r).collect())
     }
@@ -653,36 +652,31 @@ impl Store {
         let vec_ids = vec_res.unwrap_or_default();
         let lex_hits = lex_hits_res.unwrap_or_default();
 
-        let lex_ids: Vec<String> = lex_hits.iter().map(|(id, _)| id.clone()).collect();
-        let need_metadata = project_ids.is_some() && !project_ids.unwrap().is_empty();
-        let lw_records = self
-            .get_lightweight_records(&lex_ids, need_metadata)
-            .await
-            .unwrap_or_default();
-
-        let mut lex_ids_filtered = Vec::new();
-        for (id, _score) in lex_hits {
-            if let Some(meta_opt) = lw_records.get(&id) {
-                if let Some(pids) = project_ids {
-                    if !pids.is_empty() {
-                        if let Some(meta_str) = meta_opt {
-                            let meta_json: serde_json::Value =
-                                serde_json::from_str(meta_str).unwrap_or(serde_json::Value::Null);
-                            let pid = meta_json["project_id"].as_str().unwrap_or("").to_string();
-                            if !pids.contains(&pid) {
-                                continue;
-                            }
-                        } else {
-                            continue;
-                        }
+        let lex_ids_filtered: Vec<String> = if let Some(pids) = project_ids {
+            let lex_ids: Vec<String> = lex_hits.iter().map(|(id, _)| id.clone()).collect();
+            let need_metadata = !pids.is_empty();
+            let lw_records = self
+                .get_lightweight_records(&lex_ids, need_metadata)
+                .await
+                .unwrap_or_default();
+            let mut filtered = Vec::with_capacity(lex_hits.len());
+            for (id, _) in lex_hits {
+                if let Some(Some(meta_str)) = lw_records.get(&id) {
+                    let meta_json: serde_json::Value =
+                        serde_json::from_str(meta_str).unwrap_or(serde_json::Value::Null);
+                    let pid = meta_json["project_id"].as_str().unwrap_or("").to_string();
+                    if pids.contains(&pid) {
+                        filtered.push(id);
                     }
                 }
-                lex_ids_filtered.push(id);
             }
-        }
+            filtered
+        } else {
+            lex_hits.into_iter().map(|(id, _)| id).collect()
+        };
 
         let k = 60.0_f64;
-        let mut scores: HashMap<String, f64> = HashMap::new();
+        let mut scores: HashMap<String, f64> = HashMap::with_capacity(fetch * 2);
 
         for (i, id) in vec_ids.iter().enumerate() {
             *scores.entry(id.clone()).or_default() += 1.0 / (k + (i + 1) as f64);
@@ -698,7 +692,7 @@ impl Store {
         let final_ids: Vec<String> = ranked.iter().map(|(id, _)| id.clone()).collect();
         let mut heavy_records = self.get_records_by_ids(&final_ids).await?;
 
-        let mut result = Vec::new();
+        let mut result = Vec::with_capacity(limit);
         for (id, score) in ranked {
             if let Some(record) = heavy_records.remove(&id) {
                 result.push((record, score as f32));
@@ -814,7 +808,9 @@ pub async fn connect_store(uri: &str, dimension: usize, read_only: bool) -> Resu
 /// Escape a string for use inside a single-quoted SQL literal.
 /// Escapes both single quotes (SQL standard) and backslashes (some dialects).
 fn sql_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\'', "''")
+    s.replace('\\', "\\\\")
+        .replace('\'', "''")
+        .replace('"', "\\\"")
 }
 
 fn bm25_document_text(r: &Record) -> String {
@@ -954,7 +950,8 @@ fn records_to_batch(records: &[Record]) -> Result<RecordBatch> {
 }
 
 pub fn batches_to_records(batches: Vec<RecordBatch>) -> Result<Vec<Record>> {
-    let mut records = Vec::new();
+    let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+    let mut records = Vec::with_capacity(total_rows);
     for batch in batches {
         let ids = batch
             .column(0)

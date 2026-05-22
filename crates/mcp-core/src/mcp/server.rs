@@ -39,7 +39,7 @@ pub struct Server {
     pub llm_worker: Option<Arc<LlmWorker>>,
     pub semantic_router: Option<Arc<SemanticRouter>>,
     pub reload_watcher_tx: tokio::sync::mpsc::Sender<String>,
-    pub indexing_progress: Arc<std::sync::RwLock<crate::indexer::scanner::ProgressState>>,
+    pub indexing_progress: Arc<parking_lot::RwLock<crate::indexer::scanner::ProgressState>>,
     /// session_id → SSE sender for `$/progress` notifications.
     pub progress_senders:
         Arc<dashmap::DashMap<String, tokio::sync::mpsc::UnboundedSender<serde_json::Value>>>,
@@ -62,10 +62,10 @@ impl Server {
         reload_watcher_tx: tokio::sync::mpsc::Sender<String>,
         write_log: Arc<WriteLog>,
     ) -> Self {
-        let indexing_progress = Arc::new(std::sync::RwLock::new(
+        let indexing_progress = Arc::new(parking_lot::RwLock::new(
             crate::indexer::scanner::ProgressState::default(),
         ));
-        let root = config.project_root.read().unwrap().clone();
+        let root = config.project_root.read().clone();
         let path_guard =
             PathGuard::new(&root).unwrap_or_else(|_| PathGuard::new(std::env::temp_dir()).unwrap());
         Self {
@@ -274,7 +274,7 @@ impl Server {
     /// `tsconfig.json` found in the project root. This pays the cold-start
     /// cost at server boot so the first real LSP query is instant.
     pub fn prewarm_lsp(&self) {
-        let root = self.config.project_root.read().unwrap().clone();
+        let root = self.config.project_root.read().clone();
         let lsp_pool = Arc::clone(&self.lsp_pool);
 
         tokio::spawn(async move {

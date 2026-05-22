@@ -38,7 +38,7 @@ pub struct ApiState {
     pub index_tx: tokio::sync::mpsc::Sender<String>,
     #[allow(dead_code)]
     pub rate_limiter: Arc<RateLimiter>,
-    pub progress: Arc<std::sync::RwLock<crate::indexer::scanner::ProgressState>>,
+    pub progress: Arc<parking_lot::RwLock<crate::indexer::scanner::ProgressState>>,
     pub version: &'static str,
     /// Optional KV-cache store reference for the /api/cache/status endpoint.
     pub kv_cache: Option<Arc<KvCacheStore>>,
@@ -129,15 +129,15 @@ async fn handle_live() -> impl IntoResponse {
 }
 
 async fn handle_stats(State(s): State<Arc<ApiState>>) -> impl IntoResponse {
-    let p = s.progress.read().unwrap();
+    let p = s.progress.read();
     Json(serde_json::to_value(&*p).unwrap_or_default())
 }
 
 // --- UI Compatibility Handlers ---
 
 async fn handle_tools_repos(State(s): State<Arc<ApiState>>) -> impl IntoResponse {
-    let root = s.config.project_root.read().unwrap().clone();
-    let status = s.progress.read().unwrap().status.clone();
+    let root = s.config.project_root.read().clone();
+    let status = s.progress.read().status.clone();
     let status = if status.is_empty() {
         "Ready".to_string()
     } else {
@@ -150,7 +150,7 @@ async fn handle_tools_repos(State(s): State<Arc<ApiState>>) -> impl IntoResponse
 }
 
 async fn handle_tools_status(State(s): State<Arc<ApiState>>) -> impl IntoResponse {
-    let p = s.progress.read().unwrap();
+    let p = s.progress.read();
     Json(serde_json::json!({
         "status": p.status,
         "indexed_files": p.indexed_files,
@@ -170,7 +170,7 @@ async fn handle_tools_index(
 ) -> impl IntoResponse {
     let path = req
         .path
-        .unwrap_or_else(|| s.config.project_root.read().unwrap().clone());
+        .unwrap_or_else(|| s.config.project_root.read().clone());
     let _ = s.index_tx.send(path).await;
     Json(serde_json::json!({ "status": "triggered" }))
 }
@@ -182,7 +182,7 @@ async fn handle_tools_skeleton(
     let path = params
         .get("path")
         .cloned()
-        .unwrap_or_else(|| s.config.project_root.read().unwrap().clone());
+        .unwrap_or_else(|| s.config.project_root.read().clone());
 
     // Use the analyze_code logic or a simplified version
     let mut tree = String::new();

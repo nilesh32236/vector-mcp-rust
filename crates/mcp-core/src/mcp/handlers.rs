@@ -178,7 +178,7 @@ async fn handle_trigger_project_index(
     let path_clone = path.clone();
     // Update project_root so scan_project indexes the requested path.
     {
-        let mut root = config.project_root.write().unwrap();
+        let mut root = config.project_root.write();
         *root = path.clone();
     }
     tokio::spawn(async move {
@@ -212,7 +212,7 @@ async fn handle_set_project_root(
     let path = abs.to_string_lossy().to_string();
 
     {
-        let mut root = server.config.project_root.write().unwrap();
+        let mut root = server.config.project_root.write();
         *root = path.clone();
     }
 
@@ -233,7 +233,7 @@ async fn handle_set_project_root(
 async fn handle_store_context(server: &Server, params: &CallToolParams) -> Result<CallToolResult> {
     let text = require_string_arg(params, "text")?;
     let project_id = optional_string_arg(params, "project_id")
-        .unwrap_or_else(|| server.config.project_root.read().unwrap().clone());
+        .unwrap_or_else(|| server.config.project_root.read().clone());
 
     server
         .store
@@ -323,7 +323,7 @@ async fn handle_index_status(server: &Server) -> Result<CallToolResult> {
     let count = server.store.code_vectors.count_rows(None).await?;
     let records = server.store.get_all_records().await?;
 
-    let root = server.config.project_root.read().unwrap().clone();
+    let root = server.config.project_root.read().clone();
     let walker = ignore::WalkBuilder::new(&root)
         .standard_filters(true)
         .hidden(true)
@@ -487,7 +487,7 @@ async fn handle_check_dependency_health(
     params: &CallToolParams,
 ) -> Result<CallToolResult> {
     let dir_path = require_string_arg(params, "directory_path")?;
-    let root = server.config.project_root.read().unwrap().clone();
+    let root = server.config.project_root.read().clone();
     // Security enhancement: Prevent path traversal by using path_guard
     let abs_path = match server.path_guard.validate(&dir_path, PathOp::Read) {
         Ok(p) => p,
@@ -766,7 +766,7 @@ async fn handle_analyze_architecture(
     let records = server.store.get_all_records().await?;
 
     // Read project root once outside the loop to avoid repeated lock acquisitions.
-    let root = server.config.project_root.read().unwrap().clone();
+    let root = server.config.project_root.read().clone();
 
     // adjacency: src_pkg -> set of target_pkgs
     let mut adj: HashMap<String, HashSet<String>> = HashMap::new();
@@ -1018,7 +1018,7 @@ async fn handle_filesystem_grep(
     params: &CallToolParams,
 ) -> Result<CallToolResult> {
     let query = require_string_arg(params, "query")?.to_lowercase();
-    let root = server.config.project_root.read().unwrap().clone();
+    let root = server.config.project_root.read().clone();
 
     // Collect file paths in a blocking task to avoid blocking the async runtime.
     let paths = tokio::task::spawn_blocking(move || {
@@ -1133,7 +1133,7 @@ async fn handle_get_indexing_diagnostics(server: &Server) -> Result<CallToolResu
         .count_rows(None)
         .await
         .unwrap_or(0);
-    let p = server.indexing_progress.read().unwrap();
+    let p = server.indexing_progress.read();
     let status = if p.status.is_empty() {
         "idle".to_string()
     } else {
@@ -1337,7 +1337,7 @@ async fn handle_get_code_history(
         .validate(&path, PathOp::Read)
         .map_err(|e| anyhow::anyhow!("path guard: {e}"))?;
 
-    let root = server.config.project_root.read().unwrap().clone();
+    let root = server.config.project_root.read().clone();
     let output = tokio::process::Command::new("git")
         .arg("log")
         .arg("-n")
@@ -1466,7 +1466,7 @@ async fn handle_distill_knowledge(
     }
 
     // Store the raw indexed content as a knowledge item — no external LLM needed.
-    let project_id = server.config.project_root.read().unwrap().clone();
+    let project_id = server.config.project_root.read().clone();
     let distilled = relevant_content.trim().to_string();
     server
         .store
@@ -1483,7 +1483,7 @@ async fn handle_verify_proposed_change(
     params: &CallToolParams,
 ) -> Result<CallToolResult> {
     let proposed_change = require_string_arg(params, "proposed_change")?;
-    let project_id = server.config.project_root.read().unwrap().clone();
+    let project_id = server.config.project_root.read().clone();
 
     let contexts = server.store.get_project_context(&project_id).await?;
     if contexts.is_empty() {
@@ -1568,7 +1568,7 @@ async fn handle_get_related_context(server: &Server, file_path: &str) -> Result<
         )));
     }
 
-    let project_root = server.config.project_root.read().unwrap().clone();
+    let project_root = server.config.project_root.read().clone();
 
     // Collect symbols and relationships from all chunks of the target file
     let mut all_symbols: HashSet<String> = HashSet::new();
@@ -1795,11 +1795,17 @@ async fn handle_search_workspace(
             };
 
             // When intent is Summarize, prepend an AI summary of the top result.
-            let intent = server
-                .semantic_router
-                .as_ref()
-                .map(|r| r.classify(&query, &server.embedder))
-                .unwrap_or(crate::mcp::router::Intent::SearchOnly);
+            let intent = match &server.semantic_router {
+                Some(router) => {
+                    let embedder = Arc::clone(&server.embedder);
+                    let q = query.clone();
+                    let r = Arc::clone(router);
+                    tokio::task::spawn_blocking(move || r.classify(&q, &embedder))
+                        .await
+                        .unwrap_or(crate::mcp::router::Intent::SearchOnly)
+                }
+                None => crate::mcp::router::Intent::SearchOnly,
+            };
 
             if intent == crate::mcp::router::Intent::Summarize {
                 if let (Some(worker), Some(top)) = (&server.llm_worker, results.first()) {
@@ -2019,7 +2025,7 @@ async fn handle_workspace_manager(
             handle_set_project_root(server, &synthetic).await
         }
         "trigger_index" => {
-            let p = path.unwrap_or_else(|| server.config.project_root.read().unwrap().clone());
+            let p = path.unwrap_or_else(|| server.config.project_root.read().clone());
             let synthetic = CallToolParams {
                 name: "trigger_project_index".into(),
                 arguments: serde_json::json!({ "project_path": p }),
@@ -3160,7 +3166,7 @@ pub async fn handle_distill_package_purpose(
         "path": pkg_path,
         "type": "distilled_summary",
         "priority": "2.0",
-        "project_id": server.config.project_root.read().unwrap().clone(),
+        "project_id": server.config.project_root.read().clone(),
     });
     let record = crate::db::Record {
         id: format!("distill-{}", uuid::Uuid::new_v4()),

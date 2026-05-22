@@ -156,7 +156,15 @@ async fn init_components(
     }));
 
     // Build SemanticRouter from prototype embeddings (non-fatal if embedder is degraded).
-    let semantic_router = Arc::new(SemanticRouter::build(&embedder));
+    let emb = Arc::clone(&embedder);
+    let semantic_router =
+        match tokio::task::spawn_blocking(move || SemanticRouter::build(&emb)).await {
+            Ok(router) => Arc::new(router),
+            Err(e) => {
+                tracing::error!("SemanticRouter::build panicked: {e}");
+                Arc::new(SemanticRouter::build(&Embedder::new_disabled()))
+            }
+        };
 
     Ok((
         Arc::new(store),
@@ -172,7 +180,7 @@ async fn start_background_tasks(
     store: Arc<Store>,
     embedder: Arc<Embedder>,
     summarizer: Arc<Summarizer>,
-    progress: Arc<std::sync::RwLock<crate::indexer::scanner::ProgressState>>,
+    progress: Arc<parking_lot::RwLock<crate::indexer::scanner::ProgressState>>,
 ) -> Result<Option<notify::RecommendedWatcher>> {
     // Initial scan.
     let (c, s, e, su, p) = (
@@ -205,6 +213,9 @@ async fn start_background_tasks(
 
 fn main() -> Result<()> {
     // 0. Silence internal llama.cpp logging.
+    // SAFETY: Called single-threaded at the very start of main(), before any
+    // thread or runtime is created. LlamaBackend::init may spawn threads, so
+    // these env vars must be set first.
     unsafe {
         std::env::set_var("LLAMA_LOG_VERBOSITY", "-1");
         std::env::set_var("GGML_QUIET", "1");
@@ -229,7 +240,7 @@ async fn async_main() -> Result<()> {
     let _log_guard = setup_logging(&cfg.log_path)?;
 
     info!(
-        project_root = %*cfg.project_root.read().unwrap(),
+        project_root = %*cfg.project_root.read(),
         db_path      = %cfg.db_path.display(),
         model        = %cfg.model_name,
         log          = %cfg.log_path.display(),
@@ -262,7 +273,7 @@ async fn run_master(cfg: Config, socket_path: String) -> Result<()> {
     let config = Arc::new(cfg);
 
     // Shared indexing progress map.
-    let progress = Arc::new(std::sync::RwLock::new(
+    let progress = Arc::new(parking_lot::RwLock::new(
         crate::indexer::scanner::ProgressState::default(),
     ));
 
@@ -362,7 +373,7 @@ async fn run_slave(cfg: Config, socket_path: String) -> Result<()> {
     info!(socket = %socket_path, "Starting in SLAVE mode — delegating to master");
 
     let config = Arc::new(cfg);
-    let progress = Arc::new(std::sync::RwLock::new(
+    let progress = Arc::new(parking_lot::RwLock::new(
         crate::indexer::scanner::ProgressState::default(),
     ));
     let (index_tx, _index_rx) = tokio::sync::mpsc::channel::<String>(1);
@@ -388,7 +399,16 @@ async fn run_slave(cfg: Config, socket_path: String) -> Result<()> {
     ));
 
     // Build SemanticRouter for slave mode too.
-    let semantic_router = Some(Arc::new(SemanticRouter::build(&embedder)));
+    let emb = Arc::clone(&embedder);
+    let semantic_router = Some(
+        match tokio::task::spawn_blocking(move || SemanticRouter::build(&emb)).await {
+            Ok(router) => Arc::new(router),
+            Err(e) => {
+                tracing::error!("SemanticRouter::build panicked: {e}");
+                Arc::new(SemanticRouter::build(&Embedder::new_disabled()))
+            }
+        },
+    );
 
     let (reload_tx, _reload_rx) = tokio::sync::mpsc::channel::<String>(10);
 
@@ -420,7 +440,7 @@ async fn start_servers(
     embedder: Arc<Embedder>,
     summarizer: Arc<Summarizer>,
     config: Arc<Config>,
-    progress: Arc<std::sync::RwLock<crate::indexer::scanner::ProgressState>>,
+    progress: Arc<parking_lot::RwLock<crate::indexer::scanner::ProgressState>>,
     index_tx: tokio::sync::mpsc::Sender<String>,
 ) -> Result<()> {
     let port_str = config.api_port.clone();

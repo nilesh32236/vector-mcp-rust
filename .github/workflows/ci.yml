@@ -35,6 +35,9 @@ jobs:
     - name: Install protoc (required by lance)
       run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
 
+    - name: Install Vulkan SDK (required by llama-cpp-2 vulkan feature)
+      run: sudo apt-get install -y libvulkan-dev glslang-dev glslang-tools
+
     - name: Check Formatting
       run: cargo fmt -- --check
 

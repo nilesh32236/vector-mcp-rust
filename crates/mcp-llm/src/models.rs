@@ -369,8 +369,12 @@ impl LlamaEngine {
             tokenized.push(tokens);
         }
 
-        // Dynamic n_ctx: next power-of-two >= total_tokens, floored at 64.
-        let n_ctx = (total_tokens as u32).next_power_of_two().max(64);
+        let max_seq_len = tokenized.iter().map(|s| s.len()).max().unwrap_or(0);
+        let n_ctx = (max_seq_len as u32)
+            .next_power_of_two()
+            .max(64)
+            .min(self.embed_model.n_ctx_train())
+            .min(1024);
 
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(n_ctx))

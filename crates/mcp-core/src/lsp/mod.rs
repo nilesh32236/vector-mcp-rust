@@ -461,7 +461,7 @@ impl LspPool {
     #[allow(dead_code)]
     pub fn get(&self, ext: &str) -> Option<Arc<LspManager>> {
         let cmd = server_command(ext)?;
-        let root = self.config.project_root.read().unwrap().clone();
+        let root = self.config.project_root.read().clone();
 
         // If a cached session exists but was started for a different root, evict it.
         if let Some(existing) = self.sessions.get(ext) {
@@ -490,8 +490,8 @@ impl LspPool {
 
         // Use the nearest tsconfig.json directory so cross-package resolution
         // works correctly in monorepos (each package gets its own LSP session).
-        let root = find_nearest_tsconfig(path)
-            .unwrap_or_else(|| self.config.project_root.read().unwrap().clone());
+        let root =
+            find_nearest_tsconfig(path).unwrap_or_else(|| self.config.project_root.read().clone());
 
         self.get_with_root(&ext, root)
     }

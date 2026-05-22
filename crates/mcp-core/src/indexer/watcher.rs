@@ -28,7 +28,7 @@ pub async fn start_watcher(
 
     info!(
         "Initializing background CDC watcher on: {}",
-        config.project_root.read().unwrap().clone()
+        config.project_root.read().clone()
     );
 
     let (tx, mut rx) = mpsc::channel::<PathBuf>(100);
@@ -45,7 +45,7 @@ pub async fn start_watcher(
     })?;
 
     watcher.watch(
-        std::path::Path::new(&config.project_root.read().unwrap().clone()),
+        std::path::Path::new(&config.project_root.read().clone()),
         RecursiveMode::Recursive,
     )?;
 
@@ -99,7 +99,7 @@ pub async fn start_watcher(
                             }
 
                             // --- Architectural Guardrails ---
-                            let rel_path = get_relative_path(&path_str, &config.project_root.read().unwrap());
+                            let rel_path = get_relative_path(&path_str, &config.project_root.read());
                             check_architectural_compliance(&rel_path, Arc::clone(&config), Arc::clone(&db), Arc::clone(&embedder)).await;
 
                             // --- Autonomous Re-Distillation ---
@@ -128,7 +128,7 @@ async fn check_architectural_compliance(
     db: Arc<Store>,
     embedder: Arc<Embedder>,
 ) {
-    let _project_root = config.project_root.read().unwrap().clone();
+    let _project_root = config.project_root.read().clone();
 
     // 1. Fetch the records for the file we just indexed
     let records = match db.get_records_by_path(rel_path).await {
@@ -137,8 +137,13 @@ async fn check_architectural_compliance(
     };
 
     // 2. Search for relevant ADRs and Distilled Summaries
-    let vector = match embedder.embed_query("architecture dependency rules constraints ADR") {
-        Ok(v) => v,
+    let vector = match tokio::task::spawn_blocking({
+        let embedder = Arc::clone(&embedder);
+        move || embedder.embed_query("architecture dependency rules constraints ADR")
+    })
+    .await
+    {
+        Ok(Ok(v)) => v,
         _ => return,
     };
 
@@ -199,8 +204,14 @@ async fn redistill_dependents(
         .unwrap_or_else(|| ".".to_string());
 
     let query = format!("pkg:{}", pkg);
-    let vector = match embedder.embed_query(&query) {
-        Ok(v) => v,
+    let q_clone = query.clone();
+    let vector = match tokio::task::spawn_blocking({
+        let embedder = Arc::clone(&embedder);
+        move || embedder.embed_query(&q_clone)
+    })
+    .await
+    {
+        Ok(Ok(v)) => v,
         _ => return,
     };
 
@@ -269,12 +280,16 @@ async fn distill_package_internal(
         symbols.join(", ")
     );
 
-    let vector = embedder.embed_text(&summary)?;
+    let embedder = Arc::clone(&embedder);
+    let summary_clone = summary.clone();
+    let vector = tokio::task::spawn_blocking(move || embedder.embed_text(&summary_clone))
+        .await
+        .map_err(|e| anyhow::anyhow!("embedding task panicked: {e}"))??;
     let metadata = serde_json::json!({
         "path": pkg_path,
         "type": "distilled_summary",
         "priority": "2.0",
-        "project_id": config.project_root.read().unwrap().clone(),
+        "project_id": config.project_root.read().clone(),
     });
     let record = crate::db::Record {
         id: format!("distill-{}", uuid::Uuid::new_v4()),
