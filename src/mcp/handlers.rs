@@ -6,6 +6,7 @@
 use anyhow::Result;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write;
 use std::sync::Arc;
 
 use super::protocol::{CallToolParams, CallToolResult};
@@ -1590,10 +1591,11 @@ async fn handle_get_related_context(server: &Server, file_path: &str) -> Result<
         serde_json::to_string(&sym_list).unwrap_or_default(),
     ));
     for r in &records {
-        out.push_str(&format!(
-            "    <code_chunk>\n{}\n    </code_chunk>\n",
+        let _ = writeln!(
+            &mut out,
+            "    <code_chunk>\n{}\n    </code_chunk>",
             r.content
-        ));
+        );
     }
     out.push_str("  </file>\n");
 
@@ -1619,10 +1621,11 @@ async fn handle_get_related_context(server: &Server, file_path: &str) -> Result<
                 out.push_str("    <error>No indexed chunks found.</error>\n");
             } else {
                 for chunk in chunks {
-                    out.push_str(&format!(
-                        "    <code_chunk>\n{}\n    </code_chunk>\n",
+                    let _ = writeln!(
+                        &mut out,
+                        "    <code_chunk>\n{}\n    </code_chunk>",
                         chunk.content
-                    ));
+                    );
                 }
             }
             out.push_str("  </file>\n");
@@ -1639,11 +1642,12 @@ async fn handle_get_related_context(server: &Server, file_path: &str) -> Result<
                 if u.metadata_str("path") == file_path {
                     continue;
                 }
-                out.push_str(&format!(
-                    "    <sample symbol=\"{sym}\" used_in=\"{}\">\n{}\n    </sample>\n",
+                let _ = writeln!(
+                    &mut out,
+                    "    <sample symbol=\"{sym}\" used_in=\"{}\">\n{}\n    </sample>",
                     u.metadata_str("path"),
                     u.content
-                ));
+                );
                 found_any = true;
             }
         }
